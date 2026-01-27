@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Convenience wrapper that delegates to the centralized cli-wrapper
+# so Codex sub-agents can run from any repository.
+
+set -euo pipefail
+
+exec "$HOME/Scripts/cli-tools/bin/cli-wrapper" subagent "$@"

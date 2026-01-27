@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Convenience shim for db-query command
+exec "$HOME/Scripts/cli-tools/bin/cli-wrapper" db-query "$@"

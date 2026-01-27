@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Deploy CLI - wrapper for Claude Code deployment system
+#
+# Usage: deploy [target] [options]
+#
+# Targets: dev (default), prod, local, debug
+# Options: -b/--blocking, -p/--skip-build, -y/--skip-push
+#
+# Examples:
+#   deploy                        # Dev async deployment
+#   deploy prod                   # Prod async deployment
+#   deploy -b                     # Dev blocking (wait for completion)
+#   deploy local                  # Local dev server
+#   deploy local -b               # Local with health monitoring
+#   deploy local -b --one-shot --google-chat-message "hello"  # Full test cycle
+
+set -euo pipefail
+
+DEPLOY_DIR="$HOME/Scripts/cli-tools/src/deploy"
+
+# Check if help is requested
+if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
+    cat << 'EOF'
+Deploy CLI - Claude Code deployment system
+
+Usage: deploy [target] [options]
+
+Targets:
+  dev, development    Cloud development deployment (default)
+  prod, production    Cloud production deployment
+  local               Local continuous server with ngrok
+  debug               Local server with debugpy on port 5678
+
+Options:
+  -b, --blocking      Wait for completion, monitor errors
+  -p, --skip-build    Use last built image (skip docker build)
+  -y, --skip-push     Use last pushed image (skip build + push)
+
+Request Options (for local deployments):
+  --request-endpoint <path>     Endpoint to call after health check
+  --request-method <method>     HTTP method (default: GET)
+  --request-body <json>         Request body as JSON string
+  --request-headers <json>      Custom headers as JSON object
+  --force-localhost             Use localhost instead of ngrok
+  --localhost                   Alias for --force-localhost
+
+One-Shot Testing:
+  --one-shot          Start -> health check -> request -> stop
+  --test-and-stop     Alias for --one-shot
+  --auto-stop         Alias for --one-shot
+
+Google Chat Testing:
+  --google-chat-message <text>  Send test message (auto-configures request)
+
+Examples:
+  deploy                        # Dev async deployment
+  deploy prod                   # Prod async deployment
+  deploy -b                     # Dev blocking (wait for completion)
+  deploy prod -b                # Prod blocking
+  deploy local                  # Local server (continuous)
+  deploy local -b               # Local with health monitoring
+  deploy local -b --google-chat-message "hello"
+                                # Test message via local server
+  deploy local -b --one-shot --google-chat-message "test"
+                                # Full test cycle (auto-stops)
+
+Legacy Syntax (deprecated):
+  deploy -l                     # Use: deploy local
+  deploy -d                     # Use: deploy debug
+EOF
+    exit 0
+fi
+
+# Require a git repository context
+GIT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    echo "Error: must be run from within a git repository" >&2
+    exit 1
+}
+
+# Verify trigger-deploy.js exists
+if [[ ! -f "$DEPLOY_DIR/trigger-deploy.js" ]]; then
+    echo "Error: Deploy system not found at $DEPLOY_DIR" >&2
+    exit 1
+fi
+
+# Execute from the project directory
+cd "$GIT_ROOT"
+exec node "$DEPLOY_DIR/trigger-deploy.js" "$@"

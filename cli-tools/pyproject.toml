@@ -1,0 +1,27 @@
+[project]
+name = "cli-tools"
+version = "1.0.0"
+description = "Centralized CLI tools for ProcurementAgentAI projects"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.1.0",
+    "python-dotenv>=1.0.0",
+    "requests>=2.31.0",
+    "rich>=13.0.0",
+    "asyncpg>=0.29.0",
+    "cloud-sql-python-connector[asyncpg]>=1.0.0",
+]
+
+[project.scripts]
+subagent = "cli_tools.subagents.main:main"
+time-convert = "cli_tools.timezone.cli:main"
+google-chat-message = "cli_tools.google_chat.cli:main"
+db-query = "cli_tools.db_query.cli:main"
+cloud-logs = "cli_tools.cloud_logs.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = ["pytest>=7.0"]

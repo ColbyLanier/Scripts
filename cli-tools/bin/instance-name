@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Instance Name - Rename current session in Token-API registry
+#
+# Usage: instance-name <name> [--id <instance-id>]
+#
+# Examples:
+#   instance-name "auth-refactor"
+#   instance-name "fix-bug" --id abc123
+
+set -euo pipefail
+
+API_URL="http://localhost:7777"
+
+# Help
+if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
+    cat << 'EOF'
+Instance Name - Rename current session in Token-API registry
+
+Usage: instance-name <name> [--id <instance-id>]
+
+Sets the display name for this Claude Code session in the Token-API
+registry dashboard. The name helps identify what you're working on.
+
+Options:
+  --id <id>    Explicit instance ID (for ambiguous cases)
+
+Instance Resolution (in order):
+  1. --id flag if provided
+  2. TOKEN_API_INSTANCE_ID env var (set by SessionStart hook)
+  3. Match active instance by current working directory
+
+Examples:
+  instance-name "auth-refactor"
+  instance-name "fix-bug-123"
+  instance-name "feature/payments" --id abc123-def456
+EOF
+    exit 0
+fi
+
+# Parse arguments
+NAME=""
+EXPLICIT_ID=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --id)
+            EXPLICIT_ID="$2"
+            shift 2
+            ;;
+        *)
+            NAME="$1"
+            shift
+            ;;
+    esac
+done
+
+# Require name
+if [[ -z "$NAME" ]]; then
+    echo "Usage: instance-name <name> [--id <instance-id>]" >&2
+    exit 1
+fi
+
+# Resolve instance ID (priority: --id > env var > cwd match)
+if [[ -n "$EXPLICIT_ID" ]]; then
+    INSTANCE_ID="$EXPLICIT_ID"
+elif [[ -n "${TOKEN_API_INSTANCE_ID:-}" ]]; then
+    INSTANCE_ID="$TOKEN_API_INSTANCE_ID"
+else
+    CWD="$(pwd)"
+    INSTANCE_ID=$(curl -s "$API_URL/api/instances" 2>/dev/null | \
+        jq -r --arg cwd "$CWD" '.[] | select(.status == "active" and .working_dir == $cwd) | .id' | \
+        head -1)
+fi
+
+if [[ -z "$INSTANCE_ID" ]]; then
+    echo "Error: No active instance found. Use --id to specify explicitly." >&2
+    exit 1
+fi
+
+# Rename
+RESPONSE=$(curl -s -X PATCH "$API_URL/api/instances/$INSTANCE_ID/rename" \
+    -H "Content-Type: application/json" \
+    -d "{\"tab_name\": \"$NAME\"}" 2>/dev/null)
+
+if echo "$RESPONSE" | jq -e '.status == "renamed"' >/dev/null 2>&1; then
+    echo "Renamed to: $NAME"
+else
+    echo "Error: $(echo "$RESPONSE" | jq -r '.detail // "rename failed"')" >&2
+    exit 1
+fi

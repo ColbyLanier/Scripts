@@ -1,0 +1,82 @@
+# ====================================================
+# SECRETS & SENSITIVE DATA
+# ====================================================
+.env
+*.env
+.env.*
+!.env.example
+
+# Private AHK macros (contains passwords, emails, etc.)
+ahk/private.ahk
+
+# Config files with secrets
+mesh-pipe/config.json
+
+# ====================================================
+# RUNTIME STATE & DATA
+# ====================================================
+*state*.json
+session_registry.json
+*.db
+*.sqlite
+*.sqlite3
+
+# ====================================================
+# LOGS
+# ====================================================
+*.log
+logs/
+mesh-pipe/logs/
+
+# ====================================================
+# PYTHON
+# ====================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+.eggs/
+*.egg-info/
+*.egg
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ====================================================
+# NODE.JS
+# ====================================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ====================================================
+# IDE & EDITORS
+# ====================================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ====================================================
+# DEPLOYMENT ARTIFACTS
+# ====================================================
+.claude-deploy.log
+.claude-deploy-signal
+.claude-local-server-state.json
+
+# ====================================================
+# COMPILED / BINARY
+# ====================================================
+*.exe
+*.dll
+*.bin

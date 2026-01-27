@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Test CLI - wrapper for Claude Code testing system
+#
+# Usage: test [input] [options]
+#
+# Input types: (none), "message", /endpoint
+# Options: --dry-run, --localhost, --one-shot, --attach
+#
+# Examples:
+#   test                                  # Health check
+#   test "hello world"                    # Google Chat message
+#   test "hello" --localhost              # Via localhost
+#   test "hello" --dry-run                # Show payload
+#   test "hello" --one-shot               # Full cycle
+#   test /api/status                      # GET request
+
+set -euo pipefail
+
+DEPLOY_DIR="$HOME/Scripts/cli-tools/src/deploy"
+
+# Check if help is requested
+if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
+    cat << 'EOF'
+Test Command - Smart testing utility for local development
+
+Usage: test [input] [options]
+
+Input Types (auto-detected):
+  (none)          Health check only
+  "message text"  Google Chat message (quotes required)
+  /path           HTTP endpoint (starts with /)
+
+Options:
+  -m, --method METHOD     HTTP method (default: GET/POST auto)
+  -b, --body JSON         Request body as JSON
+  -H, --header KEY:VALUE  Custom header (repeatable)
+  --localhost             Use localhost instead of ngrok
+  --dry-run               Show payload/config without sending
+  --one-shot              Force start → test → stop
+  --attach                Require running server
+  -h, --help              Show help
+
+Detection Rules:
+  - No input → health check
+  - Starts with " or ' → Google Chat message
+  - Starts with / → HTTP endpoint
+  - Auto-selects one-shot if no server running
+
+Examples:
+  test                                  # Health check
+  test "hello world"                    # Google Chat message
+  test "hello" --localhost              # Via localhost
+  test "hello" --dry-run                # Show payload
+  test "hello" --one-shot               # Force one-shot
+  test /api/status                      # GET request
+  test /webhook -m POST -b '{"text":"hi"}'
+EOF
+    exit 0
+fi
+
+# Verify test-command.js exists
+if [[ ! -f "$DEPLOY_DIR/test-command.js" ]]; then
+    echo "Error: Test system not found at $DEPLOY_DIR" >&2
+    exit 1
+fi
+
+# Execute from current directory (preserve context)
+exec node "$DEPLOY_DIR/test-command.js" "$@"

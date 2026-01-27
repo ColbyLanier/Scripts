@@ -1,0 +1,24 @@
+# ~/.termux/termux.properties
+# Termux configuration - fetch updates with: fetch-properties
+
+# Smaller font = more columns
+# Adjust with pinch-to-zoom or set:
+# terminal-margin-horizontal = 0
+# terminal-margin-vertical = 0
+
+# Extra keys toolbar (always visible) - 7x2 with popups
+extra-keys = [ \
+  ['ESC', '~', {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, {key: '|', popup: '&'}, 'UP', 'PASTE'], \
+  ['TAB', {macro: '\\x1b[Z', display: 'S-TAB'}, 'CTRL', 'ALT', 'LEFT', 'DOWN', 'RIGHT'] \
+]
+
+# Better text handling
+terminal-transcript-rows = 10000
+
+# Force terminal to report accurate size
+# (helps apps detect width correctly)
+enforce-char-based-input = true
+
+# Restore normal volume button behavior
+# (instead of terminal shortcuts)
+volume-keys = volume
