@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # Deploy CLI - wrapper for Claude Code deployment system
 #
-# Usage: deploy [target] [options]
+# Usage: deploy [service] [target] [options]
 #
+# Services: backend (default), web, widget-proxy, chat-proxy, proxies
 # Targets: dev (default), prod, local, debug
 # Options: -b/--blocking, -p/--skip-build, -y/--skip-push
 #
 # Examples:
-#   deploy                        # Dev async deployment
-#   deploy prod                   # Prod async deployment
-#   deploy -b                     # Dev blocking (wait for completion)
-#   deploy local                  # Local dev server
-#   deploy local -b               # Local with health monitoring
-#   deploy local -b --one-shot --google-chat-message "hello"  # Full test cycle
+#   deploy                        # Backend to dev async
+#   deploy prod                   # Backend to prod async
+#   deploy web                    # Frontend to dev
+#   deploy web prod               # Frontend to prod
+#   deploy proxies                # Both proxies to dev
+#   deploy local                  # Local backend server
 
 set -euo pipefail
 
@@ -23,13 +24,24 @@ if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
     cat << 'EOF'
 Deploy CLI - Claude Code deployment system
 
-Usage: deploy [target] [options]
+Usage: deploy [service] [target] [options]
 
-Targets:
+Services:
+  backend             Main application (default if no service specified)
+  web, frontend       Widget/frontend application
+  widget-proxy        Widget proxy service
+  chat-proxy          Google Chat proxy service
+  proxies             Both widget-proxy and chat-proxy
+
+Targets (for backend service):
   dev, development    Cloud development deployment (default)
   prod, production    Cloud production deployment
   local               Local continuous server with ngrok
   debug               Local server with debugpy on port 5678
+
+Targets (for web/proxy services):
+  dev, development    Development environment (default)
+  prod, production    Production environment
 
 Options:
   -b, --blocking      Wait for completion, monitor errors
@@ -53,16 +65,29 @@ Google Chat Testing:
   --google-chat-message <text>  Send test message (auto-configures request)
 
 Examples:
+  # Backend deployments
   deploy                        # Dev async deployment
   deploy prod                   # Prod async deployment
   deploy -b                     # Dev blocking (wait for completion)
   deploy prod -b                # Prod blocking
   deploy local                  # Local server (continuous)
   deploy local -b               # Local with health monitoring
+  deploy debug                  # Local with debugger
+
+  # Frontend deployments
+  deploy web                    # Frontend to dev
+  deploy web prod               # Frontend to prod
+  deploy frontend local         # Local frontend + backend
+
+  # Proxy deployments
+  deploy widget-proxy           # Widget proxy to dev
+  deploy chat-proxy prod        # Chat proxy to prod
+  deploy proxies                # Both proxies to dev
+  deploy proxies prod           # Both proxies to prod
+
+  # Testing
   deploy local -b --google-chat-message "hello"
-                                # Test message via local server
   deploy local -b --one-shot --google-chat-message "test"
-                                # Full test cycle (auto-stops)
 
 Legacy Syntax (deprecated):
   deploy -l                     # Use: deploy local
@@ -83,6 +108,81 @@ if [[ ! -f "$DEPLOY_DIR/trigger-deploy.js" ]]; then
     exit 1
 fi
 
+# Parse service type from first argument
+SERVICE=""
+ARGS=()
+FIRST_ARG_PROCESSED=false
+
+for arg in "$@"; do
+    if [[ "$FIRST_ARG_PROCESSED" == "false" && ! "$arg" =~ ^- ]]; then
+        case "$arg" in
+            web|frontend)
+                SERVICE="web"
+                FIRST_ARG_PROCESSED=true
+                continue
+                ;;
+            widget-proxy)
+                SERVICE="widget-proxy"
+                FIRST_ARG_PROCESSED=true
+                continue
+                ;;
+            chat-proxy)
+                SERVICE="chat-proxy"
+                FIRST_ARG_PROCESSED=true
+                continue
+                ;;
+            proxies)
+                SERVICE="proxies"
+                FIRST_ARG_PROCESSED=true
+                continue
+                ;;
+            backend)
+                SERVICE="backend"
+                FIRST_ARG_PROCESSED=true
+                continue
+                ;;
+        esac
+    fi
+    ARGS+=("$arg")
+done
+
 # Execute from the project directory
 cd "$GIT_ROOT"
-exec node "$DEPLOY_DIR/trigger-deploy.js" "$@"
+
+# Determine environment from remaining args
+ENV="development"
+for arg in "${ARGS[@]}"; do
+    case "$arg" in
+        prod|production) ENV="production" ;;
+        dev|development) ENV="development" ;;
+    esac
+done
+
+# Handle different service types
+case "$SERVICE" in
+    web)
+        echo "Deploying frontend to $ENV..."
+        if [[ " ${ARGS[*]} " =~ " local " ]]; then
+            exec make deploy-web FLAG=-l ENVIRONMENT="$ENV"
+        else
+            exec make deploy-web ENVIRONMENT="$ENV"
+        fi
+        ;;
+    widget-proxy)
+        echo "Deploying widget-proxy to $ENV..."
+        exec make deploy-widget-proxy ENVIRONMENT="$ENV"
+        ;;
+    chat-proxy)
+        echo "Deploying chat-proxy to $ENV..."
+        exec make deploy-chat-proxy ENVIRONMENT="$ENV"
+        ;;
+    proxies)
+        echo "Deploying both proxies to $ENV..."
+        make deploy-widget-proxy ENVIRONMENT="$ENV"
+        exec make deploy-chat-proxy ENVIRONMENT="$ENV"
+        ;;
+    *)
+        # Default: backend deployment via trigger-deploy.js
+        exec node "$DEPLOY_DIR/trigger-deploy.js" "${ARGS[@]}"
+        ;;
+esac
