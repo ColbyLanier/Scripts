@@ -13,6 +13,7 @@ import re
 import uuid
 import json
 import time
+import random
 import asyncio
 import logging
 from datetime import datetime, timedelta
@@ -574,13 +575,20 @@ def resolve_device_from_ip(ip: str) -> str:
     return DEVICE_IPS.get(ip, "unknown")
 
 
-def get_next_available_profile(used_profiles: set) -> dict:
-    """Get the next available profile from the pool."""
-    for profile in PROFILES:
-        if profile["name"] not in used_profiles:
-            return profile
-    # If all profiles used, cycle back to first
-    return PROFILES[0]
+def get_next_available_profile(used_voices: set) -> dict:
+    """Get a random available profile from the pool.
+
+    Args:
+        used_voices: Set of voice names currently in use by registered instances.
+
+    Returns:
+        A random profile whose voice is not in use, or a random profile if all are used.
+    """
+    available = [p for p in PROFILES if p["tts_voice"] not in used_voices]
+    if available:
+        return random.choice(available)
+    # If all voices used, return random profile anyway
+    return random.choice(PROFILES)
 
 
 # ============ Scheduled Task System ============
@@ -962,15 +970,16 @@ async def register_instance(request: InstanceRegisterRequest):
         device_id = "desktop"  # Default to desktop for local sessions
 
     async with aiosqlite.connect(DB_PATH) as db:
-        # Get currently used profiles
+        # Get currently used voices (from all registered instances, not just active)
+        # Voices are locked for the duration of a session until deleted
         cursor = await db.execute(
-            "SELECT profile_name FROM claude_instances WHERE status = 'active'"
+            "SELECT tts_voice FROM claude_instances"
         )
         rows = await cursor.fetchall()
-        used_profiles = {row[0] for row in rows if row[0]}
+        used_voices = {row[0] for row in rows if row[0]}
 
-        # Assign profile
-        profile = get_next_available_profile(used_profiles)
+        # Assign random available profile
+        profile = get_next_available_profile(used_voices)
 
         # Insert instance
         now = datetime.now().isoformat()
@@ -1166,6 +1175,130 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
     )
 
     return {"status": "renamed", "instance_id": instance_id, "tab_name": request.tab_name}
+
+
+class VoiceChangeRequest(BaseModel):
+    voice: str
+
+
+@app.get("/api/voices")
+async def list_voices():
+    """List all available TTS voices from the profile pool."""
+    voices = []
+    for profile in PROFILES:
+        voice = profile["tts_voice"]
+        # Extract short name: "Microsoft George" -> "George"
+        short_name = voice.replace("Microsoft ", "")
+        voices.append({
+            "voice": voice,
+            "short_name": short_name,
+            "profile_name": profile["name"]
+        })
+    return {"voices": voices}
+
+
+def find_voice_linear_probe(used_voices: set) -> str | None:
+    """Find an available voice using random offset + linear probe.
+
+    Picks a random starting index in PROFILES, then iterates circularly
+    until finding a voice not in used_voices. Returns None if all are used.
+    """
+    n = len(PROFILES)
+    if n == 0:
+        return None
+
+    start = random.randint(0, n - 1)
+    for i in range(n):
+        idx = (start + i) % n
+        voice = PROFILES[idx]["tts_voice"]
+        if voice not in used_voices:
+            return voice
+    return None
+
+
+@app.patch("/api/instances/{instance_id}/voice")
+async def change_instance_voice(instance_id: str, request: VoiceChangeRequest):
+    """Change an instance's TTS voice with collision handling.
+
+    If the target voice is already in use by another instance, that instance
+    gets bumped using random offset + linear probe to find an open slot.
+    No cascade - bumped instance just finds the next available voice.
+    """
+    all_voices = {p["tts_voice"] for p in PROFILES}
+    if request.voice not in all_voices:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid voice. Available: {', '.join(sorted(all_voices))}"
+        )
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Get all instances and their voices
+        cursor = await db.execute("SELECT id, tts_voice, tab_name FROM claude_instances")
+        rows = await cursor.fetchall()
+
+        instance_to_voice = {row[0]: row[1] for row in rows}
+        instance_to_name = {row[0]: row[2] for row in rows}
+        voice_to_instance = {row[1]: row[0] for row in rows if row[1]}
+
+        if instance_id not in instance_to_voice:
+            raise HTTPException(status_code=404, detail="Instance not found")
+
+        original_voice = instance_to_voice[instance_id]
+        if original_voice == request.voice:
+            return {"status": "no_change", "instance_id": instance_id, "voice": request.voice}
+
+        # Changes to apply: [(instance_id, old_voice, new_voice), ...]
+        changes = [(instance_id, original_voice, request.voice)]
+
+        # Check for collision
+        holder = voice_to_instance.get(request.voice)
+        if holder and holder != instance_id:
+            # Collision! Bump the holder to a new voice
+            holder_old_voice = instance_to_voice[holder]
+
+            # Build set of voices that will be in use after our change
+            # (exclude original_voice since we're freeing it, include request.voice since we're taking it)
+            used_after = set(voice_to_instance.keys())
+            used_after.discard(original_voice)  # We're freeing this
+            used_after.add(request.voice)  # We're taking this
+
+            # Find new voice for bumped instance via linear probe
+            new_voice_for_holder = find_voice_linear_probe(used_after)
+            if not new_voice_for_holder:
+                # All voices in use, give them the voice we just freed
+                new_voice_for_holder = original_voice
+
+            changes.append((holder, holder_old_voice, new_voice_for_holder))
+
+        # Apply all changes to database
+        for iid, _, new_voice in changes:
+            await db.execute(
+                "UPDATE claude_instances SET tts_voice = ? WHERE id = ?",
+                (new_voice, iid)
+            )
+        await db.commit()
+
+    # Log events for each change
+    for iid, old_v, new_v in changes:
+        name = instance_to_name.get(iid, iid[:8])
+        await log_event(
+            "instance_voice_changed",
+            instance_id=iid,
+            details={"old_voice": old_v, "new_voice": new_v, "bumped": iid != instance_id}
+        )
+
+    # Build response
+    bumps = [
+        {"instance_id": iid, "name": instance_to_name.get(iid, iid[:8]), "old": old_v, "new": new_v}
+        for iid, old_v, new_v in changes
+    ]
+
+    return {
+        "status": "voice_changed",
+        "instance_id": instance_id,
+        "voice": request.voice,
+        "changes": bumps
+    }
 
 
 @app.post("/api/instances/{instance_id}/activity")

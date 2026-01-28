@@ -8,6 +8,7 @@ Controls:
   arrow/jk  - Select instance (up/down)
   h/l       - Switch info panel (Events/Logs)
   r         - Rename selected instance
+  v         - Change voice for instance
   s         - Stop selected instance
   d         - Delete selected instance
   c         - Clear all instances
@@ -290,6 +291,43 @@ def delete_instance(instance_id: str) -> bool:
             return result.get("status") == "stopped"
     except Exception:
         return False
+
+
+def get_available_voices() -> list:
+    """Get list of available voices from the API."""
+    try:
+        req = urllib.request.Request(f"{API_URL}/api/voices")
+        with urllib.request.urlopen(req, timeout=5) as response:
+            result = json.loads(response.read().decode())
+            return result.get("voices", [])
+    except Exception:
+        return []
+
+
+def change_instance_voice(instance_id: str, voice: str) -> dict:
+    """Change an instance's TTS voice via the API.
+
+    Returns dict with 'success', 'changes' (list of bumps), or None on error.
+    """
+    try:
+        data = json.dumps({"voice": voice}).encode()
+        req = urllib.request.Request(
+            f"{API_URL}/api/instances/{instance_id}/voice",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="PATCH"
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            result = json.loads(response.read().decode())
+            if result.get("status") in ("voice_changed", "no_change"):
+                return {
+                    "success": True,
+                    "changes": result.get("changes", []),
+                    "status": result.get("status")
+                }
+            return {"success": False}
+    except Exception:
+        return {"success": False}
 
 
 def delete_all_instances() -> tuple[bool, int]:
@@ -1478,6 +1516,10 @@ def main():
                         with action_lock:
                             action_queue.append('tts_skip_all')
                         update_flag.set()
+                    elif key == 'v':
+                        with action_lock:
+                            action_queue.append('voice')
+                        update_flag.set()
         except Exception:
             pass
         finally:
@@ -1577,6 +1619,68 @@ def main():
                             instances_cache = get_instances()
                             if instances_cache:
                                 selected_index = min(selected_index, len(instances_cache) - 1)
+                            live.start()
+                            live.update(get_dashboard(instances_cache, selected_index))
+                            live.refresh()
+
+                    elif action == 'voice' and instances_cache:
+                        if 0 <= selected_index < len(instances_cache):
+                            instance = instances_cache[selected_index]
+                            instance_id = instance.get("id")
+                            instance_name = format_instance_name(instance)
+                            current_voice = instance.get("tts_voice", "")
+
+                            input_mode.set()
+                            time.sleep(0.1)
+                            live.stop()
+
+                            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, original_terminal_settings)
+
+                            voices = get_available_voices()
+                            if not voices:
+                                console.print("[red]Could not fetch voices from API[/red]")
+                            else:
+                                console.print(f"\n[cyan]Change voice for:[/cyan] {instance_name}")
+                                console.print(f"[dim]Current: {current_voice}[/dim]\n")
+
+                                # Display numbered list
+                                for i, v in enumerate(voices, 1):
+                                    marker = "[green]*[/green]" if v["voice"] == current_voice else " "
+                                    console.print(f"  {marker} {i}. {v['short_name']}")
+
+                                console.print()
+                                try:
+                                    choice = Prompt.ask("Select voice number", default="")
+                                    if choice.isdigit():
+                                        idx = int(choice) - 1
+                                        if 0 <= idx < len(voices):
+                                            new_voice = voices[idx]["voice"]
+                                            result = change_instance_voice(instance_id, new_voice)
+                                            if result.get("success"):
+                                                if result.get("status") == "no_change":
+                                                    console.print("[dim]Already using that voice[/dim]")
+                                                else:
+                                                    changes = result.get("changes", [])
+                                                    console.print(f"[green]v[/green] Voice changed to: {voices[idx]['short_name']}")
+                                                    # Show bump chain if any
+                                                    if len(changes) > 1:
+                                                        console.print("[yellow]Bump chain:[/yellow]")
+                                                        for c in changes:
+                                                            old_short = c['old'].replace('Microsoft ', '') if c['old'] else '?'
+                                                            new_short = c['new'].replace('Microsoft ', '')
+                                                            console.print(f"  {c['name']}: {old_short} -> {new_short}")
+                                            else:
+                                                console.print("[red]x[/red] Voice change failed")
+                                        else:
+                                            console.print("[red]Invalid selection[/red]")
+                                    else:
+                                        console.print("[dim]Cancelled[/dim]")
+                                except (KeyboardInterrupt, EOFError):
+                                    console.print("[dim]Cancelled[/dim]")
+
+                            time.sleep(0.3)
+                            input_mode.clear()
+                            instances_cache = get_instances()
                             live.start()
                             live.update(get_dashboard(instances_cache, selected_index))
                             live.refresh()
