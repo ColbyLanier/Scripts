@@ -1,0 +1,19 @@
+# Geofence Gym Exit Telemetry
+# Reports when leaving the gym - pure location tracking
+
+name: "Geofence Gym Exit"
+category: "Geofence"
+description: "Track leaving gym geofence"
+enabled: true
+
+triggers:
+  - type: geofence
+    geofence_id: "7fa61f1d-fcc7-4ffc-8b83-0e5b6ba0e0dd"
+    enter: false
+
+actions:
+  - type: http_request
+    url: "http://100.66.10.74:7777/phone"
+    method: POST
+    body: '{"location": "gym", "action": "exit"}'
+    content_type: "application/json"

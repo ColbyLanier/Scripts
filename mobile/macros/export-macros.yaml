@@ -1,7 +1,7 @@
 # Export Macros on Demand
 # Listens for HTTP request and triggers MacroDroid export
 #
-# Usage: curl http://<phone-ip>:8080/export-macros
+# Usage: curl http://<phone-ip>:7777/export-macros
 # The macro will export to ~/macros/ and return the filename
 
 name: "Export Macros API"

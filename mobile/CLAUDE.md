@@ -6,9 +6,67 @@ Tools and configuration for phone automation via Termux and MacroDroid.
 
 This directory contains:
 - Termux shell configuration templates
+- MacroDroid macro specifications (YAML)
 - Documentation for mobile automation tooling
 
 The phone (Samsung S24) connects via Tailscale and runs Termux for SSH access.
+
+## Focus Management System
+
+A phone-server system for managing app usage. The phone reports events to the server, which decides enforcement actions.
+
+### Architecture
+
+```
+Phone (MacroDroid)                    Desktop Server (Token-API)
+──────────────────                    ────────────────────────────
+
+[Telemetry Macros]
+  Twitter/YouTube/Games    ─POST──>   /phone (logs app events)
+  Open/Close events                   │
+                                      ▼
+  Geofence Home/Gym       ─POST──>   Server analyzes context
+  Enter/Exit events                   (time, location, usage)
+         │                                    │
+         ├─ 200 OK ─────────────────>        │
+         │                                    ▼
+         └─ Error ──> Enable Local    /enforce (pushes commands)
+                      Fallback               │
+                           │                 │
+                           ▼                 │
+[Enforcement Macros]  <──────────────────────┘
+  /enforce endpoint       Disable/enable specific apps
+  Local Management        (disabled by default)
+```
+
+### Phone Endpoints (MacroDroid HTTP Server, port 7777)
+
+| Endpoint | Purpose |
+|----------|---------|
+| `/enforce?action=disable&app=twitter` | Disable an app |
+| `/enforce?action=enable&app=twitter` | Re-enable an app |
+| `/enable-local` | Enable local fallback enforcement |
+| `/disable-local` | Disable local fallback (server back) |
+| `/notify?title=X&text=Y` | Show notification |
+| `/list-exports` | List available macro exports |
+
+### Server Endpoints (Token-API)
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /phone` | Receive app/geofence telemetry |
+
+### Macro Categories
+
+| Category | Count | Purpose |
+|----------|-------|---------|
+| Telemetry | 6 | Report app opens/closes to server |
+| Geofence | 4 | Report location enter/exit |
+| Enforcement | 6 | Enable/disable apps on command |
+| Endpoints | 2 | HTTP API endpoints |
+| Other | 4 | Misc (Spotify, YouTube toggle, etc.) |
+
+See `macros/MACRODROID.md` for full macro inventory.
 
 ## Connection
 
@@ -184,12 +242,29 @@ To import in MacroDroid:
 2. Use Termux file picker to browse to `~/macros/`
 3. Select the .macro file
 
+### .macro File Lifecycle
+
+**Important:** `.macro` files are temporary staging files. After import into MacroDroid, they should be deleted because the macro is now stored in the `.mdr` export.
+
+**Workflow:**
+1. Generate: `macrodroid-gen spec.yaml > name.macro`
+2. Push: `macrodroid-push name.macro`
+3. Import in MacroDroid app
+4. Verify with `macrodroid-state --list`
+5. Delete: `rm name.macro` (local) and `sshp "rm ~/macros/name.macro"` (phone)
+
+**Naming convention for pending imports:**
+- `IMPORT-*.macro` - Files waiting to be imported into MacroDroid
+- Once imported, delete the file
+
+**The `.mdr` file is the source of truth** - it contains all imported macros. Use `macrodroid-read --refresh` to see current state.
+
 ### HTTP Server Trigger Details
 
-MacroDroid's HTTP Server runs on a configurable port (default 8080). Endpoints are:
+MacroDroid's HTTP Server runs on port 7777. Endpoints are:
 ```
-http://<phone-ip>:<port>/<identifier>
-http://<phone-ip>:<port>/<identifier>?param=value
+http://<phone-ip>:7777/<identifier>
+http://<phone-ip>:7777/<identifier>?param=value
 ```
 
 Available magic variables in actions:

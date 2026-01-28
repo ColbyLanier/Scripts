@@ -1,10 +1,16 @@
-# Twitter Open Tracker
+# Twitter Open Tracker with Fallback
 # Reports to /phone when Twitter is opened
+# If server unreachable, triggers local enforcement
 
 name: "Twitter Open"
 category: "Telemetry"
-description: "Track Twitter app opens"
+description: "Track Twitter opens, fallback to local if server down"
 enabled: true
+
+variables:
+  - name: response_code
+    type: integer
+    value: 0
 
 triggers:
   - type: app_launched
@@ -18,3 +24,26 @@ actions:
     method: POST
     body: '{"app": "twitter", "action": "open"}'
     content_type: "application/json"
+    code_var: "response_code"
+    block_next: true
+    timeout: 5
+
+  # If server unreachable (code != 200), trigger local fallback
+  - type: if
+    conditions:
+      - type: variable
+        variable: "response_code"
+        var_type: integer
+        comparison: not_equals
+        value: 200
+        local_var: true
+
+  # Force run local management for this app
+  - type: run_macro
+    macro_name: "Twitter Management"
+
+  # Enable all local fallbacks for future events
+  - type: run_macro
+    macro_name: "Enable Local Fallback"
+
+  - type: end_if

@@ -511,12 +511,33 @@ def build_shell_action(config):
 def build_run_macro_action(config):
     """Force Run Macro action."""
     return {
+        "getByName": False,
+        "isCategoryLocked": False,
+        "m_GUID": config.get("macro_guid", 0),
+        "m_ignoreConstraints": config.get("ignore_constraints", True),
         "m_macroName": config.get("macro_name", ""),
-        "m_macroGuid": config.get("macro_guid", 0),
-        "m_runAsActionBlock": config.get("as_action_block", False),
+        "m_useOffStatus": False,
+        "m_userPromptTitle": "Run Macro",
+        "m_waitToComplete": config.get("wait_to_complete", False),
         "disableLogging": config.get("disable_logging", False),
         "m_SIGUID": generate_guid(),
-        "m_classType": "ForceRunMacroAction",
+        "m_classType": "ForceMacroRunAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@action_builder("enable_macro")
+def build_enable_macro_action(config):
+    """Enable/Disable Macro action."""
+    return {
+        "m_macroName": config.get("macro_name", ""),
+        "m_macroGuid": config.get("macro_guid", 0),
+        "m_enable": config.get("enable", True),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "SetMacroEnabledAction",
         "m_constraintList": [],
         "m_isDisabled": config.get("disabled", False),
         "m_isOrCondition": False

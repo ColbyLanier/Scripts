@@ -1,7 +1,7 @@
 # List Available Exports
 # HTTP endpoint that lists .mdr files in ~/macros/
 #
-# Usage: curl http://<phone-ip>:8080/list-exports
+# Usage: curl http://<phone-ip>:7777/list-exports
 
 name: "List Exports API"
 category: "Automation"
