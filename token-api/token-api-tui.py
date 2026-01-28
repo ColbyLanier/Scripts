@@ -11,6 +11,7 @@ Controls:
   v         - Change voice for instance
   s         - Stop selected instance
   d         - Delete selected instance
+  K         - Kill frozen instance (SIGTERM/SIGKILL)
   c         - Clear all instances
   o         - Change sort order
   q         - Quit
@@ -18,6 +19,7 @@ Controls:
 
 import sys
 import os
+import re
 import argparse
 import json
 import sqlite3
@@ -79,7 +81,14 @@ api_error_message = None
 layout_mode = "full"  # "mobile", "vertical", "compact", or "full"
 layout_mode_forced = False  # True if user used --mobile, --vertical, --compact, or --no-mobile
 sort_mode = "status"  # "status", "recent_activity", "recent_stopped", "created"
-panel_page = 0  # 0 = events view, 1 = server logs view
+panel_page = 0  # 0 = events view, 1 = server logs view, 2 = deploy logs view
+PANEL_PAGE_MAX = 2  # 0=Events, 1=Logs, 2=Deploy
+deploy_active = False
+deploy_log_path = None
+deploy_metadata = {}
+deploy_previous_page = 0
+deploy_auto_switched = False
+DEPLOY_SCAN_DIR = Path.home() / "ProcAgentDir"
 console = Console()
 
 
@@ -122,6 +131,34 @@ def detect_layout_mode() -> str:
         return "compact"
 
     return "full"
+
+
+ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+
+
+def strip_ansi(text: str) -> str:
+    """Strip ANSI escape codes from text."""
+    return ANSI_ESCAPE_RE.sub('', text)
+
+
+def check_deploy_status() -> tuple[bool, Path | None, dict]:
+    """Check for active deployment by scanning for .claude-deploy-signal files."""
+    try:
+        if not DEPLOY_SCAN_DIR.exists():
+            return False, None, {}
+        for entry in DEPLOY_SCAN_DIR.iterdir():
+            if entry.is_dir():
+                signal = entry / ".claude-deploy-signal"
+                if signal.exists():
+                    log = entry / ".claude-deploy.log"
+                    try:
+                        metadata = json.loads(signal.read_text())
+                    except Exception:
+                        metadata = {}
+                    return True, log, metadata
+    except Exception:
+        pass
+    return False, None, {}
 
 
 def check_api_health() -> tuple[bool, str | None]:
@@ -243,14 +280,15 @@ def get_instances():
 def get_instance_todos(instance_id: str, use_cache: bool = False) -> dict:
     """Fetch todos for an instance from the API.
 
-    If use_cache=True, returns cached data without polling.
-    Otherwise fetches fresh data and updates the cache.
+    If use_cache=True and data is cached, returns cached data without polling.
+    If use_cache=True but no cached data exists, fetches fresh data to seed the cache.
+    If use_cache=False, always fetches fresh data and updates the cache.
     """
     global todos_cache
     default = {"progress": 0, "current_task": None, "total": 0, "todos": []}
 
-    if use_cache:
-        return todos_cache.get(instance_id, default)
+    if use_cache and instance_id in todos_cache:
+        return todos_cache[instance_id]
 
     try:
         req = urllib.request.Request(f"{API_URL}/api/instances/{instance_id}/todos")
@@ -291,6 +329,27 @@ def delete_instance(instance_id: str) -> bool:
             return result.get("status") == "stopped"
     except Exception:
         return False
+
+
+def kill_instance(instance_id: str) -> dict:
+    """Kill a frozen instance via the API. Returns result dict or None on failure."""
+    try:
+        req = urllib.request.Request(
+            f"{API_URL}/api/instances/{instance_id}/kill",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+            data=b"{}"
+        )
+        resp = urllib.request.urlopen(req, timeout=15)  # longer timeout for kill sequence
+        return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read())
+            return {"status": "error", "detail": body.get("detail", str(e))}
+        except Exception:
+            return {"status": "error", "detail": str(e)}
+    except Exception:
+        return None
 
 
 def get_available_voices() -> list:
@@ -536,7 +595,7 @@ def create_instances_table(instances: list, selected_idx: int) -> Table:
         max_name_len = max(max_name_len, len(name) + 2)
 
     table = Table(
-        title="Claude Instances  [dim](jk=nav h/l=page r=rename s=stop d=delete c=clear o=sort q=quit)[/dim]",
+        title="Claude Instances  [dim](jk=nav h/l=page r=rename s=stop d=delete K=kill c=clear o=sort q=quit)[/dim]",
         show_header=True,
         header_style="bold cyan",
         border_style="blue",
@@ -559,18 +618,18 @@ def create_instances_table(instances: list, selected_idx: int) -> Table:
 
         device = instance.get("device_id", "?")
         instance_id = instance.get("id", "")
+        status = instance.get("status", "idle")
         # Poll for fresh todos when processing, otherwise use cached data
-        if instance.get("is_processing", 0):
+        if status == "processing":
             todos = get_instance_todos(instance_id, use_cache=False)
         else:
             todos = get_instance_todos(instance_id, use_cache=True)
 
-        is_processing = instance.get("is_processing", 0)
         has_active_subtask = todos.get("current_task") is not None
 
-        if instance["status"] == "stopped":
+        if status == "stopped":
             status_icon = "[dim]o[/dim]"
-        elif is_processing or has_active_subtask:
+        elif status == "processing" or has_active_subtask:
             status_icon = "[green]>[/green]"
         else:
             status_icon = "[cyan]*[/cyan]"
@@ -625,18 +684,18 @@ def create_mobile_instances_table(instances: list, selected_idx: int) -> Table:
             name = f"[bold yellow]{name}[/bold yellow]"
 
         instance_id = instance.get("id", "")
+        status = instance.get("status", "idle")
         # Poll for fresh todos when processing, otherwise use cached data
-        if instance.get("is_processing", 0):
+        if status == "processing":
             todos = get_instance_todos(instance_id, use_cache=False)
         else:
             todos = get_instance_todos(instance_id, use_cache=True)
 
-        is_processing = instance.get("is_processing", 0)
         has_active_subtask = todos.get("current_task") is not None
 
-        if instance["status"] == "stopped":
+        if status == "stopped":
             status_icon = "[dim]o[/dim]"
-        elif is_processing or has_active_subtask:
+        elif status == "processing" or has_active_subtask:
             status_icon = "[green]>[/green]"
         else:
             status_icon = "[cyan]*[/cyan]"
@@ -647,7 +706,7 @@ def create_mobile_instances_table(instances: list, selected_idx: int) -> Table:
         else:
             progress_bar = "[dim]-----[/dim]"
 
-        end_time = instance.get("stopped_at") if instance["status"] == "stopped" else None
+        end_time = instance.get("stopped_at") if status == "stopped" else None
         duration = format_duration(instance.get("registered_at", ""), end_time)
         if " " in duration:
             duration = duration.split()[0]
@@ -668,7 +727,7 @@ def create_compact_instances_table(instances: list, selected_idx: int) -> Table:
         max_name_len = max(max_name_len, len(name) + 2)
 
     table = Table(
-        title="Claude Instances  [dim](jk=nav h/l=page r=rename s=stop d=delete c=clear o=sort q=quit)[/dim]",
+        title="Claude Instances  [dim](jk=nav h/l=page r=rename s=stop d=delete K=kill c=clear o=sort q=quit)[/dim]",
         show_header=True,
         header_style="bold cyan",
         border_style="blue",
@@ -690,18 +749,18 @@ def create_compact_instances_table(instances: list, selected_idx: int) -> Table:
 
         device = instance.get("device_id", "?")
         instance_id = instance.get("id", "")
+        status = instance.get("status", "idle")
         # Poll for fresh todos when processing, otherwise use cached data
-        if instance.get("is_processing", 0):
+        if status == "processing":
             todos = get_instance_todos(instance_id, use_cache=False)
         else:
             todos = get_instance_todos(instance_id, use_cache=True)
 
-        is_processing = instance.get("is_processing", 0)
         has_active_subtask = todos.get("current_task") is not None
 
-        if instance["status"] == "stopped":
+        if status == "stopped":
             status_icon = "[dim]o[/dim]"
-        elif is_processing or has_active_subtask:
+        elif status == "processing" or has_active_subtask:
             status_icon = "[green]>[/green]"
         else:
             status_icon = "[cyan]*[/cyan]"
@@ -713,7 +772,7 @@ def create_compact_instances_table(instances: list, selected_idx: int) -> Table:
         else:
             progress_text = "[dim]-[/dim]"
 
-        end_time = instance.get("stopped_at") if instance["status"] == "stopped" else None
+        end_time = instance.get("stopped_at") if status == "stopped" else None
         duration = format_duration(instance.get("registered_at", ""), end_time)
 
         table.add_row(selector, status_icon, name, device, progress_text, duration)
@@ -731,6 +790,7 @@ def create_events_panel(events: list) -> Panel:
     EVENT_STYLES = {
         "instance_registered": ("green", "+", "registered"),
         "instance_stopped": ("red", "-", "stopped"),
+        "instance_killed": ("red", "x", "killed"),
         "instance_renamed": ("yellow", "~", "renamed"),
         "tts_queued": ("yellow", "o", "queued TTS"),
         "tts_playing": ("cyan", ">", "speaking"),
@@ -788,6 +848,7 @@ def create_mobile_events_panel(events: list) -> Panel:
     EVENT_ICONS = {
         "instance_registered": "[green]+[/green]",
         "instance_stopped": "[red]-[/red]",
+        "instance_killed": "[red]x[/red]",
         "instance_renamed": "[yellow]~[/yellow]",
         "tts_playing": "[cyan]>[/cyan]",
         "notification_sent": "[magenta]*[/magenta]",
@@ -908,6 +969,60 @@ def create_server_logs_panel(max_lines: int = 8) -> Panel:
     return Panel(content, title="Server Logs", border_style="blue")
 
 
+def create_deploy_logs_panel(max_lines: int = 8) -> Panel:
+    """Create a panel showing deploy logs from .claude-deploy.log."""
+    is_active, log_path, metadata = check_deploy_status()
+
+    if not is_active or not log_path or not log_path.exists():
+        content = Text("No deployment in progress", style="dim")
+        return Panel(content, title="Deploy", border_style="blue")
+
+    # Build title from metadata
+    env = metadata.get("environment", "?")
+    repo = metadata.get("repo", "")
+    status_label = "RUNNING" if is_active else "COMPLETED"
+    title_parts = ["Deploy"]
+    if env:
+        title_parts.append(f"[yellow]{env}[/yellow]")
+    if repo:
+        title_parts.append(f"[dim]{repo}[/dim]")
+    title_parts.append(f"[bold green]{status_label}[/bold green]")
+    title = " | ".join(title_parts)
+
+    try:
+        raw_lines = log_path.read_text().splitlines()
+        # Tail: take the last N lines
+        tail_lines = raw_lines[-max_lines:] if len(raw_lines) > max_lines else raw_lines
+
+        if not tail_lines:
+            content = Text("Deploy log is empty", style="dim")
+            return Panel(content, title=title, border_style="yellow")
+
+        content = Text()
+        for i, raw_line in enumerate(tail_lines):
+            if i > 0:
+                content.append("\n")
+            line = strip_ansi(raw_line)
+
+            # Color lines based on content
+            lower = line.lower()
+            if "error" in lower or "fail" in lower or "fatal" in lower:
+                content.append(line, style="red")
+            elif "success" in lower or "deployed" in lower or "complete" in lower:
+                content.append(line, style="green")
+            elif "build" in lower or "step" in lower:
+                content.append(line, style="cyan")
+            elif "warn" in lower:
+                content.append(line, style="yellow")
+            else:
+                content.append(line)
+
+    except Exception:
+        content = Text("Could not read deploy log", style="dim red")
+
+    return Panel(content, title=title, border_style="yellow")
+
+
 def create_instance_details_panel(instance: dict, todos_data: dict, compact: bool = False) -> Panel:
     """Create a panel showing details for the selected instance.
 
@@ -921,7 +1036,12 @@ def create_instance_details_panel(instance: dict, todos_data: dict, compact: boo
     name = format_instance_name(instance, max_len=25)
     status = instance.get("status", "unknown")
     device = instance.get("device_id", "?")
-    status_icon = "[green]*[/green]" if status == "active" else "[dim]o[/dim]"
+    if status == "stopped":
+        status_icon = "[dim]o[/dim]"
+    elif status == "processing":
+        status_icon = "[green]>[/green]"
+    else:
+        status_icon = "[cyan]*[/cyan]"
 
     # Get TTS voice profile info
     tts_voice = instance.get("tts_voice", "")
@@ -1002,7 +1122,12 @@ def create_mobile_instance_details_panel(instance: dict, todos_data: dict) -> Pa
 
     name = format_instance_name(instance, max_len=15)
     status = instance.get("status", "unknown")
-    status_icon = "[green]*[/green]" if status == "active" else "[dim]o[/dim]"
+    if status == "stopped":
+        status_icon = "[dim]o[/dim]"
+    elif status == "processing":
+        status_icon = "[green]>[/green]"
+    else:
+        status_icon = "[cyan]*[/cyan]"
 
     # Get TTS voice profile info
     tts_voice = instance.get("tts_voice", "")
@@ -1042,26 +1167,30 @@ def create_server_status_panel() -> Panel:
 
 
 def create_info_panel(max_lines: int = 8) -> Panel:
-    """Create the info panel - events or server logs based on panel_page."""
+    """Create the info panel - events, server logs, or deploy logs based on panel_page."""
     if panel_page == 0:
         events = get_recent_events(max_lines)
         return create_events_panel(events)
-    else:
+    elif panel_page == 1:
         return create_server_logs_panel(max_lines=max_lines)
+    else:
+        return create_deploy_logs_panel(max_lines=max_lines)
 
 
 def create_mobile_info_panel(max_lines: int = 4) -> Panel:
-    """Create a compact info panel for mobile - events or server logs based on panel_page."""
+    """Create a compact info panel for mobile - events, server logs, or deploy logs based on panel_page."""
     if panel_page == 0:
         events = get_recent_events(max_lines)
         return create_mobile_events_panel(events)
-    else:
+    elif panel_page == 1:
         return create_server_logs_panel(max_lines=max_lines)
+    else:
+        return create_deploy_logs_panel(max_lines=max_lines)
 
 
 def create_status_bar(instances: list, selected_idx: int) -> Text:
     """Create the status bar."""
-    active_count = sum(1 for i in instances if i.get("status") == "active")
+    active_count = sum(1 for i in instances if i.get("status") in ("processing", "idle"))
     total_count = len(instances)
 
     # Mode indicator with color
@@ -1069,7 +1198,7 @@ def create_status_bar(instances: list, selected_idx: int) -> Text:
     mode_color = mode_colors.get(layout_mode, "white")
 
     # Page indicator
-    page_names = ["Events", "Logs"]
+    page_names = ["Events", "Logs", "Deploy"]
     page_name = page_names[panel_page] if panel_page < len(page_names) else "?"
 
     text = Text()
@@ -1077,18 +1206,19 @@ def create_status_bar(instances: list, selected_idx: int) -> Text:
     text.append_text(Text.from_markup(f"[{mode_color}]{layout_mode}[/{mode_color}]"))
     text.append(f"  |  {selected_idx + 1}/{total_count}  |  ", style="white")
     text.append_text(Text.from_markup(f"[cyan]{page_name}[/cyan] [dim](h/l)[/dim]  |  "))
-    text.append_text(Text.from_markup("[dim]c=clear  o=sort  q=quit[/dim]"))
+    text.append_text(Text.from_markup("[dim]K=kill  c=clear  o=sort  q=quit[/dim]"))
 
     return text
 
 
 def create_mobile_status_bar(instances: list, selected_idx: int) -> Text:
     """Create a compact status bar for mobile."""
-    active_count = sum(1 for i in instances if i.get("status") == "active")
+    active_count = sum(1 for i in instances if i.get("status") in ("processing", "idle"))
     total_count = len(instances)
 
     # Page indicator
-    page_indicator = "E" if panel_page == 0 else "L"
+    page_indicators = {0: "E", 1: "L", 2: "D"}
+    page_indicator = page_indicators.get(panel_page, "?")
 
     text = Text()
     text.append(f"{active_count}/{total_count} ", style="white")
@@ -1112,7 +1242,7 @@ def generate_mobile_dashboard(instances: list, selected_idx: int) -> Layout:
         selected_instance = instances[selected_idx]
         instance_id = selected_instance.get("id", "")
         # Poll for fresh todos when processing, otherwise use cached data
-        if selected_instance.get("is_processing", 0):
+        if selected_instance.get("status") == "processing":
             selected_todos = get_instance_todos(instance_id, use_cache=False)
         else:
             selected_todos = get_instance_todos(instance_id, use_cache=True)
@@ -1156,7 +1286,7 @@ def generate_compact_dashboard(instances: list, selected_idx: int) -> Layout:
         selected_instance = instances[selected_idx]
         instance_id = selected_instance.get("id", "")
         # Poll for fresh todos when processing, otherwise use cached data
-        if selected_instance.get("is_processing", 0):
+        if selected_instance.get("status") == "processing":
             selected_todos = get_instance_todos(instance_id, use_cache=False)
         else:
             selected_todos = get_instance_todos(instance_id, use_cache=True)
@@ -1220,7 +1350,7 @@ def generate_vertical_dashboard(instances: list, selected_idx: int) -> Layout:
         selected_instance = instances[selected_idx]
         instance_id = selected_instance.get("id", "")
         # Poll for fresh todos when processing, otherwise use cached data
-        if selected_instance.get("is_processing", 0):
+        if selected_instance.get("status") == "processing":
             selected_todos = get_instance_todos(instance_id, use_cache=False)
         else:
             selected_todos = get_instance_todos(instance_id, use_cache=True)
@@ -1308,7 +1438,7 @@ def generate_dashboard(instances: list, selected_idx: int) -> Layout:
         selected_instance = instances[selected_idx]
         instance_id = selected_instance.get("id", "")
         # Poll for fresh todos when processing, otherwise use cached data
-        if selected_instance.get("is_processing", 0):
+        if selected_instance.get("status") == "processing":
             selected_todos = get_instance_todos(instance_id, use_cache=False)
         else:
             selected_todos = get_instance_todos(instance_id, use_cache=True)
@@ -1386,6 +1516,7 @@ def get_dashboard(instances: list, selected_idx: int) -> Layout:
 def main():
     """Main entry point."""
     global selected_index, instances_cache, api_healthy, api_error_message, layout_mode, layout_mode_forced, sort_mode, panel_page
+    global deploy_active, deploy_log_path, deploy_metadata, deploy_previous_page, deploy_auto_switched
 
     parser = argparse.ArgumentParser(description="Token-API TUI Dashboard")
     parser.add_argument("--mobile", "-m", action="store_true",
@@ -1430,7 +1561,7 @@ def main():
         console.print("Run the Token-API server first to initialize the database.")
         sys.exit(1)
 
-    console.print("[dim]Controls: jk=select, h/l=page, r=rename, s=stop, d=delete, c=clear all, o=sort, q=quit[/dim]\n")
+    console.print("[dim]Controls: jk=select, h/l=page, r=rename, s=stop, d=delete, K=kill, c=clear all, o=sort, q=quit[/dim]\n")
 
     quit_flag = threading.Event()
     input_mode = threading.Event()
@@ -1519,6 +1650,10 @@ def main():
                     elif key == 'v':
                         with action_lock:
                             action_queue.append('voice')
+                        update_flag.set()
+                    elif key == 'K':
+                        with action_lock:
+                            action_queue.append('kill')
                         update_flag.set()
         except Exception:
             pass
@@ -1742,6 +1877,45 @@ def main():
                                 live.update(get_dashboard(instances_cache, selected_index))
                                 live.refresh()
 
+                    elif action == 'kill' and instances_cache:
+                        if 0 <= selected_index < len(instances_cache):
+                            instance = instances_cache[selected_index]
+                            instance_id = instance.get("id")
+                            instance_name = format_instance_name(instance)
+
+                            input_mode.set()
+                            time.sleep(0.1)
+                            live.stop()
+                            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, original_terminal_settings)
+
+                            console.print(f"\n[red bold]Kill frozen instance:[/red bold] {instance_name}")
+                            console.print("[dim]This sends SIGTERM/SIGKILL to the Claude process[/dim]")
+                            try:
+                                confirm = Prompt.ask("Type 'yes' to kill", default="no")
+                                if confirm.lower() == 'yes':
+                                    result = kill_instance(instance_id)
+                                    if result and result.get("status") in ("killed", "already_dead"):
+                                        pid = result.get("pid", "?")
+                                        sig = result.get("signal", "?")
+                                        console.print(f"[green]v[/green] Killed: {instance_name} (PID {pid}, {sig})")
+                                    elif result and result.get("detail"):
+                                        console.print(f"[red]x[/red] {result['detail']}")
+                                    else:
+                                        console.print("[red]x[/red] Kill failed (see server logs)")
+                                else:
+                                    console.print("[dim]Cancelled[/dim]")
+                            except (KeyboardInterrupt, EOFError):
+                                console.print("[dim]Cancelled[/dim]")
+
+                            time.sleep(0.3)
+                            input_mode.clear()
+                            instances_cache = get_instances()
+                            if instances_cache:
+                                selected_index = min(selected_index, len(instances_cache) - 1)
+                            live.start()
+                            live.update(get_dashboard(instances_cache, selected_index))
+                            live.refresh()
+
                     elif action == 'sort':
                         input_mode.set()
                         time.sleep(0.1)
@@ -1776,11 +1950,17 @@ def main():
 
                     elif action == 'page_prev':
                         panel_page = max(0, panel_page - 1)
+                        # If user manually navigates away from Deploy during active deploy, disable auto-switch-back
+                        if deploy_active and deploy_auto_switched and panel_page != 2:
+                            deploy_auto_switched = False
                         live.update(get_dashboard(instances_cache, selected_index))
                         live.refresh()
 
                     elif action == 'page_next':
-                        panel_page = min(1, panel_page + 1)
+                        panel_page = min(PANEL_PAGE_MAX, panel_page + 1)
+                        # If user manually navigates away from Deploy during active deploy, disable auto-switch-back
+                        if deploy_active and deploy_auto_switched and panel_page != 2:
+                            deploy_auto_switched = False
                         live.update(get_dashboard(instances_cache, selected_index))
                         live.refresh()
 
@@ -1835,6 +2015,25 @@ def main():
                     api_healthy, api_error_message = check_api_health()
                     if instances_cache:
                         selected_index = min(selected_index, len(instances_cache) - 1)
+
+                    # Deploy auto-switch logic
+                    now_active, now_log, now_meta = check_deploy_status()
+                    if now_active and not deploy_active:
+                        # Deploy just started: save current page and switch to Deploy
+                        deploy_previous_page = panel_page
+                        panel_page = 2
+                        deploy_auto_switched = True
+                        deploy_log_path = now_log
+                        deploy_metadata = now_meta
+                    elif not now_active and deploy_active:
+                        # Deploy just ended: switch back if we auto-switched
+                        if deploy_auto_switched:
+                            panel_page = deploy_previous_page
+                            deploy_auto_switched = False
+                        deploy_log_path = None
+                        deploy_metadata = {}
+                    deploy_active = now_active
+
                     live.update(get_dashboard(instances_cache, selected_index))
                     last_refresh = time.time()
 
