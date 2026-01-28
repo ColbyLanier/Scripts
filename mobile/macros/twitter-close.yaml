@@ -1,0 +1,20 @@
+# Twitter Close Tracker
+# Reports to /phone when Twitter is closed
+
+name: "Twitter Close"
+category: "Telemetry"
+description: "Track Twitter app closes"
+enabled: true
+
+triggers:
+  - type: app_launched
+    apps: ["X"]
+    packages: ["com.twitter.android"]
+    launched: false  # App closed
+
+actions:
+  - type: http_request
+    url: "http://100.66.10.74:7777/phone"
+    method: POST
+    body: '{"app": "twitter", "action": "close"}'
+    content_type: "application/json"

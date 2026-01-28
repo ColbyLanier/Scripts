@@ -1,0 +1,185 @@
+# Enforcement Endpoint
+# Listens for commands from desktop server to enable/disable apps
+# Server pushes enforcement decisions here
+
+name: "Enforce"
+category: "Telemetry"
+description: "HTTP endpoint for server-pushed enforcement commands"
+enabled: true
+
+variables:
+  - name: action
+    type: string
+    value: ""
+  - name: app
+    type: string
+    value: ""
+  - name: response_code
+    type: integer
+    value: 0
+
+triggers:
+  - type: http_server
+    identifier: "enforce"
+    send_response: true
+
+actions:
+  # Parse the request - action and app come from query params or body
+  # {action: "disable", app: "twitter"}
+
+  # Check if action is "disable"
+  - type: if
+    conditions:
+      - type: variable
+        variable: "action"
+        var_type: string
+        comparison: equals
+        value: "disable"
+        local_var: true
+    or_conditions: false
+
+  # Disable the requested app
+  # Note: In practice, we'd need separate if blocks per app
+  # For now, handle twitter
+  - type: if
+    conditions:
+      - type: variable
+        variable: "app"
+        var_type: string
+        comparison: equals
+        value: "twitter"
+        local_var: true
+
+  - type: disable_app
+    apps: ["X"]
+    packages: ["com.twitter.android"]
+    disable: true
+
+  - type: notification
+    title: "App Blocked"
+    text: "Twitter disabled by server"
+    channel_type: 1
+
+  - type: end_if
+
+  # YouTube
+  - type: if
+    conditions:
+      - type: variable
+        variable: "app"
+        var_type: string
+        comparison: equals
+        value: "youtube"
+        local_var: true
+
+  - type: disable_app
+    apps: ["YouTube", "YouTube"]
+    packages: ["app.revanced.android.youtube", "com.google.android.youtube"]
+    disable: true
+
+  - type: notification
+    title: "App Blocked"
+    text: "YouTube disabled by server"
+    channel_type: 1
+
+  - type: end_if
+
+  # Games
+  - type: if
+    conditions:
+      - type: variable
+        variable: "app"
+        var_type: string
+        comparison: equals
+        value: "game"
+        local_var: true
+
+  - type: disable_app
+    apps: ["Thronefall", "Slice & Dice", "20 Minutes Till Dawn", "OneBit Adventure"]
+    packages:
+      - "com.doghowlgames.thronefall"
+      - "com.com.tann.dice"
+      - "com.Flanne.MinutesTillDawn.roguelike.shooting.gp"
+      - "com.GalacticSlice.OneBitAdventure"
+    disable: true
+
+  - type: notification
+    title: "App Blocked"
+    text: "Game disabled by server"
+    channel_type: 1
+
+  - type: end_if
+
+  - type: end_if  # end action == disable
+
+  # Handle "enable" action
+  - type: if
+    conditions:
+      - type: variable
+        variable: "action"
+        var_type: string
+        comparison: equals
+        value: "enable"
+        local_var: true
+
+  # Twitter enable
+  - type: if
+    conditions:
+      - type: variable
+        variable: "app"
+        var_type: string
+        comparison: equals
+        value: "twitter"
+        local_var: true
+
+  - type: disable_app
+    apps: ["X"]
+    packages: ["com.twitter.android"]
+    disable: false
+
+  - type: end_if
+
+  # YouTube enable
+  - type: if
+    conditions:
+      - type: variable
+        variable: "app"
+        var_type: string
+        comparison: equals
+        value: "youtube"
+        local_var: true
+
+  - type: disable_app
+    apps: ["YouTube", "YouTube"]
+    packages: ["app.revanced.android.youtube", "com.google.android.youtube"]
+    disable: false
+
+  - type: end_if
+
+  # Games enable
+  - type: if
+    conditions:
+      - type: variable
+        variable: "app"
+        var_type: string
+        comparison: equals
+        value: "game"
+        local_var: true
+
+  - type: disable_app
+    apps: ["Thronefall", "Slice & Dice", "20 Minutes Till Dawn", "OneBit Adventure"]
+    packages:
+      - "com.doghowlgames.thronefall"
+      - "com.com.tann.dice"
+      - "com.Flanne.MinutesTillDawn.roguelike.shooting.gp"
+      - "com.GalacticSlice.OneBitAdventure"
+    disable: false
+
+  - type: end_if
+
+  - type: end_if  # end action == enable
+
+  # Send response
+  - type: http_response
+    code: "OK"
+    text: '{"status": "ok"}'

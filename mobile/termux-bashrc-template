@@ -1,11 +1,11 @@
 # ~/.bashrc for Termux (phone)
-# Minimal quality-of-life setup + mesh-pipe integration
+# Minimal quality-of-life setup + token-api integration
 
 # ====================================================
 # ENVIRONMENT CONFIGURATION
 # ====================================================
 # Source local .env file for secrets (not in repo)
-# Expected vars: MESH_AUTH_TOKEN, DESKTOP_IP
+# Expected vars: WSL_IP (for SSH), WINDOWS_IP (for system control)
 if [[ -f "$HOME/.env" ]]; then
     set -a
     source "$HOME/.env"
@@ -13,39 +13,31 @@ if [[ -f "$HOME/.env" ]]; then
 fi
 
 # Verify required variables are set
-if [[ -z "$MESH_AUTH_TOKEN" || -z "$DESKTOP_IP" ]]; then
-    echo "Warning: MESH_AUTH_TOKEN or DESKTOP_IP not set. Create ~/.env with:"
-    echo '  MESH_AUTH_TOKEN="your_token"'
-    echo '  DESKTOP_IP="your_tailscale_ip"'
+if [[ -z "$WSL_IP" || -z "$WINDOWS_IP" ]]; then
+    echo "Warning: WSL_IP or WINDOWS_IP not set. Create ~/.env with:"
+    echo '  WSL_IP="wsl_tailscale_ip"'
+    echo '  WINDOWS_IP="windows_tailscale_ip"'
 fi
 
 # ====================================================
-# MESH-PIPE INTEGRATION
+# DESKTOP SSH (WSL)
 # ====================================================
-
-# SSH to desktop with auto session registration
-# Usage: sshd [command] - runs command and exits, or starts interactive session
+# SSH to WSL - Claude sessions are tracked by token-api hooks automatically
+# Usage: sshpc [command] - runs command on desktop, or starts interactive session
 ssh-desktop() {
   if [[ $# -gt 0 ]]; then
-    # Run command and exit
-    ssh token@${DESKTOP_IP} -t "$*"
+    ssh token@${WSL_IP} -t "$*"
   else
-    # Interactive session with mesh-pipe registration
-    ssh token@${DESKTOP_IP} -t "
-      curl -s -X POST 'http://localhost:7777/session/start' \
-        -H 'Content-Type: application/json' \
-        -d '{\"device_id\": \"Token-S24\", \"auth_token\": \"${MESH_AUTH_TOKEN}\"}' > /dev/null 2>&1
-      exec bash -l
-    "
+    ssh token@${WSL_IP}
   fi
 }
-alias sshd="ssh-desktop"
+alias sshpc="ssh-desktop"
 
 # Fetch and update .bashrc from desktop
-alias fetch-bashrc='ssh token@${DESKTOP_IP} "cat /home/token/Scripts/termux/termux-bashrc-template" > ~/.bashrc && source ~/.bashrc && echo "bashrc updated and reloaded"'
+alias fetch-bashrc='ssh token@${WSL_IP} "cat /home/token/Scripts/mobile/termux-bashrc-template" > ~/.bashrc && source ~/.bashrc && echo "bashrc updated and reloaded"'
 
 # Fetch and update termux.properties from desktop
-alias fetch-properties='ssh token@${DESKTOP_IP} "cat /home/token/Scripts/termux/termux-properties-template" > ~/.termux/termux.properties && termux-reload-settings && echo "termux properties updated and reloaded"'
+alias fetch-properties='ssh token@${WSL_IP} "cat /home/token/Scripts/mobile/termux-properties-template" > ~/.termux/termux.properties && termux-reload-settings && echo "termux properties updated and reloaded"'
 
 # ====================================================
 # HISTORY
@@ -251,11 +243,11 @@ alias gpull="git pull origin"
 alias gadd="git add ."
 
 # ====================================================
-# REMOTE SHUTDOWN
+# WINDOWS SYSTEM CONTROL
 # ====================================================
 # Shutdown Windows with 15s delay, Ctrl+C to cancel
 shutdown() {
-    local API="http://${DESKTOP_IP}:7777"
+    local API="http://${WINDOWS_IP}:7777"
 
     echo "Initiating shutdown in 15 seconds... (Ctrl+C to cancel)"
 

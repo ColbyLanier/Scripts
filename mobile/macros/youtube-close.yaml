@@ -1,0 +1,20 @@
+# YouTube Close Tracker
+# Reports to /phone when YouTube is closed
+
+name: "YouTube Close"
+category: "Telemetry"
+description: "Track YouTube app closes"
+enabled: true
+
+triggers:
+  - type: app_launched
+    apps: ["YouTube", "YouTube"]
+    packages: ["com.google.android.youtube", "app.revanced.android.youtube"]
+    launched: false  # App closed
+
+actions:
+  - type: http_request
+    url: "http://100.66.10.74:7777/phone"
+    method: POST
+    body: '{"app": "youtube", "action": "close"}'
+    content_type: "application/json"

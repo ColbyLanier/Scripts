@@ -1,0 +1,19 @@
+# Geofence Home Enter Telemetry
+# Reports when arriving home
+
+name: "Geofence Home Enter"
+category: "Telemetry"
+description: "Track entering home geofence"
+enabled: true
+
+triggers:
+  - type: geofence
+    geofence_id: "1e4e4f0d-ccd8-40a2-b84a-6027a2843cb8"
+    enter: true
+
+actions:
+  - type: http_request
+    url: "http://100.66.10.74:7777/phone"
+    method: POST
+    body: '{"location": "home", "action": "enter"}'
+    content_type: "application/json"

@@ -1,0 +1,20 @@
+# YouTube Open Tracker
+# Reports to /phone when YouTube is opened
+
+name: "YouTube Open"
+category: "Telemetry"
+description: "Track YouTube app opens"
+enabled: true
+
+triggers:
+  - type: app_launched
+    apps: ["YouTube", "YouTube"]
+    packages: ["com.google.android.youtube", "app.revanced.android.youtube"]
+    launched: true
+
+actions:
+  - type: http_request
+    url: "http://100.66.10.74:7777/phone"
+    method: POST
+    body: '{"app": "youtube", "action": "open"}'
+    content_type: "application/json"

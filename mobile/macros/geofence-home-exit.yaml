@@ -1,0 +1,19 @@
+# Geofence Home Exit Telemetry
+# Reports when leaving home
+
+name: "Geofence Home Exit"
+category: "Telemetry"
+description: "Track leaving home geofence"
+enabled: true
+
+triggers:
+  - type: geofence
+    geofence_id: "1e4e4f0d-ccd8-40a2-b84a-6027a2843cb8"
+    enter: false  # Exit
+
+actions:
+  - type: http_request
+    url: "http://100.66.10.74:7777/phone"
+    method: POST
+    body: '{"location": "home", "action": "exit"}'
+    content_type: "application/json"
