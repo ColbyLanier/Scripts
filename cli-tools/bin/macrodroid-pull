@@ -1,0 +1,120 @@
+#!/bin/bash
+# macrodroid-pull - Pull files from phone via sshp (Tailscale SSH)
+#
+# Usage:
+#   macrodroid-pull <remote-path> [local-path]   # Pull specific file
+#   macrodroid-pull --list                       # List ~/macros/ on phone
+#   macrodroid-pull --latest                     # Pull most recent .mdr/.macro
+
+set -e
+
+SSH_HOST="phone"
+DEFAULT_REMOTE="~/macros"
+DEFAULT_LOCAL="."
+
+usage() {
+    cat << 'EOF'
+macrodroid-pull - Pull files from phone via Tailscale SSH
+
+Usage:
+    macrodroid-pull <remote-path> [local-path]   # Pull specific file
+    macrodroid-pull --list                       # List ~/macros/ contents
+    macrodroid-pull --latest [local-path]        # Pull most recent file
+    macrodroid-pull --all [local-dir]            # Pull all macros
+
+Examples:
+    macrodroid-pull ~/macros/export.mdr
+    macrodroid-pull --list
+    macrodroid-pull --latest ./backup.mdr
+    macrodroid-pull --all ./phone-macros/
+
+Note: Requires SSH access to Termux on the phone via Tailscale.
+EOF
+    exit 1
+}
+
+test_connection() {
+    if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$SSH_HOST" "echo ok" &>/dev/null; then
+        echo "Error: Cannot connect to phone" >&2
+        echo "Make sure Termux sshd is running and Tailscale is connected" >&2
+        exit 1
+    fi
+}
+
+list_macros() {
+    test_connection
+    echo "Files in $DEFAULT_REMOTE on phone:"
+    echo "=================================="
+    ssh "$SSH_HOST" "ls -lah $DEFAULT_REMOTE/ 2>/dev/null || echo '(directory empty or missing)'"
+}
+
+pull_latest() {
+    local dest="${1:-.}"
+    test_connection
+
+    # Find most recent .mdr or .macro file
+    local latest=$(ssh "$SSH_HOST" "ls -t $DEFAULT_REMOTE/*.mdr $DEFAULT_REMOTE/*.macro 2>/dev/null | head -1")
+
+    if [[ -z "$latest" ]]; then
+        echo "No .mdr or .macro files found in $DEFAULT_REMOTE" >&2
+        exit 1
+    fi
+
+    local filename=$(basename "$latest")
+    echo "Pulling latest: $latest"
+    scp -q "$SSH_HOST:$latest" "$dest/$filename"
+    echo "Saved to: $dest/$filename"
+}
+
+pull_all() {
+    local dest="${1:-.}"
+    test_connection
+
+    mkdir -p "$dest"
+    echo "Pulling all macros to: $dest/"
+    scp -q "$SSH_HOST:$DEFAULT_REMOTE/*" "$dest/" 2>/dev/null || {
+        echo "No files to pull or directory empty" >&2
+        exit 1
+    }
+    echo "Done. Files:"
+    ls -la "$dest/"
+}
+
+pull_file() {
+    local remote="$1"
+    local local_path="${2:-.}"
+    test_connection
+
+    local filename=$(basename "$remote")
+
+    # If local_path is a directory, append filename
+    if [[ -d "$local_path" ]]; then
+        local_path="$local_path/$filename"
+    fi
+
+    echo "Pulling: $remote -> $local_path"
+    scp -q "$SSH_HOST:$remote" "$local_path"
+    echo "Done: $local_path"
+}
+
+# Parse arguments
+case "${1:-}" in
+    -h|--help)
+        usage
+        ;;
+    --list|-l)
+        list_macros
+        ;;
+    --latest)
+        pull_latest "${2:-.}"
+        ;;
+    --all|-a)
+        pull_all "${2:-.}"
+        ;;
+    "")
+        usage
+        ;;
+    *)
+        pull_file "$1" "${2:-.}"
+        ;;
+esac

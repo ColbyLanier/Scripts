@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""
+macrodroid-read - Parse and display MacroDroid .mdr backup files
+
+Usage:
+    macrodroid-read <file.mdr>              # Show summary of all macros
+    macrodroid-read <file.mdr> --list       # List macro names only
+    macrodroid-read <file.mdr> --detail     # Show full details
+    macrodroid-read <file.mdr> --json       # Output as JSON
+    macrodroid-read <file.mdr> --macro "Name"  # Show specific macro
+    macrodroid-read <file.mdr> --export-yaml   # Export all as YAML specs
+    macrodroid-read --refresh               # Trigger export, pull, show summary
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from urllib.request import urlopen
+from urllib.error import URLError
+
+try:
+    import yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
+
+# Phone HTTP server for triggering exports
+PHONE_HTTP_PORT = 7777
+PHONE_TAILSCALE_IP = "100.102.92.24"
+PHONE_LOCAL_IP = os.environ.get("PHONE_LOCAL_IP", "192.168.0.89")
+EXPORT_ENDPOINT = "list-exports"
+DEFAULT_EXPORT_PATH = "~/macros/EXPORT.mdr"
+
+
+def trigger_phone_export(timeout=5):
+    """Trigger MacroDroid to export current state via HTTP endpoint."""
+    # Try Tailscale first, then local IP
+    ips = [PHONE_TAILSCALE_IP, PHONE_LOCAL_IP]
+
+    for ip in ips:
+        url = f"http://{ip}:{PHONE_HTTP_PORT}/{EXPORT_ENDPOINT}"
+        try:
+            with urlopen(url, timeout=timeout) as response:
+                result = response.read().decode()
+                if "OK" in result or response.status == 200:
+                    return True
+        except (URLError, TimeoutError, OSError):
+            continue
+
+    return False
+
+
+def pull_export_from_phone(dest_path=None):
+    """Pull the latest .mdr export from phone via SSH."""
+    if dest_path is None:
+        dest_path = Path.cwd() / "EXPORT.mdr"
+
+    try:
+        result = subprocess.run(
+            ["scp", "-q", f"phone:{DEFAULT_EXPORT_PATH}", str(dest_path)],
+            capture_output=True,
+            timeout=30
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def refresh_export(dest_path=None):
+    """Trigger export on phone, wait, then pull the file."""
+    print("Triggering MacroDroid export...", file=sys.stderr)
+    if not trigger_phone_export():
+        print("Warning: Could not trigger export (phone unreachable?)", file=sys.stderr)
+        return None
+
+    # Wait for export to complete
+    time.sleep(2)
+
+    if dest_path is None:
+        dest_path = Path.cwd() / "EXPORT.mdr"
+
+    print(f"Pulling export to {dest_path}...", file=sys.stderr)
+    if not pull_export_from_phone(dest_path):
+        print("Error: Could not pull export from phone", file=sys.stderr)
+        return None
+
+    return dest_path
+
+
+# Mapping of class types to human-readable names
+TRIGGER_NAMES = {
+    "HttpServerTrigger": "HTTP Server",
+    "WebHookTrigger": "Webhook",
+    "GeofenceTrigger": "Geofence",
+    "ApplicationLaunchedTrigger": "App Launched",
+    "TimerTrigger": "Timer",
+    "DeviceBootTrigger": "Device Boot",
+    "BatteryLevelTrigger": "Battery Level",
+    "NotificationTrigger": "Notification",
+    "ShakeDeviceTrigger": "Shake",
+    "ScreenOnOffTrigger": "Screen On/Off",
+    "WifiStateChangeTrigger": "WiFi State",
+    "SwipeTrigger": "Swipe",
+    "SunriseSunsetTrigger": "Sunrise/Sunset",
+    "PowerButtonTrigger": "Power Button",
+    "HeadphonesPluggedTrigger": "Headphones",
+    "BluetoothDeviceTrigger": "Bluetooth",
+    "SmsTrigger": "SMS",
+    "CallTrigger": "Call",
+    "LocationTrigger": "Location",
+    "NfcTrigger": "NFC",
+    "WidgetButtonTrigger": "Widget Button",
+    "FloatingButtonTrigger": "Floating Button",
+    "ShortcutTrigger": "Shortcut",
+    "CalendarTrigger": "Calendar",
+    "ExternalEventApiTrigger": "External API",
+}
+
+ACTION_NAMES = {
+    "NotificationAction": "Notification",
+    "HttpRequestAction": "HTTP Request",
+    "HttpServerResponseAction": "HTTP Response",
+    "VibrateAction": "Vibrate",
+    "ToastAction": "Toast",
+    "SpeakTextAction": "Speak",
+    "LaunchApplicationAction": "Launch App",
+    "LaunchActivityAction": "Launch Activity",
+    "SetVariableAction": "Set Variable",
+    "SetWifiStateAction": "WiFi",
+    "SetTorchAction": "Torch",
+    "PauseAction": "Wait",
+    "ShellCommandAction": "Shell",
+    "ForceRunMacroAction": "Run Macro",
+    "DisableAppAction": "Enable/Disable App",
+    "ControlMediaAction": "Media Control",
+    "IfConditionAction": "If Condition",
+    "ElseAction": "Else",
+    "EndIfAction": "End If",
+    "LoopAction": "Loop",
+    "EndLoopAction": "End Loop",
+    "WaitUntilTriggerAction": "Wait Until",
+    "StopMacroAction": "Stop Macro",
+    "SetVolumeAction": "Set Volume",
+    "SetBrightnessAction": "Set Brightness",
+    "OpenWebPageAction": "Open URL",
+    "ClipboardAction": "Clipboard",
+    "SendIntentAction": "Send Intent",
+    "SetAirplaneModeAction": "Airplane Mode",
+    "SetBluetoothAction": "Bluetooth",
+    "SendSmsAction": "Send SMS",
+    "ShareLocationAction": "Share Location",
+}
+
+
+def get_trigger_name(trigger):
+    """Get human-readable trigger name."""
+    class_type = trigger.get("m_classType", "Unknown")
+    return TRIGGER_NAMES.get(class_type, class_type.replace("Trigger", ""))
+
+
+def get_action_name(action):
+    """Get human-readable action name."""
+    class_type = action.get("m_classType", "Unknown")
+    return ACTION_NAMES.get(class_type, class_type.replace("Action", ""))
+
+
+def get_trigger_details(trigger):
+    """Extract key details from a trigger."""
+    class_type = trigger.get("m_classType", "")
+    details = {}
+
+    if class_type == "HttpServerTrigger":
+        details["identifier"] = trigger.get("identifier", "")
+        details["send_response"] = trigger.get("sendResponse", False)
+    elif class_type == "GeofenceTrigger":
+        details["enter"] = trigger.get("m_enterArea", False)
+        details["geofence_id"] = trigger.get("m_geofenceId", "")
+    elif class_type == "ApplicationLaunchedTrigger":
+        details["apps"] = trigger.get("m_applicationNameList", [])
+        details["launched"] = trigger.get("m_launched", True)
+    elif class_type == "TimerTrigger":
+        details["hour"] = trigger.get("m_hour", 0)
+        details["minute"] = trigger.get("m_minute", 0)
+        details["days"] = trigger.get("m_daysOfWeek", [])
+    elif class_type == "SunriseSunsetTrigger":
+        details["sunrise"] = trigger.get("m_sunrise", True)
+        details["offset_mins"] = trigger.get("m_offsetMinutes", 0)
+    elif class_type == "SwipeTrigger":
+        directions = ["Up", "Down", "Left", "Right"]
+        details["direction"] = directions[trigger.get("m_swipeDirection", 0)] if trigger.get("m_swipeDirection", 0) < 4 else "Unknown"
+        details["screen_state"] = trigger.get("m_screenState", 0)
+
+    return details
+
+
+def get_action_details(action):
+    """Extract key details from an action."""
+    class_type = action.get("m_classType", "")
+    details = {}
+
+    if class_type == "NotificationAction":
+        details["title"] = action.get("m_notificationSubject", "")
+        details["text"] = action.get("m_notificationText", "")[:50]
+    elif class_type == "HttpRequestAction":
+        config = action.get("requestConfig", {})
+        details["url"] = config.get("urlToOpen", "")[:60]
+        methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"]
+        details["method"] = methods[config.get("requestType", 0)]
+    elif class_type == "HttpServerResponseAction":
+        details["code"] = action.get("responseCode", "")
+        details["text"] = action.get("text", "")[:30]
+    elif class_type == "SpeakTextAction":
+        details["text"] = action.get("m_textToSpeak", "")[:50]
+    elif class_type == "LaunchApplicationAction":
+        details["app"] = action.get("m_appName", "")
+    elif class_type == "LaunchActivityAction":
+        details["app"] = action.get("m_appName", "")
+    elif class_type == "DisableAppAction":
+        details["apps"] = action.get("m_applicationNameList", [])
+        details["disable"] = action.get("m_option", 0) == 1
+    elif class_type == "ControlMediaAction":
+        controls = ["Play/Pause", "Next", "Previous", "Stop", "Play", "Pause"]
+        opt = action.get("m_option", 0)
+        if isinstance(opt, int) and opt < len(controls):
+            details["action"] = controls[opt]
+        else:
+            details["action"] = str(opt)
+    elif class_type == "WaitUntilTriggerAction":
+        details["timeout_secs"] = action.get("m_timeoutSeconds", 0)
+    elif class_type == "PauseAction":
+        details["seconds"] = action.get("m_seconds", 0)
+        details["ms"] = action.get("m_milliseconds", 0)
+
+    return details
+
+
+def print_macro_summary(macro, verbose=False):
+    """Print a summary of a macro."""
+    name = macro.get("m_name", "Unnamed")
+    enabled = macro.get("m_enabled", False)
+    category = macro.get("m_category", "None")
+    description = macro.get("m_description", "")
+
+    status = "✓" if enabled else "✗"
+    print(f"\n{status} {name}")
+    print(f"  Category: {category}")
+    if description:
+        print(f"  Description: {description[:80]}")
+
+    # Triggers
+    triggers = macro.get("m_triggerList", [])
+    print(f"  Triggers ({len(triggers)}):")
+    for t in triggers:
+        name = get_trigger_name(t)
+        details = get_trigger_details(t)
+        detail_str = ", ".join(f"{k}={v}" for k, v in details.items() if v) if details else ""
+        print(f"    - {name}" + (f" ({detail_str})" if detail_str else ""))
+
+    # Actions
+    actions = macro.get("m_actionList", [])
+    print(f"  Actions ({len(actions)}):")
+    for a in actions:
+        name = get_action_name(a)
+        if verbose:
+            details = get_action_details(a)
+            detail_str = ", ".join(f"{k}={v}" for k, v in details.items() if v) if details else ""
+            print(f"    - {name}" + (f" ({detail_str})" if detail_str else ""))
+        else:
+            print(f"    - {name}")
+
+    # Local variables
+    local_vars = macro.get("localVariables", [])
+    if local_vars:
+        print(f"  Variables ({len(local_vars)}):")
+        for v in local_vars:
+            vname = v.get("m_name", "")
+            vtype = ["bool", "int", "string", "decimal", "dict"][v.get("m_type", 2)]
+            print(f"    - {vname} ({vtype})")
+
+
+def macro_to_yaml_spec(macro):
+    """Convert a macro to YAML spec format for macrodroid-gen."""
+    spec = {
+        "name": macro.get("m_name", "Unnamed"),
+        "category": macro.get("m_category", "Uncategorized"),
+        "enabled": macro.get("m_enabled", True),
+    }
+
+    if macro.get("m_description"):
+        spec["description"] = macro.get("m_description")
+
+    # Variables
+    local_vars = macro.get("localVariables", [])
+    if local_vars:
+        spec["variables"] = []
+        for v in local_vars:
+            var_types = ["boolean", "integer", "string", "decimal", "dictionary"]
+            vtype = var_types[v.get("m_type", 2)]
+            var_spec = {"name": v.get("m_name", ""), "type": vtype}
+
+            # Get default value
+            if vtype == "boolean":
+                var_spec["value"] = v.get("m_booleanValue", False)
+            elif vtype == "integer":
+                var_spec["value"] = v.get("m_intValue", 0)
+            elif vtype == "string":
+                var_spec["value"] = v.get("m_stringValue", "")
+            elif vtype == "decimal":
+                var_spec["value"] = v.get("m_decimalValue", 0.0)
+
+            spec["variables"].append(var_spec)
+
+    # Note: Full trigger/action conversion would require extensive mapping
+    # For now, just note the types
+    spec["_triggers"] = [t.get("m_classType", "Unknown") for t in macro.get("m_triggerList", [])]
+    spec["_actions"] = [a.get("m_classType", "Unknown") for a in macro.get("m_actionList", [])]
+    spec["_note"] = "Full conversion requires manual review - trigger/action details not fully mapped"
+
+    return spec
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Parse and display MacroDroid .mdr backup files",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("mdr_file", nargs="?", help="MacroDroid .mdr backup file")
+    parser.add_argument("--refresh", "-r", action="store_true",
+                        help="Trigger export on phone and pull before reading")
+    parser.add_argument("--list", "-l", action="store_true", help="List macro names only")
+    parser.add_argument("--detail", "-d", action="store_true", help="Show full details")
+    parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
+    parser.add_argument("--macro", "-m", help="Show specific macro by name")
+    parser.add_argument("--export-yaml", action="store_true", help="Export as YAML specs")
+    parser.add_argument("--variables", "-v", action="store_true", help="Show global variables")
+    parser.add_argument("--geofences", "-g", action="store_true", help="Show geofences")
+    parser.add_argument("--http-config", action="store_true", help="Show HTTP server config")
+
+    args = parser.parse_args()
+
+    # Handle refresh: trigger export and pull from phone
+    if args.refresh:
+        mdr_path = refresh_export()
+        if mdr_path is None:
+            return 1
+    elif args.mdr_file:
+        mdr_path = Path(args.mdr_file)
+    else:
+        # No file specified and no --refresh, check for local EXPORT.mdr
+        mdr_path = Path.cwd() / "EXPORT.mdr"
+        if not mdr_path.exists():
+            print("Error: No .mdr file specified. Use --refresh to pull from phone.", file=sys.stderr)
+            parser.print_help()
+            return 1
+
+    if not mdr_path.exists():
+        print(f"Error: File not found: {mdr_path}", file=sys.stderr)
+        return 1
+
+    try:
+        with open(mdr_path, 'r') as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON: {e}", file=sys.stderr)
+        return 1
+
+    macros = data.get("macroList", [])
+
+    # Handle specific views
+    if args.variables:
+        variables = data.get("variables", [])
+        print(f"Global Variables ({len(variables)}):")
+        for v in variables:
+            vname = v.get("m_name", "")
+            vtype = ["bool", "int", "string", "decimal", "dict"][v.get("m_type", 2)]
+            print(f"  {vname} ({vtype})")
+        return 0
+
+    if args.geofences:
+        gd = data.get("geofenceData", {})
+        # Handle both old list format and new map format
+        if "geofenceMap" in gd:
+            geofences = list(gd["geofenceMap"].values())
+        else:
+            geofences = gd.get("m_geofenceData", [])
+        print(f"Geofences ({len(geofences)}):")
+        for g in geofences:
+            name = g.get("name", g.get("m_name", ""))
+            lat = g.get("latitude", g.get("m_latitude", 0))
+            lon = g.get("longitude", g.get("m_longitude", 0))
+            radius = g.get("radius", g.get("m_radius", 0))
+            gid = g.get("id", "")[:8]
+            print(f"  {name}: ({lat:.5f}, {lon:.5f}) r={radius}m [{gid}...]")
+        return 0
+
+    if args.http_config:
+        http_config = data.get("httpServerConfig", {})
+        print("HTTP Server Config:")
+        print(f"  Port: {http_config.get('port', 8080)}")
+        print(f"  Enabled: {http_config.get('enabled', False)}")
+        print(f"  Auth required: {http_config.get('authRequired', False)}")
+        return 0
+
+    # List mode
+    if args.list:
+        print(f"Macros ({len(macros)}):")
+        for m in macros:
+            status = "✓" if m.get("m_enabled", False) else "✗"
+            print(f"  {status} {m.get('m_name', 'Unnamed')}")
+        return 0
+
+    # Specific macro
+    if args.macro:
+        found = None
+        for m in macros:
+            if m.get("m_name", "").lower() == args.macro.lower():
+                found = m
+                break
+
+        if not found:
+            print(f"Macro not found: {args.macro}", file=sys.stderr)
+            print("Available macros:", file=sys.stderr)
+            for m in macros:
+                print(f"  - {m.get('m_name', 'Unnamed')}", file=sys.stderr)
+            return 1
+
+        if args.json:
+            print(json.dumps(found, indent=2))
+        else:
+            print_macro_summary(found, verbose=True)
+        return 0
+
+    # Export as YAML
+    if args.export_yaml:
+        if not HAS_YAML:
+            print("Error: PyYAML not installed. pip install pyyaml", file=sys.stderr)
+            return 1
+
+        specs = [macro_to_yaml_spec(m) for m in macros]
+        print(yaml.dump(specs, default_flow_style=False, sort_keys=False))
+        return 0
+
+    # JSON output
+    if args.json:
+        output = {
+            "macro_count": len(macros),
+            "macros": [
+                {
+                    "name": m.get("m_name", ""),
+                    "enabled": m.get("m_enabled", False),
+                    "category": m.get("m_category", ""),
+                    "triggers": [get_trigger_name(t) for t in m.get("m_triggerList", [])],
+                    "actions": [get_action_name(a) for a in m.get("m_actionList", [])],
+                }
+                for m in macros
+            ]
+        }
+        print(json.dumps(output, indent=2))
+        return 0
+
+    # Default: summary view
+    print(f"MacroDroid Backup: {mdr_path.name}")
+    print(f"Export version: {data.get('exportAppVersion', 'Unknown')}")
+    print(f"Total macros: {len(macros)}")
+    print("=" * 50)
+
+    for m in macros:
+        print_macro_summary(m, verbose=args.detail)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,110 @@
+#!/bin/bash
+# macrodroid-state - Fetch current MacroDroid state from phone
+#
+# Usage:
+#   macrodroid-state              # Pull latest export and show summary
+#   macrodroid-state --detail     # Show detailed view
+#   macrodroid-state --json       # Output as JSON
+#   macrodroid-state --refresh    # Remind user to export first, then pull
+
+set -e
+
+SCRATCHPAD="${SCRATCHPAD:-/tmp/macrodroid-state}"
+SSH_HOST="phone"
+PHONE_TAILSCALE_IP="100.102.92.24"
+PHONE_LOCAL_IP="${PHONE_LOCAL_IP:-192.168.0.89}"
+PHONE_HTTP_PORT="7777"
+EXPORT_FILE="EXPORT.mdr"
+
+usage() {
+    cat << 'EOF'
+macrodroid-state - Fetch current MacroDroid state from phone
+
+Usage:
+    macrodroid-state              # Pull latest export and show summary
+    macrodroid-state --detail     # Show detailed view
+    macrodroid-state --json       # Output as JSON
+    macrodroid-state --pull       # Just pull, don't display
+    macrodroid-state --list       # List available exports on phone
+
+Workflow:
+    1. Export in MacroDroid (Settings → Export/Import → Export)
+       - Configure export path to ~/macros/ for easy access
+    2. Run: macrodroid-state
+
+The tool pulls the most recent .mdr file from ~/macros/ on the phone.
+EOF
+    exit 1
+}
+
+trigger_export() {
+    # Hit the HTTP endpoint to trigger a fresh export
+    # Try Tailscale first, then local IP
+    curl -s --connect-timeout 3 "http://$PHONE_TAILSCALE_IP:$PHONE_HTTP_PORT/list-exports" >/dev/null 2>&1 ||
+    curl -s --connect-timeout 3 "http://$PHONE_LOCAL_IP:$PHONE_HTTP_PORT/list-exports" >/dev/null 2>&1
+}
+
+pull_latest() {
+    mkdir -p "$SCRATCHPAD"
+
+    # Try to trigger fresh export via HTTP (ignore failures - SSH fallback)
+    trigger_export
+
+    # Wait for export to complete
+    sleep 2
+
+    # Pull the canonical export file
+    if ! scp -q "$SSH_HOST:~/macros/$EXPORT_FILE" "$SCRATCHPAD/$EXPORT_FILE" 2>/dev/null; then
+        echo "Failed to pull $EXPORT_FILE from phone" >&2
+        echo "" >&2
+        echo "Ensure:" >&2
+        echo "  1. sshd is running on phone (run 'sshd' in Termux)" >&2
+        echo "  2. EXPORT.mdr exists in ~/macros/" >&2
+        exit 1
+    fi
+
+    echo "$SCRATCHPAD/$EXPORT_FILE"
+}
+
+list_exports() {
+    ssh -o ConnectTimeout=5 "$SSH_HOST" "ls -lah ~/macros/*.mdr ~/macros/*.macro 2>/dev/null || echo 'No exports found'"
+}
+
+# Parse args
+DETAIL=""
+JSON=""
+PULL_ONLY=""
+LIST_ONLY=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) usage ;;
+        --detail|-d) DETAIL="--detail"; shift ;;
+        --json|-j) JSON="--json"; shift ;;
+        --pull|-p) PULL_ONLY=1; shift ;;
+        --list|-l) LIST_ONLY=1; shift ;;
+        *) echo "Unknown option: $1" >&2; usage ;;
+    esac
+done
+
+if [[ -n "$LIST_ONLY" ]]; then
+    list_exports
+    exit 0
+fi
+
+# Pull latest
+MDR_FILE=$(pull_latest)
+
+if [[ -n "$PULL_ONLY" ]]; then
+    echo "$MDR_FILE"
+    exit 0
+fi
+
+# Display
+if [[ -n "$JSON" ]]; then
+    macrodroid-read "$MDR_FILE" --json
+elif [[ -n "$DETAIL" ]]; then
+    macrodroid-read "$MDR_FILE" --detail
+else
+    macrodroid-read "$MDR_FILE"
+fi

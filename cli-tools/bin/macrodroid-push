@@ -1,0 +1,95 @@
+#!/bin/bash
+# macrodroid-push - Push .macro files to phone via sshp (Tailscale SSH)
+#
+# Usage:
+#   macrodroid-push <macro-file>              # Push to default location
+#   macrodroid-push <macro-file> <dest-dir>   # Push to custom location
+#   macrodroid-gen spec.yaml | macrodroid-push -  # Pipe from generator
+
+set -e
+
+# Use the 'phone' SSH alias configured in ~/.ssh/config
+SSH_HOST="phone"
+# Termux home is always writable; user can import from here
+DEFAULT_DEST="~/macros"
+
+usage() {
+    cat << 'EOF'
+macrodroid-push - Push .macro files to phone via Tailscale SSH
+
+Usage:
+    macrodroid-push <macro-file>              # Push to default location
+    macrodroid-push <macro-file> <dest-dir>   # Push to custom location
+    macrodroid-push -                         # Read from stdin (pipe)
+
+Examples:
+    macrodroid-push my-macro.macro
+    macrodroid-gen spec.yaml | macrodroid-push - my-notification.macro
+
+Environment:
+    PHONE_TAILSCALE_IP  Phone IP (default: 100.102.92.24)
+    PHONE_SSH_USER      SSH user (default: root)
+
+Note: Requires SSH access to Termux on the phone via Tailscale.
+EOF
+    exit 1
+}
+
+# Check args
+if [[ $# -lt 1 ]]; then
+    usage
+fi
+
+SOURCE="$1"
+DEST_DIR="${2:-$DEFAULT_DEST}"
+
+# Handle stdin
+if [[ "$SOURCE" == "-" ]]; then
+    if [[ $# -lt 2 ]]; then
+        echo "Error: When reading from stdin, provide output filename" >&2
+        echo "Usage: macrodroid-gen spec.yaml | macrodroid-push - output.macro" >&2
+        exit 1
+    fi
+    FILENAME="$2"
+    DEST_DIR="${3:-$DEFAULT_DEST}"
+
+    # Read stdin to temp file
+    TEMP_FILE=$(mktemp)
+    trap "rm -f '$TEMP_FILE'" EXIT
+    cat > "$TEMP_FILE"
+    SOURCE="$TEMP_FILE"
+else
+    FILENAME=$(basename "$SOURCE")
+fi
+
+# Verify source exists
+if [[ ! -f "$SOURCE" ]]; then
+    echo "Error: File not found: $SOURCE" >&2
+    exit 1
+fi
+
+# Test SSH connection
+echo "Testing connection to phone..."
+if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$SSH_HOST" "echo ok" &>/dev/null; then
+    echo "Error: Cannot connect to phone" >&2
+    echo "Make sure:" >&2
+    echo "  1. Termux is running with sshd" >&2
+    echo "  2. Tailscale is connected" >&2
+    echo "  3. SSH key is set up (see 'sshp' docs)" >&2
+    exit 1
+fi
+
+# Expand ~ on remote side and create destination directory
+echo "Ensuring destination exists: $DEST_DIR"
+REMOTE_DEST=$(ssh "$SSH_HOST" "mkdir -p $DEST_DIR && cd $DEST_DIR && pwd")
+
+# Push the file
+echo "Pushing: $FILENAME -> $REMOTE_DEST/"
+scp -q "$SOURCE" "$SSH_HOST:$REMOTE_DEST/$FILENAME"
+
+echo "Done!"
+echo ""
+echo "Import in MacroDroid:"
+echo "  Settings → Import/Import → Select file"
+echo "  Browse to: $REMOTE_DEST/$FILENAME"
+echo "  (Use Termux file picker if available)"

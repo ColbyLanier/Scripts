@@ -1,0 +1,1100 @@
+#!/usr/bin/env python3
+"""
+macrodroid-gen - Generate MacroDroid .macro files from YAML/JSON specs
+
+Usage:
+    macrodroid-gen <spec-file>              # Generate from YAML/JSON file
+    macrodroid-gen --template <type>        # Show template for a macro type
+    macrodroid-gen --list-triggers          # List available trigger types
+    macrodroid-gen --list-actions           # List available action types
+    macrodroid-gen --example                # Show example spec
+
+Output goes to stdout by default. Redirect to file:
+    macrodroid-gen spec.yaml > my-macro.macro
+"""
+
+import argparse
+import json
+import random
+import sys
+from pathlib import Path
+
+try:
+    import yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
+
+
+def generate_guid():
+    """Generate a random 64-bit signed integer GUID (MacroDroid style)."""
+    return random.randint(-9223372036854775808, 9223372036854775807)
+
+
+# =============================================================================
+# TRIGGER BUILDERS
+# =============================================================================
+
+TRIGGER_BUILDERS = {}
+
+def trigger_builder(name):
+    """Decorator to register a trigger builder."""
+    def decorator(func):
+        TRIGGER_BUILDERS[name] = func
+        return func
+    return decorator
+
+
+@trigger_builder("http_server")
+def build_http_server_trigger(config):
+    """HTTP Server Request trigger - listens for incoming HTTP requests."""
+    return {
+        "identifier": config.get("identifier", "webhook"),
+        "ipAddressWhiteList": config.get("ip_whitelist", []),
+        "responseCode": config.get("response_code", "OK"),
+        "responseText": config.get("response_text", "OK"),
+        "saveBodyToFile": config.get("save_body", False),
+        "saveBodyToFileDirectory": config.get("save_directory", ""),
+        "saveBodyToFileFilename": config.get("save_filename", ""),
+        "sendResponse": config.get("send_response", True),
+        "variableWhiteList": config.get("variable_whitelist", []),
+        "variableWhiteListEnabled": config.get("variable_whitelist_enabled", False),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "HttpServerTrigger",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@trigger_builder("webhook")
+def build_webhook_trigger(config):
+    """Webhook (URL) trigger - triggered by external URL call."""
+    return {
+        "m_identifier": config.get("identifier", "webhook"),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "WebHookTrigger",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@trigger_builder("geofence")
+def build_geofence_trigger(config):
+    """Geofence trigger - location-based entry/exit."""
+    return {
+        "m_enterArea": config.get("enter", False),  # False = exit, True = enter
+        "m_geofenceId": config.get("geofence_id", ""),
+        "m_geofenceUpdateRateMinutes": config.get("update_rate_minutes", 5),
+        "m_triggerFromUnknown": config.get("trigger_from_unknown", False),
+        "m_updateRateText": config.get("update_rate_text", "5 Minutes"),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "GeofenceTrigger",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@trigger_builder("app_launched")
+def build_app_launched_trigger(config):
+    """Application Launched/Closed trigger."""
+    apps = config.get("apps", [])
+    packages = config.get("packages", [])
+    return {
+        "isAllApps": config.get("all_apps", False),
+        "m_applicationNameList": apps if isinstance(apps, list) else [apps],
+        "m_launched": config.get("launched", True),  # True = launched, False = closed
+        "m_packageNameList": packages if isinstance(packages, list) else [packages],
+        "usePackageNameOption": 0,
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "ApplicationLaunchedTrigger",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@trigger_builder("time")
+def build_time_trigger(config):
+    """Day/Time trigger."""
+    return {
+        "m_hour": config.get("hour", 0),
+        "m_minute": config.get("minute", 0),
+        "m_daysOfWeek": config.get("days", [True] * 7),  # [Sun, Mon, Tue, Wed, Thu, Fri, Sat]
+        "m_useAlarm": config.get("use_alarm", False),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "TimerTrigger",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@trigger_builder("device_boot")
+def build_device_boot_trigger(config):
+    """Device Boot trigger."""
+    return {
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "DeviceBootTrigger",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@trigger_builder("battery_level")
+def build_battery_level_trigger(config):
+    """Battery Level trigger."""
+    return {
+        "m_batteryLevel": config.get("level", 50),
+        "m_option": config.get("option", 0),  # 0 = drops to, 1 = increases to, 2 = changes
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "BatteryLevelTrigger",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@trigger_builder("notification")
+def build_notification_trigger(config):
+    """Notification trigger - when a notification is received."""
+    return {
+        "m_appName": config.get("app_name", ""),
+        "m_packageName": config.get("package", ""),
+        "m_textContentContains": config.get("text_contains", ""),
+        "m_titleContains": config.get("title_contains", ""),
+        "m_option": config.get("option", 0),  # 0 = received, 1 = dismissed
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "NotificationTrigger",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@trigger_builder("shake")
+def build_shake_trigger(config):
+    """Shake Device trigger."""
+    return {
+        "m_sensitivity": config.get("sensitivity", 2),  # 0-4
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "ShakeDeviceTrigger",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@trigger_builder("screen_on")
+def build_screen_on_trigger(config):
+    """Screen On/Off trigger."""
+    return {
+        "m_screenOn": config.get("screen_on", True),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "ScreenOnOffTrigger",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@trigger_builder("wifi_state")
+def build_wifi_state_trigger(config):
+    """WiFi State Change trigger."""
+    return {
+        "m_wifiState": config.get("state", 2),  # 0 = disabled, 1 = no network, 2 = connected
+        "m_ssidList": config.get("ssids", []),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "WifiStateChangeTrigger",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+# =============================================================================
+# ACTION BUILDERS
+# =============================================================================
+
+ACTION_BUILDERS = {}
+
+def action_builder(name):
+    """Decorator to register an action builder."""
+    def decorator(func):
+        ACTION_BUILDERS[name] = func
+        return func
+    return decorator
+
+
+@action_builder("notification")
+def build_notification_action(config):
+    """Display Notification action."""
+    return {
+        "autoExpand": config.get("auto_expand", True),
+        "blockNextAction": config.get("block_next", False),
+        "dimBackground": config.get("dim_background", True),
+        "disableHtml": config.get("disable_html", False),
+        "displayOverStatusBar": config.get("over_status_bar", False),
+        "iconText": config.get("icon_text", ""),
+        "iconType": config.get("icon_type", 0),
+        "liveNotification": config.get("live", False),
+        "m_backgroundColor": config.get("background_color", -16777216),
+        "m_iconBgColor": config.get("icon_bg_color", -769226),
+        "m_imageResourceId": 0,
+        "m_macroGUIDToRun": 0,
+        "m_notificationChannelType": config.get("channel_type", 0),
+        "m_notificationSubject": config.get("title", "Notification"),
+        "m_notificationText": config.get("text", ""),
+        "m_overwriteExisting": config.get("overwrite", False),
+        "m_priority": config.get("priority", 0),
+        "m_ringtoneIndex": 0,
+        "m_ringtoneName": "Default",
+        "m_runMacroWhenPressed": False,
+        "m_textColor": config.get("text_color", -1),
+        "maintainSpaces": config.get("maintain_spaces", False),
+        "notificationActionButtons": [],
+        "notificationChannelName": config.get("channel_name", "Notification action"),
+        "notificationIdString": str(config.get("notification_id", 0)),
+        "notificatonId": config.get("notification_id", 0),
+        "preventAndroid16Grouping": False,
+        "preventBackButtonClosing": False,
+        "preventRemovalByBin": False,
+        "showAsOverlayOption": config.get("overlay_option", 1),
+        "yPosition": 0.5,
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "NotificationAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@action_builder("http_request")
+def build_http_request_action(config):
+    """HTTP Request action."""
+    # Build query params
+    query_params = []
+    for key, value in config.get("query_params", {}).items():
+        query_params.append({"paramName": key, "paramValue": value})
+
+    # Build headers
+    headers = []
+    for key, value in config.get("headers", {}).items():
+        headers.append({"paramName": key, "paramValue": value})
+
+    request_type_map = {"GET": 0, "POST": 1, "PUT": 2, "DELETE": 3, "PATCH": 4, "HEAD": 5}
+
+    return {
+        "requestConfig": {
+            "allowAnyCertificate": config.get("allow_any_cert", False),
+            "basicAuthEnabled": config.get("basic_auth", False),
+            "basicAuthPassword": config.get("auth_password", ""),
+            "basicAuthUsername": config.get("auth_username", ""),
+            "blockNextAction": config.get("block_next", False),
+            "clientCertEnabled": False,
+            "clientCertKeyStoreDisplayName": "",
+            "clientCertKeyStoreUri": "",
+            "clientCertPassword": "",
+            "contentBodyDynamicFileName": "",
+            "contentBodyFileDisplayName": "",
+            "contentBodyFileUri": "",
+            "contentBodyFolderDisplayName": "",
+            "contentBodyFolderUri": "",
+            "contentBodySource": 0,
+            "contentBodyText": config.get("body", ""),
+            "contentType": config.get("content_type", "application/json"),
+            "followRedirects": config.get("follow_redirects", True),
+            "headerParams": headers,
+            "localFileUri": "",
+            "prettifyJson": False,
+            "queryParams": query_params,
+            "requestTimeOutSeconds": config.get("timeout", 30),
+            "requestType": request_type_map.get(config.get("method", "GET").upper(), 0),
+            "responseVariableName": config.get("response_var", ""),
+            "saveResponseFileName": "",
+            "saveResponseFolderPathDisplayName": "",
+            "saveResponseFolderPathUri": "",
+            "saveResponseType": 1 if config.get("response_var") else 0,
+            "saveReturnCodeToVariable": config.get("save_code", False),
+            "saveReturnHeadersToVariable": config.get("save_headers", False),
+            "urlToOpen": config.get("url", ""),
+            "useLocalFileUri": False,
+            "useStaticContentBodyFile": True,
+            "returnCodeVariableName": config.get("code_var", ""),
+            "returnHeadersVariableName": config.get("headers_var", "")
+        },
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "HttpRequestAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@action_builder("http_response")
+def build_http_response_action(config):
+    """HTTP Server Response action (for HTTP Server triggers)."""
+    return {
+        "htmlText": config.get("html", ""),
+        "option": config.get("option", 0),
+        "responseCode": config.get("code", "OK"),
+        "text": config.get("text", "OK"),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "HttpServerResponseAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@action_builder("vibrate")
+def build_vibrate_action(config):
+    """Vibrate action."""
+    return {
+        "m_vibratePattern": config.get("pattern", 0),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "VibrateAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@action_builder("toast")
+def build_toast_action(config):
+    """Popup Message (Toast) action."""
+    return {
+        "m_toastText": config.get("text", ""),
+        "m_duration": config.get("duration", 0),  # 0 = short, 1 = long
+        "m_showOnLockScreen": config.get("show_on_lock", False),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "ToastAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@action_builder("speak")
+def build_speak_action(config):
+    """Speak Text (TTS) action."""
+    return {
+        "m_textToSpeak": config.get("text", ""),
+        "m_streamOption": config.get("stream", 0),  # 0 = notification, 3 = music
+        "m_speed": config.get("speed", 1.0),
+        "m_pitch": config.get("pitch", 1.0),
+        "m_useSystemTts": config.get("system_tts", True),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "SpeakTextAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@action_builder("launch_app")
+def build_launch_app_action(config):
+    """Launch Application action."""
+    return {
+        "m_appName": config.get("app", ""),
+        "m_packageName": config.get("package", ""),
+        "m_activityName": config.get("activity", ""),
+        "m_launchIntent": config.get("intent", False),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "LaunchApplicationAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@action_builder("set_variable")
+def build_set_variable_action(config):
+    """Set Variable action."""
+    var_type_map = {"boolean": 0, "integer": 1, "string": 2, "decimal": 3}
+    return {
+        "m_variableName": config.get("name", ""),
+        "m_value": config.get("value", ""),
+        "m_variableType": var_type_map.get(config.get("type", "string"), 2),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "SetVariableAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@action_builder("wifi")
+def build_wifi_action(config):
+    """Set WiFi Enable/Disable action."""
+    return {
+        "m_state": config.get("enable", True),  # True = enable, False = disable
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "SetWifiStateAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@action_builder("torch")
+def build_torch_action(config):
+    """Torch On/Off action."""
+    return {
+        "m_state": config.get("state", 2),  # 0 = off, 1 = on, 2 = toggle
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "SetTorchAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@action_builder("wait")
+def build_wait_action(config):
+    """Wait Before Next Action."""
+    return {
+        "m_seconds": config.get("seconds", 0),
+        "m_milliseconds": config.get("milliseconds", 0),
+        "m_useVariable": False,
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "PauseAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@action_builder("shell")
+def build_shell_action(config):
+    """Shell Script action."""
+    return {
+        "m_command": config.get("command", ""),
+        "m_useRoot": config.get("root", False),
+        "m_outputVariable": config.get("output_var", ""),
+        "m_blockExecution": config.get("block", True),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "ShellCommandAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@action_builder("run_macro")
+def build_run_macro_action(config):
+    """Force Run Macro action."""
+    return {
+        "m_macroName": config.get("macro_name", ""),
+        "m_macroGuid": config.get("macro_guid", 0),
+        "m_runAsActionBlock": config.get("as_action_block", False),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "ForceRunMacroAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@action_builder("disable_app")
+def build_disable_app_action(config):
+    """Enable/Disable Application action."""
+    apps = config.get("apps", [])
+    packages = config.get("packages", [])
+    return {
+        "m_applicationNameList": apps if isinstance(apps, list) else [apps],
+        "m_option": 1 if config.get("disable", True) else 0,  # 0 = enable, 1 = disable
+        "m_packageNameList": packages if isinstance(packages, list) else [packages],
+        "usePackageNameOption": 0,
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "DisableAppAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@action_builder("media_control")
+def build_media_control_action(config):
+    """Media Control action (play/pause/next/previous/etc)."""
+    # optionInt values from MacroDroid exports:
+    # 0=play/pause toggle, 1=next, 2=previous, 3=play, 4=pause, 5=stop
+    option_map = {
+        "toggle": 0, "play_pause": 0,
+        "next": 1,
+        "previous": 2, "prev": 2,
+        "play": 3,
+        "pause": 4,
+        "stop": 5
+    }
+    option = config.get("option", "toggle")
+    option_str = option if isinstance(option, str) else "toggle"
+    option_int = option_map.get(option_str.lower(), 0) if isinstance(option, str) else option
+
+    return {
+        "m_applicationName": config.get("app", ""),
+        "m_option": option_str.capitalize() if isinstance(option, str) else "Play/Pause",
+        "m_packageName": config.get("package", ""),
+        "m_sendMediaPlayerCommands": config.get("send_media_commands", False),
+        "m_simulateMediaButton": config.get("simulate_button", True),
+        "optionInt": option_int,
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "ControlMediaAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@action_builder("launch_activity")
+def build_launch_activity_action(config):
+    """Launch Activity action (more reliable than launch_app for some apps)."""
+    return {
+        "m_applicationName": config.get("app", ""),
+        "m_excludeFromRecents": config.get("exclude_recents", False),
+        "m_packageToLaunch": config.get("package", ""),
+        "m_startNew": config.get("start_new", False),
+        "option": config.get("option", 0),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "LaunchActivityAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@action_builder("if")
+def build_if_action(config):
+    """If Condition action - starts a conditional block."""
+    # Build constraints for the if condition
+    constraints = []
+    for cond in config.get("conditions", []):
+        constraint = build_if_constraint(cond)
+        if constraint:
+            constraints.append(constraint)
+
+    return {
+        "childrenCollapsed": config.get("collapsed", False),
+        "dontLogIfConditionIsFalse": config.get("dont_log_false", False),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "IfConditionAction",
+        "m_constraintList": constraints,
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": config.get("or_conditions", False)  # False = AND, True = OR
+    }
+
+
+def build_if_constraint(cond):
+    """Build a constraint for use inside an if condition."""
+    cond_type = cond.get("type", "variable")
+
+    if cond_type == "variable":
+        return build_variable_constraint(cond)
+    elif cond_type == "http_response":
+        return build_http_response_constraint(cond)
+    else:
+        # Fall back to using constraint builders
+        if cond_type in CONSTRAINT_BUILDERS:
+            return CONSTRAINT_BUILDERS[cond_type](cond)
+    return None
+
+
+def build_variable_constraint(cond):
+    """Build a MacroDroidVariableConstraint for if conditions."""
+    var_type_map = {"boolean": 0, "integer": 1, "string": 2, "decimal": 3, "dictionary": 4}
+    var_type = var_type_map.get(cond.get("var_type", "string"), 2)
+
+    # Comparison options
+    comparison = cond.get("comparison", "equals")
+
+    constraint = {
+        "checkCase": cond.get("case_sensitive", False),
+        "dictionaryKeys": {"keys": []},
+        "dictionaryType": 0,
+        "enableRegex": cond.get("regex", False),
+        "m_booleanValue": cond.get("value", False) if var_type == 0 else False,
+        "m_doubleValue": float(cond.get("value", 0)) if var_type == 3 else 0.0,
+        "m_intCompareVariable": False,
+        "m_intGreaterThan": comparison == "greater_than",
+        "m_intLessThan": comparison == "less_than",
+        "m_intNotEqual": comparison == "not_equals",
+        "m_intValue": int(cond.get("value", 0)) if var_type == 1 else 0,
+        "m_stringComparisonType": 0,
+        "m_stringEqual": comparison == "equals",
+        "m_stringValue": str(cond.get("value", "")) if var_type == 2 else "",
+        "m_variable": {
+            "dictionary": {
+                "entries": [],
+                "isArray": False,
+                "variableType": 4,
+                "type": "Dictionary"
+            },
+            "isActionBlockWorkingVar": cond.get("action_block_var", False),
+            "isLocalVar": cond.get("local_var", True),
+            "isSecure": False,
+            "m_booleanValue": False,
+            "m_decimalValue": 0.0,
+            "m_intValue": 0,
+            "m_name": cond.get("variable", ""),
+            "m_stringValue": "",
+            "m_type": var_type,
+            "supportsInput": True,
+            "supportsOutput": True
+        },
+        "disableLogging": cond.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "MacroDroidVariableConstraint",
+        "m_constraintList": [],
+        "m_isDisabled": cond.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+    return constraint
+
+
+def build_http_response_constraint(cond):
+    """Build constraint to check HTTP response code."""
+    comparison = cond.get("comparison", "equals")
+
+    return {
+        "checkCase": False,
+        "dictionaryKeys": {"keys": []},
+        "dictionaryType": 1,
+        "enableRegex": False,
+        "m_booleanValue": False,
+        "m_doubleValue": 0.0,
+        "m_intCompareVariable": False,
+        "m_intGreaterThan": comparison == "greater_than",
+        "m_intLessThan": comparison == "less_than",
+        "m_intNotEqual": comparison == "not_equals",
+        "m_intValue": cond.get("value", 200),
+        "m_stringComparisonType": 0,
+        "m_stringEqual": comparison == "equals",
+        "m_variable": {
+            "dictionary": {
+                "entries": [],
+                "isArray": False,
+                "variableType": 4,
+                "type": "Dictionary"
+            },
+            "isActionBlockWorkingVar": False,
+            "isLocalVar": True,
+            "isSecure": False,
+            "m_booleanValue": False,
+            "m_decimalValue": 0.0,
+            "m_intValue": 0,
+            "m_name": cond.get("variable", "response_code"),
+            "m_stringValue": "",
+            "m_type": 1,
+            "supportsInput": True,
+            "supportsOutput": True
+        },
+        "disableLogging": cond.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "MacroDroidVariableConstraint",
+        "m_constraintList": [],
+        "m_isDisabled": cond.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@action_builder("else")
+def build_else_action(config):
+    """Else action - alternative branch in if/else block."""
+    return {
+        "dontLogIfConditionIsFalse": config.get("dont_log_false", False),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "ElseAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@action_builder("end_if")
+def build_end_if_action(config):
+    """End If action - closes an if/else block."""
+    return {
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "EndIfAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+# =============================================================================
+# CONSTRAINT BUILDERS
+# =============================================================================
+
+CONSTRAINT_BUILDERS = {}
+
+def constraint_builder(name):
+    """Decorator to register a constraint builder."""
+    def decorator(func):
+        CONSTRAINT_BUILDERS[name] = func
+        return func
+    return decorator
+
+
+@constraint_builder("geofence")
+def build_geofence_constraint(config):
+    """Geofence constraint - inside/outside location."""
+    return {
+        "allowUnknown": config.get("allow_unknown", False),
+        "geofenceId": config.get("geofence_id", ""),
+        "geofenceName": config.get("name", ""),
+        "option": config.get("option", 0),  # 0 = inside, 1 = outside
+        "updateRateMinutes": config.get("update_rate", 5),
+        "updateRateText": f"{config.get('update_rate', 5)} Minutes",
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "GeofenceConstraint",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@constraint_builder("day_of_week")
+def build_day_of_week_constraint(config):
+    """Day of Week constraint."""
+    days = config.get("days", [True] * 7)  # [Sun, Mon, Tue, Wed, Thu, Fri, Sat]
+    return {
+        "m_daysOfWeek": days,
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "DayOfWeekConstraint",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@constraint_builder("time_of_day")
+def build_time_of_day_constraint(config):
+    """Time of Day constraint."""
+    return {
+        "m_startHour": config.get("start_hour", 0),
+        "m_startMinute": config.get("start_minute", 0),
+        "m_endHour": config.get("end_hour", 23),
+        "m_endMinute": config.get("end_minute", 59),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "TimeOfDayConstraint",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@constraint_builder("wifi")
+def build_wifi_constraint(config):
+    """WiFi state constraint."""
+    return {
+        "m_wifiState": config.get("state", 2),  # 0 = disabled, 1 = enabled no network, 2 = connected
+        "m_ssidList": config.get("ssids", []),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "WifiConstraint",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@constraint_builder("battery")
+def build_battery_constraint(config):
+    """Battery level constraint."""
+    return {
+        "m_batteryLevel": config.get("level", 50),
+        "m_greaterThan": config.get("greater_than", True),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "BatteryLevelConstraint",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+# =============================================================================
+# VARIABLE BUILDER
+# =============================================================================
+
+def build_local_variable(config):
+    """Build a local variable definition."""
+    var_type_map = {"boolean": 0, "integer": 1, "string": 2, "decimal": 3, "dictionary": 4}
+    vtype = var_type_map.get(config.get("type", "string"), 2)
+
+    return {
+        "dictionary": {
+            "entries": [],
+            "isArray": False,
+            "variableType": 4,
+            "type": "Dictionary"
+        },
+        "isActionBlockWorkingVar": False,
+        "isLocalVar": True,
+        "isSecure": config.get("secure", False),
+        "m_booleanValue": config.get("value", False) if vtype == 0 else False,
+        "m_decimalValue": float(config.get("value", 0.0)) if vtype == 3 else 0.0,
+        "m_intValue": int(config.get("value", 0)) if vtype == 1 else 0,
+        "m_name": config.get("name", ""),
+        "m_stringValue": str(config.get("value", "")) if vtype == 2 else "",
+        "m_type": vtype,
+        "supportsInput": config.get("input", False),
+        "supportsOutput": config.get("output", True)
+    }
+
+
+# =============================================================================
+# MACRO BUILDER
+# =============================================================================
+
+def build_macro(spec):
+    """Build a complete macro from a spec dictionary."""
+    import time
+
+    # Build triggers
+    triggers = []
+    for trigger_spec in spec.get("triggers", []):
+        trigger_type = trigger_spec.get("type")
+        if trigger_type in TRIGGER_BUILDERS:
+            triggers.append(TRIGGER_BUILDERS[trigger_type](trigger_spec))
+        else:
+            print(f"Warning: Unknown trigger type '{trigger_type}'", file=sys.stderr)
+
+    # Build actions
+    actions = []
+    for action_spec in spec.get("actions", []):
+        action_type = action_spec.get("type")
+        if action_type in ACTION_BUILDERS:
+            actions.append(ACTION_BUILDERS[action_type](action_spec))
+        else:
+            print(f"Warning: Unknown action type '{action_type}'", file=sys.stderr)
+
+    # Build constraints
+    constraints = []
+    for constraint_spec in spec.get("constraints", []):
+        constraint_type = constraint_spec.get("type")
+        if constraint_type in CONSTRAINT_BUILDERS:
+            constraints.append(CONSTRAINT_BUILDERS[constraint_type](constraint_spec))
+        else:
+            print(f"Warning: Unknown constraint type '{constraint_type}'", file=sys.stderr)
+
+    # Build local variables
+    local_vars = []
+    for var_spec in spec.get("variables", []):
+        local_vars.append(build_local_variable(var_spec))
+
+    macro = {
+        "breakpoints": [],
+        "disabledTimestamp": 0,
+        "exportedActionBlocks": [],
+        "forceEvenIfNotEnabledTimestamp": 0,
+        "isActionBlock": False,
+        "isExtra": False,
+        "isFavourite": spec.get("favourite", False),
+        "lastEditedTimestamp": int(time.time() * 1000),
+        "localVariables": local_vars,
+        "localVarsAlphabetical": True,
+        "m_GUID": generate_guid(),
+        "m_actionList": actions,
+        "m_category": spec.get("category", "Uncategorized"),
+        "m_constraintList": constraints,
+        "m_description": spec.get("description", ""),
+        "m_descriptionOpen": False,
+        "m_enabled": spec.get("enabled", True),
+        "m_excludeLog": spec.get("exclude_log", False),
+        "m_headingColor": spec.get("heading_color", 0),
+        "m_isOrCondition": spec.get("or_triggers", False),
+        "m_name": spec.get("name", "Untitled Macro"),
+        "m_triggerList": triggers
+    }
+
+    return {
+        "globalVariables": [],
+        "macro": macro,
+        "macroExportVersion": 1
+    }
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+EXAMPLE_SPEC = """# Example MacroDroid macro spec
+# Save this as a .yaml file and run: macrodroid-gen spec.yaml > macro.macro
+
+name: "Webhook Notification"
+category: "Automation"
+description: "Receive webhooks and show notifications"
+enabled: true
+
+# Local variables (optional)
+variables:
+  - name: response_data
+    type: string
+    value: ""
+
+# Triggers - what starts the macro
+triggers:
+  - type: http_server
+    identifier: "my-webhook"
+    send_response: true
+
+# Actions - what the macro does
+actions:
+  - type: vibrate
+    pattern: 0
+
+  - type: notification
+    title: "Webhook Received"
+    text: "{http_query_string}"
+    channel_type: 1  # High priority
+
+  - type: http_response
+    code: "OK"
+    text: "OK"
+
+# Constraints - conditions that must be met (optional)
+# constraints:
+#   - type: time_of_day
+#     start_hour: 9
+#     end_hour: 17
+"""
+
+def print_triggers():
+    """Print available trigger types."""
+    print("Available Trigger Types:")
+    print("=" * 50)
+    for name in sorted(TRIGGER_BUILDERS.keys()):
+        func = TRIGGER_BUILDERS[name]
+        doc = func.__doc__ or "No description"
+        print(f"  {name:20} - {doc.split('.')[0]}")
+
+def print_actions():
+    """Print available action types."""
+    print("Available Action Types:")
+    print("=" * 50)
+    for name in sorted(ACTION_BUILDERS.keys()):
+        func = ACTION_BUILDERS[name]
+        doc = func.__doc__ or "No description"
+        print(f"  {name:20} - {doc.split('.')[0]}")
+
+def print_constraints():
+    """Print available constraint types."""
+    print("Available Constraint Types:")
+    print("=" * 50)
+    for name in sorted(CONSTRAINT_BUILDERS.keys()):
+        func = CONSTRAINT_BUILDERS[name]
+        doc = func.__doc__ or "No description"
+        print(f"  {name:20} - {doc.split('.')[0]}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate MacroDroid .macro files from YAML/JSON specs",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  macrodroid-gen spec.yaml > my-macro.macro
+  macrodroid-gen --example > template.yaml
+  macrodroid-gen --list-triggers
+  macrodroid-gen --list-actions
+        """
+    )
+    parser.add_argument("spec_file", nargs="?", help="YAML or JSON spec file")
+    parser.add_argument("--example", action="store_true", help="Print example spec")
+    parser.add_argument("--list-triggers", action="store_true", help="List trigger types")
+    parser.add_argument("--list-actions", action="store_true", help="List action types")
+    parser.add_argument("--list-constraints", action="store_true", help="List constraint types")
+    parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output")
+
+    args = parser.parse_args()
+
+    if args.example:
+        print(EXAMPLE_SPEC)
+        return 0
+
+    if args.list_triggers:
+        print_triggers()
+        return 0
+
+    if args.list_actions:
+        print_actions()
+        return 0
+
+    if args.list_constraints:
+        print_constraints()
+        return 0
+
+    if not args.spec_file:
+        parser.print_help()
+        return 1
+
+    # Load spec file
+    spec_path = Path(args.spec_file)
+    if not spec_path.exists():
+        print(f"Error: File not found: {spec_path}", file=sys.stderr)
+        return 1
+
+    content = spec_path.read_text()
+
+    # Parse as YAML or JSON
+    if spec_path.suffix in (".yaml", ".yml"):
+        if not HAS_YAML:
+            print("Error: PyYAML not installed. Use JSON or: pip install pyyaml", file=sys.stderr)
+            return 1
+        spec = yaml.safe_load(content)
+    else:
+        spec = json.loads(content)
+
+    # Build macro
+    macro = build_macro(spec)
+
+    # Output
+    if args.pretty:
+        print(json.dumps(macro, indent=2))
+    else:
+        print(json.dumps(macro))
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
