@@ -67,7 +67,7 @@ elif [[ -n "${TOKEN_API_INSTANCE_ID:-}" ]]; then
 else
     CWD="$(pwd)"
     INSTANCE_ID=$(curl -s "$API_URL/api/instances" 2>/dev/null | \
-        jq -r --arg cwd "$CWD" '.[] | select(.status == "active" and .working_dir == $cwd) | .id' | \
+        jq -r --arg cwd "$CWD" '.[] | select((.status == "processing" or .status == "idle") and .working_dir == $cwd) | .id' | \
         head -1)
 fi
 

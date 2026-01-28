@@ -13,6 +13,7 @@ import re
 import uuid
 import json
 import time
+import signal
 import random
 import asyncio
 import logging
@@ -179,7 +180,6 @@ class InstanceResponse(BaseModel):
     notification_sound: str
     pid: Optional[int]
     status: str
-    is_processing: bool = False
     registered_at: str
     last_activity: str
     stopped_at: Optional[str]
@@ -424,7 +424,7 @@ async def init_db():
                 tts_voice TEXT,
                 notification_sound TEXT,
                 pid INTEGER,
-                status TEXT DEFAULT 'active',
+                status TEXT DEFAULT 'idle',
                 is_processing INTEGER DEFAULT 0,
                 registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -439,6 +439,19 @@ async def init_db():
             await db.execute("ALTER TABLE claude_instances ADD COLUMN is_processing INTEGER DEFAULT 0")
         if 'working_dir' not in columns:
             await db.execute("ALTER TABLE claude_instances ADD COLUMN working_dir TEXT")
+
+        # Migration: Convert two-field status (status + is_processing) to single enum
+        # Old: status='active' + is_processing=0/1 → New: status='processing'/'idle'/'stopped'
+        cursor = await db.execute("SELECT COUNT(*) FROM claude_instances WHERE status = 'active'")
+        if (await cursor.fetchone())[0] > 0:
+            await db.execute("""
+                UPDATE claude_instances SET status = CASE
+                    WHEN status = 'active' AND is_processing = 1 THEN 'processing'
+                    WHEN status = 'active' AND is_processing = 0 THEN 'idle'
+                    ELSE status
+                END
+            """)
+            await db.commit()
 
         await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_status ON claude_instances(status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_device ON claude_instances(device_id)")
@@ -692,7 +705,7 @@ async def cleanup_stale_instances() -> dict:
         cursor = await db.execute("""
             UPDATE claude_instances
             SET status = 'stopped', stopped_at = CURRENT_TIMESTAMP
-            WHERE status = 'active'
+            WHERE status IN ('processing', 'idle')
               AND last_activity < ?
         """, (cutoff,))
         affected = cursor.rowcount
@@ -988,7 +1001,7 @@ async def register_instance(request: InstanceRegisterRequest):
                (id, session_id, tab_name, working_dir, origin_type, source_ip, device_id,
                 profile_name, tts_voice, notification_sound, pid, status,
                 registered_at, last_activity)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?)""",
             (
                 request.instance_id,
                 session_id,
@@ -1042,7 +1055,7 @@ async def delete_all_instances():
             return {"status": "no_instances", "deleted_count": 0}
 
         # Count active instances for enforcement check
-        active_count = sum(1 for _, _, status in all_instances if status == 'active')
+        active_count = sum(1 for _, _, status in all_instances if status in ('processing', 'idle'))
 
         # Delete all instances from the database
         await db.execute("DELETE FROM claude_instances")
@@ -1097,7 +1110,7 @@ async def stop_instance(instance_id: str):
 
         # Check if this was the last active instance
         cursor = await db.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE status = 'active'"
+            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle')"
         )
         count_row = await cursor.fetchone()
         remaining_active = count_row[0] if count_row else 0
@@ -1128,6 +1141,214 @@ async def stop_instance(instance_id: str):
         }
 
     return {"status": "stopped", "instance_id": instance_id}
+
+
+async def find_claude_pid_by_workdir(working_dir: str) -> Optional[int]:
+    """Scan /proc for claude processes matching the working directory.
+
+    Returns the PID if exactly one match is found, None otherwise.
+    """
+    if not working_dir:
+        return None
+
+    matches = []
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                comm_path = f"/proc/{pid}/comm"
+                with open(comm_path, "r") as f:
+                    comm = f.read().strip()
+                if comm != "claude":
+                    continue
+                cwd_path = f"/proc/{pid}/cwd"
+                cwd = os.readlink(cwd_path)
+                if cwd.rstrip("/") == working_dir.rstrip("/"):
+                    matches.append(pid)
+            except (OSError, PermissionError):
+                continue
+    except OSError:
+        return None
+
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def is_pid_claude(pid: int) -> bool:
+    """Check if the given PID belongs to a claude process."""
+    try:
+        with open(f"/proc/{pid}/comm", "r") as f:
+            return f.read().strip() == "claude"
+    except (OSError, PermissionError):
+        return False
+
+
+@app.post("/api/instances/{instance_id}/kill")
+async def kill_instance(instance_id: str):
+    """Kill a frozen Claude instance process and mark it stopped.
+
+    Sends SIGTERM, waits, then SIGKILL if needed. Supports both
+    desktop (direct kill) and phone (SSH kill) instances.
+    """
+    logger.info(f"Kill request for instance: {instance_id[:12]}...")
+    now = datetime.now().isoformat()
+
+    # Look up instance
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM claude_instances WHERE id = ?",
+            (instance_id,)
+        )
+        row = await cursor.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Instance not found")
+
+    instance = dict(row)
+    pid = instance.get("pid")
+    device_id = instance.get("device_id", "desktop")
+    working_dir = instance.get("working_dir", "")
+    kill_signal = None
+
+    # If no PID stored, attempt process discovery fallback
+    if not pid:
+        if device_id == "desktop":
+            pid = await find_claude_pid_by_workdir(working_dir)
+            if pid:
+                logger.info(f"Kill: discovered PID {pid} via /proc scan for {working_dir}")
+            else:
+                # Mark stopped in DB anyway (cleanup)
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "UPDATE claude_instances SET status = 'stopped', stopped_at = ? WHERE id = ?",
+                        (now, instance_id)
+                    )
+                    await db.commit()
+                await log_event("instance_killed", instance_id=instance_id, device_id=device_id,
+                                details={"error": "no_pid", "status": "marked_stopped"})
+                raise HTTPException(
+                    status_code=400,
+                    detail="No PID stored and could not discover process. Instance marked stopped."
+                )
+        else:
+            # Can't scan /proc on remote device
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE claude_instances SET status = 'stopped', stopped_at = ? WHERE id = ?",
+                    (now, instance_id)
+                )
+                await db.commit()
+            await log_event("instance_killed", instance_id=instance_id, device_id=device_id,
+                            details={"error": "no_pid_remote", "status": "marked_stopped"})
+            raise HTTPException(
+                status_code=400,
+                detail=f"No PID stored for remote device '{device_id}'. Instance marked stopped."
+            )
+
+    # Kill sequence based on device type
+    if device_id == "desktop":
+        # Validate PID still belongs to claude
+        if not is_pid_claude(pid):
+            # Process already exited or PID reused by another process
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE claude_instances SET status = 'stopped', stopped_at = ? WHERE id = ?",
+                    (now, instance_id)
+                )
+                await db.commit()
+            await log_event("instance_killed", instance_id=instance_id, device_id=device_id,
+                            details={"pid": pid, "status": "already_dead"})
+            return {"status": "already_dead", "pid": pid, "signal": None}
+
+        # SIGTERM first
+        try:
+            os.kill(pid, signal.SIGTERM)
+            kill_signal = "SIGTERM"
+            logger.info(f"Kill: sent SIGTERM to PID {pid}")
+        except ProcessLookupError:
+            # Already dead
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE claude_instances SET status = 'stopped', stopped_at = ? WHERE id = ?",
+                    (now, instance_id)
+                )
+                await db.commit()
+            await log_event("instance_killed", instance_id=instance_id, device_id=device_id,
+                            details={"pid": pid, "status": "already_dead"})
+            return {"status": "already_dead", "pid": pid, "signal": None}
+        except PermissionError:
+            raise HTTPException(status_code=500, detail=f"Permission denied killing PID {pid}")
+
+        # Wait for graceful shutdown
+        await asyncio.sleep(2)
+
+        # Check if still alive, escalate to SIGKILL
+        if is_pid_claude(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+                kill_signal = "SIGKILL"
+                logger.info(f"Kill: escalated to SIGKILL for PID {pid}")
+            except ProcessLookupError:
+                pass  # Died between check and kill
+
+    else:
+        # Phone/remote device - use sshp
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "sshp", f"kill -TERM {pid}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+            kill_signal = "SIGTERM"
+            logger.info(f"Kill: sent SIGTERM via SSH to PID {pid} on {device_id}")
+
+            # Wait then check/escalate
+            await asyncio.sleep(2)
+
+            proc2 = await asyncio.create_subprocess_exec(
+                "sshp", f"kill -0 {pid}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout2, stderr2 = await asyncio.wait_for(proc2.communicate(), timeout=10)
+            if proc2.returncode == 0:
+                # Still alive, escalate
+                proc3 = await asyncio.create_subprocess_exec(
+                    "sshp", f"kill -9 {pid}",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await asyncio.wait_for(proc3.communicate(), timeout=10)
+                kill_signal = "SIGKILL"
+                logger.info(f"Kill: escalated to SIGKILL via SSH for PID {pid} on {device_id}")
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail=f"SSH to {device_id} timed out")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"SSH kill failed: {str(e)}")
+
+    # Mark stopped in DB
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE claude_instances SET status = 'stopped', stopped_at = ? WHERE id = ?",
+            (now, instance_id)
+        )
+        await db.commit()
+
+    # Log event
+    await log_event(
+        "instance_killed",
+        instance_id=instance_id,
+        device_id=device_id,
+        details={"pid": pid, "signal": kill_signal}
+    )
+
+    logger.info(f"Kill: instance {instance_id[:12]}... killed (PID {pid}, {kill_signal})")
+    return {"status": "killed", "pid": pid, "signal": kill_signal}
 
 
 class RenameInstanceRequest(BaseModel):
@@ -1307,10 +1528,10 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
     now = datetime.now().isoformat()
 
     if request.action == "prompt_submit":
-        is_processing = 1
+        new_status = "processing"
         logger.info(f"Activity: {instance_id[:8]}... prompt submitted")
     elif request.action == "stop":
-        is_processing = 0
+        new_status = "idle"
     else:
         raise HTTPException(status_code=400, detail=f"Unknown action: {request.action}")
 
@@ -1325,8 +1546,8 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
             raise HTTPException(status_code=404, detail="Instance not found")
 
         await db.execute(
-            "UPDATE claude_instances SET is_processing = ?, last_activity = ? WHERE id = ?",
-            (is_processing, now, instance_id)
+            "UPDATE claude_instances SET status = ?, last_activity = ? WHERE id = ?",
+            (new_status, now, instance_id)
         )
         await db.commit()
 
@@ -1334,7 +1555,7 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
         "status": "updated",
         "instance_id": instance_id,
         "action": request.action,
-        "is_processing": bool(is_processing)
+        "new_status": new_status
     }
 
 
@@ -1431,7 +1652,7 @@ async def get_dashboard():
         instances = [dict(row) for row in await cursor.fetchall()]
 
         # Check productivity (any active instances = productive)
-        active_count = sum(1 for i in instances if i["status"] == "active")
+        active_count = sum(1 for i in instances if i["status"] in ("processing", "idle"))
         productivity_active = active_count > 0
 
         # Get recent events (last 20)
@@ -1557,6 +1778,9 @@ AUDIO_PROXY_STATE = {
 AUDIO_RECEIVER_PATH = r"C:\Scripts\audio-receiver.py"
 AUDIO_RECEIVER_PORT = 8765
 
+# Full path to PowerShell for WSL->Windows commands (systemd doesn't have Windows PATH)
+POWERSHELL_PATH = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+
 # ============ Headless Mode State ============
 # Controls monitor disconnection for headless operation
 
@@ -1667,7 +1891,7 @@ def start_audio_receiver() -> dict:
 
     try:
         result = subprocess.run(
-            ["powershell.exe", "-Command", ps_script],
+            [POWERSHELL_PATH, "-Command", ps_script],
             capture_output=True,
             text=True,
             timeout=15
@@ -1723,7 +1947,7 @@ def stop_audio_receiver() -> dict:
 
     try:
         result = subprocess.run(
-            ["powershell.exe", "-Command", ps_script],
+            [POWERSHELL_PATH, "-Command", ps_script],
             capture_output=True,
             text=True,
             timeout=10
@@ -1770,7 +1994,7 @@ def check_audio_receiver_running() -> dict:
 
     try:
         result = subprocess.run(
-            ["powershell.exe", "-Command", ps_script],
+            [POWERSHELL_PATH, "-Command", ps_script],
             capture_output=True,
             text=True,
             timeout=10
@@ -1893,7 +2117,7 @@ def close_distraction_windows() -> dict:
 
     try:
         result = subprocess.run(
-            ["powershell.exe", "-Command", ps_script],
+            [POWERSHELL_PATH, "-Command", ps_script],
             capture_output=True,
             text=True,
             timeout=10
@@ -1933,7 +2157,7 @@ def trigger_obsidian_command(command_id: str) -> bool:
 
     try:
         result = subprocess.run(
-            ["powershell.exe", "-Command", f'Start-Process "{uri}"'],
+            [POWERSHELL_PATH, "-Command", f'Start-Process "{uri}"'],
             capture_output=True,
             text=True,
             timeout=5,
@@ -1969,7 +2193,7 @@ async def check_window_enforcement(request: WindowCheckRequest = None):
     async with aiosqlite.connect(DB_PATH) as db:
         # Count active Claude instances
         cursor = await db.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE status = 'active'"
+            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle')"
         )
         row = await cursor.fetchone()
         active_count = row[0] if row else 0
@@ -2076,7 +2300,7 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
     # Check productivity status
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE status = 'active'"
+            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle')"
         )
         row = await cursor.fetchone()
         active_count = row[0] if row else 0
@@ -2210,13 +2434,28 @@ async def handle_phone_activity(request: PhoneActivityRequest):
 
     # Handle app close
     if action == "close":
+        old_app = PHONE_STATE.get("current_app")
         PHONE_STATE["current_app"] = None
         PHONE_STATE["is_distracted"] = False
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
 
+        # Switch Obsidian timer to silence when distraction app closes
+        obsidian_triggered = False
+        if old_app:  # Only trigger if we were tracking an app
+            DESKTOP_STATE["current_mode"] = "silence"
+            DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
+            obsidian_triggered = trigger_obsidian_command(
+                OBSIDIAN_CONFIG["mode_commands"]["silence"]
+            )
+            print(f"    Phone close -> silence | obsidian={obsidian_triggered}")
+
         await log_event(
             "phone_app_closed",
-            details={"app": app_name, "package": package}
+            details={
+                "app": app_name,
+                "package": package,
+                "obsidian_triggered": obsidian_triggered
+            }
         )
 
         return PhoneActivityResponse(
@@ -2248,9 +2487,23 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         PHONE_STATE["is_distracted"] = True
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
 
+        # Sync Obsidian timer to phone distraction mode
+        obsidian_triggered = False
+        if distraction_mode in OBSIDIAN_CONFIG["mode_commands"]:
+            DESKTOP_STATE["current_mode"] = distraction_mode
+            DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
+            obsidian_triggered = trigger_obsidian_command(
+                OBSIDIAN_CONFIG["mode_commands"][distraction_mode]
+            )
+            print(f"    Phone open -> {distraction_mode} | obsidian={obsidian_triggered}")
+
         await log_event(
             "phone_distraction_allowed",
-            details={"app": app_name, "reason": work_mode}
+            details={
+                "app": app_name,
+                "reason": work_mode,
+                "obsidian_triggered": obsidian_triggered
+            }
         )
 
         return PhoneActivityResponse(
@@ -2266,7 +2519,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
     # Check productivity (active Claude instances)
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE status = 'active'"
+            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle')"
         )
         row = await cursor.fetchone()
         active_count = row[0] if row else 0
@@ -2280,12 +2533,23 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         PHONE_STATE["is_distracted"] = True
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
 
+        # Sync Obsidian timer to phone distraction mode
+        obsidian_triggered = False
+        if distraction_mode in OBSIDIAN_CONFIG["mode_commands"]:
+            DESKTOP_STATE["current_mode"] = distraction_mode
+            DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
+            obsidian_triggered = trigger_obsidian_command(
+                OBSIDIAN_CONFIG["mode_commands"][distraction_mode]
+            )
+            print(f"    Phone open -> {distraction_mode} | obsidian={obsidian_triggered}")
+
         await log_event(
             "phone_distraction_allowed",
             details={
                 "app": app_name,
                 "reason": "break_time",
-                "break_seconds": break_secs
+                "break_seconds": break_secs,
+                "obsidian_triggered": obsidian_triggered
             }
         )
 
@@ -2303,12 +2567,23 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         PHONE_STATE["is_distracted"] = True
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
 
+        # Sync Obsidian timer to phone distraction mode
+        obsidian_triggered = False
+        if distraction_mode in OBSIDIAN_CONFIG["mode_commands"]:
+            DESKTOP_STATE["current_mode"] = distraction_mode
+            DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
+            obsidian_triggered = trigger_obsidian_command(
+                OBSIDIAN_CONFIG["mode_commands"][distraction_mode]
+            )
+            print(f"    Phone open -> {distraction_mode} | obsidian={obsidian_triggered}")
+
         await log_event(
             "phone_distraction_allowed",
             details={
                 "app": app_name,
                 "reason": "productivity_active",
-                "active_instances": active_count
+                "active_instances": active_count,
+                "obsidian_triggered": obsidian_triggered
             }
         )
 
@@ -3087,8 +3362,6 @@ def is_wsl() -> bool:
 
 IS_WSL = is_wsl()
 DEFAULT_SOUND = "chimes.wav"  # Windows Media sound name
-# Full path to powershell.exe for systemd services that don't have Windows PATH
-POWERSHELL_PATH = "/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/powershell.exe"
 
 
 def play_sound(sound_file: str = None) -> dict:
@@ -3137,15 +3410,95 @@ async def log_event_sync(event_type: str, instance_id: str = None, device_id: st
         await db.commit()
 
 
+def clean_markdown_for_tts(text: str) -> str:
+    """Clean markdown syntax for natural TTS output.
+
+    Removes/transforms markdown that sounds bad when spoken aloud,
+    like table separators ("pipe dash dash dash") or headers ("hash hash").
+    """
+    import re
+
+    # Unicode arrows/symbols that SAPI mispronounces
+    text = text.replace('→', ' to ')
+    text = text.replace('←', ' from ')
+    text = text.replace('↔', ' both ways ')
+    text = text.replace('⇒', ' implies ')
+    text = text.replace('⇐', ' implied by ')
+    text = text.replace('➜', ' to ')
+    text = text.replace('➔', ' to ')
+    text = text.replace('•', ',')  # Bullet point
+    text = text.replace('…', '...')  # Ellipsis
+    text = text.replace('—', ', ')  # Em dash
+    text = text.replace('–', ', ')  # En dash
+
+    # Remove backslashes (they get doubled by PowerShell escaping and read aloud)
+    text = text.replace('\\', ' ')
+
+    # Path compression - replace long paths with friendly names
+    path_replacements = [
+        # Specific paths first (longer/more specific before shorter/generic)
+        ('/mnt/c/Users/colby/Documents/Obsidian/Token-ENV', 'Obsidian Path'),
+        ('~/ProcAgentDir/ProcurementAgentAI', 'pax path'),
+        ('/home/token/ProcAgentDir/ProcurementAgentAI', 'pax path'),
+        # Generic home paths last (strip entirely)
+        ('/home/token/', ''),
+        ('/home/token', ''),
+        ('~/', ''),
+    ]
+    for path, replacement in path_replacements:
+        text = text.replace(path, replacement)
+
+    # Table separators: |---|---| or |:---:|:---:| → remove entirely
+    text = re.sub(r'\|[-:]+\|[-:|\s]+', '', text)  # Table separator rows
+    text = re.sub(r'^-{3,}$', '', text, flags=re.MULTILINE)  # Horizontal rules
+
+    # Headers: ## Title → Title (strip # sequences followed by space)
+    text = re.sub(r'#{1,6}\s+', '', text)
+
+    # Bold/italic: **text** or *text* or __text__ or _text_ → text
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)  # Bold
+    text = re.sub(r'\*(.+?)\*', r'\1', text)       # Italic
+    text = re.sub(r'__(.+?)__', r'\1', text)       # Bold alt
+    text = re.sub(r'_(.+?)_', r'\1', text)         # Italic alt
+
+    # Code blocks: ```...``` → [code block]
+    text = re.sub(r'```[\s\S]*?```', '[code block]', text)
+
+    # Inline code: `code` → code
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+
+    # Links: [text](url) → text
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+
+    # Bullet points: - item or * item → item
+    text = re.sub(r'^[\-\*]\s+', '', text, flags=re.MULTILINE)
+
+    # Numbered lists: 1. item → item
+    text = re.sub(r'^\d+\.\s+', '', text, flags=re.MULTILINE)
+
+    # Table pipes: | cell | cell | → cell, cell
+    text = re.sub(r'\|', ', ', text)
+
+    # Clean up multiple spaces/newlines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r'  +', ' ', text)
+    text = re.sub(r', ,', ',', text)  # Clean double commas from empty cells
+
+    return text.strip()
+
+
 def speak_tts(message: str, voice: str = None, rate: int = 0, instance_id: str = None) -> dict:
     """Speak a message using TTS. In WSL, uses Windows SAPI via PowerShell.
 
     Uses Popen instead of run() to allow process termination via skip_tts().
     """
-    global tts_current_process
+    global tts_current_process, tts_skip_requested
 
     if not message:
         return {"success": False, "error": "No message provided"}
+
+    # Clean markdown syntax for natural TTS output
+    message = clean_markdown_for_tts(message)
 
     if IS_WSL:
         # Use Windows SAPI via PowerShell
@@ -3177,6 +3530,10 @@ $synth.Speak('{escaped}')
 
             if process.returncode == 0:
                 return {"success": True, "method": "windows_sapi", "voice": voice, "message": message[:50]}
+            # Check if this was an intentional skip (vs. actual failure)
+            if tts_skip_requested:
+                tts_skip_requested = False  # Reset flag
+                return {"success": True, "method": "skipped", "message": message[:50]}
             error = stderr.decode()[:200] if stderr else "Unknown error"
             return {"success": False, "error": f"SAPI failed: {error}"}
         except subprocess.TimeoutExpired:
@@ -3204,6 +3561,9 @@ $synth.Speak('{escaped}')
 
             if process.returncode == 0:
                 return {"success": True, "method": "espeak", "message": message[:50]}
+            if tts_skip_requested:
+                tts_skip_requested = False
+                return {"success": True, "method": "skipped", "message": message[:50]}
 
             process = subprocess.Popen(
                 ["festival", "--tts"],
@@ -3217,6 +3577,9 @@ $synth.Speak('{escaped}')
 
             if process.returncode == 0:
                 return {"success": True, "method": "festival", "message": message[:50]}
+            if tts_skip_requested:
+                tts_skip_requested = False
+                return {"success": True, "method": "skipped", "message": message[:50]}
 
             return {"success": False, "error": "Both espeak and festival failed"}
         except subprocess.TimeoutExpired:
@@ -3249,6 +3612,7 @@ class TTSQueueItem:
 tts_queue: Deque[TTSQueueItem] = deque()
 tts_current: Optional[TTSQueueItem] = None
 tts_current_process: Optional[subprocess.Popen] = None  # Current TTS/sound process for skip support
+tts_skip_requested: bool = False  # Flag to indicate skip was requested (vs. actual failure)
 tts_queue_lock = asyncio.Lock()
 tts_worker_task: Optional[asyncio.Task] = None
 stale_flag_cleaner_task: Optional[asyncio.Task] = None
@@ -3295,16 +3659,27 @@ async def tts_queue_worker():
                 tts_result = await loop.run_in_executor(None, speak_tts, tts_current.message, tts_current.voice)
                 logger.info(f"TTS worker: speak result = {json.dumps(tts_result)}")
 
-                # Log completion or failure
+                # Log completion, skip, or failure
                 if tts_result.get("success"):
-                    await log_event(
-                        "tts_completed",
-                        instance_id=tts_current.instance_id,
-                        details={
-                            "message": tts_current.message[:50],
-                            "voice": tts_current.voice
-                        }
-                    )
+                    if tts_result.get("method") == "skipped":
+                        logger.info(f"TTS skipped for {tts_current.instance_id}")
+                        await log_event(
+                            "tts_skipped",
+                            instance_id=tts_current.instance_id,
+                            details={
+                                "message": tts_current.message[:50],
+                                "voice": tts_current.voice
+                            }
+                        )
+                    else:
+                        await log_event(
+                            "tts_completed",
+                            instance_id=tts_current.instance_id,
+                            details={
+                                "message": tts_current.message[:50],
+                                "voice": tts_current.voice
+                            }
+                        )
                 else:
                     logger.error(f"TTS failed for {tts_current.instance_id}: {tts_result.get('error')}")
                     await log_event(
@@ -3330,14 +3705,14 @@ async def tts_queue_worker():
 
 
 async def clear_stale_processing_flags():
-    """Background worker that auto-clears is_processing for instances inactive > 5 minutes."""
+    """Background worker that auto-clears status='processing' for instances inactive > 5 minutes."""
     while True:
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 cursor = await db.execute("""
                     UPDATE claude_instances
-                    SET is_processing = 0
-                    WHERE is_processing = 1
+                    SET status = 'idle'
+                    WHERE status = 'processing'
                       AND datetime(last_activity) < datetime('now', 'localtime', '-5 minutes')
                 """)
                 await db.commit()
@@ -3439,12 +3814,14 @@ async def skip_tts(clear_queue: bool = False) -> dict:
     Returns:
         Dict with skipped (bool) and cleared (int) counts.
     """
-    global tts_current_process, tts_current, tts_queue
+    global tts_current_process, tts_current, tts_queue, tts_skip_requested
 
     result = {"skipped": False, "cleared": 0}
 
     # Kill current TTS process if running
     if tts_current_process and tts_current_process.poll() is None:
+        # Set flag BEFORE killing so speak_tts() knows this was intentional
+        tts_skip_requested = True
         try:
             if IS_WSL:
                 # In WSL, process.kill() doesn't stop Windows processes
@@ -3700,7 +4077,7 @@ async def handle_session_start(payload: dict) -> dict:
 
         # Get currently used profiles
         cursor = await db.execute(
-            "SELECT profile_name FROM claude_instances WHERE status = 'active'"
+            "SELECT profile_name FROM claude_instances WHERE status IN ('processing', 'idle')"
         )
         rows = await cursor.fetchall()
         used_profiles = {row[0] for row in rows if row[0]}
@@ -3716,7 +4093,7 @@ async def handle_session_start(payload: dict) -> dict:
                (id, session_id, tab_name, working_dir, origin_type, source_ip, device_id,
                 profile_name, tts_voice, notification_sound, pid, status,
                 registered_at, last_activity)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?)""",
             (
                 session_id,
                 internal_session_id,
@@ -3773,7 +4150,7 @@ async def handle_session_end(payload: dict) -> dict:
 
         # Check remaining active instances
         cursor = await db.execute(
-            "SELECT COUNT(*) FROM claude_instances WHERE status = 'active'"
+            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle')"
         )
         count_row = await cursor.fetchone()
         remaining_active = count_row[0] if count_row else 0
@@ -3808,18 +4185,23 @@ async def handle_prompt_submit(payload: dict) -> dict:
         if not await cursor.fetchone():
             return {"success": False, "action": "not_found"}
 
+        # Also resurrect stopped instances - activity means they're active
+        # Backfill PID if payload contains one and DB value is NULL
         await db.execute(
-            "UPDATE claude_instances SET is_processing = 1, last_activity = ? WHERE id = ?",
-            (now, session_id)
+            """UPDATE claude_instances
+               SET status = 'processing', last_activity = ?, stopped_at = NULL,
+                   pid = COALESCE(pid, ?)
+               WHERE id = ?""",
+            (now, payload.get("pid"), session_id)
         )
         await db.commit()
 
-    logger.info(f"Hook: PromptSubmit {session_id[:12]}... -> processing")
+    logger.info(f"Hook: PromptSubmit {session_id[:12]}... -> processing (resurrected if stopped)")
     return {"success": True, "action": "processing", "instance_id": session_id}
 
 
 async def handle_post_tool_use(payload: dict) -> dict:
-    """Handle PostToolUse hook - heartbeat with debouncing."""
+    """Handle PostToolUse hook - heartbeat with debouncing, ensures status='processing'."""
     session_id = payload.get("session_id")
     if not session_id:
         return {"success": False, "action": "no_session_id"}
@@ -3832,12 +4214,18 @@ async def handle_post_tool_use(payload: dict) -> dict:
 
     _post_tool_debounce[session_id] = current_time
 
-    # Update last_activity as heartbeat (don't touch is_processing - that's managed by prompt_submit/stop)
+    # Update last_activity as heartbeat AND ensure status='processing'
+    # This catches cases where prompt_submit was missed (e.g., after context clear)
+    # Also resurrect stopped instances - activity means they're active
+    # Backfill PID if payload contains one and DB value is NULL
     now = datetime.now().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE claude_instances SET last_activity = ? WHERE id = ?",
-            (now, session_id)
+            """UPDATE claude_instances
+               SET status = 'processing', last_activity = ?, stopped_at = NULL,
+                   pid = COALESCE(pid, ?)
+               WHERE id = ?""",
+            (now, payload.get("pid"), session_id)
         )
         await db.commit()
 
@@ -3876,7 +4264,7 @@ async def handle_stop(payload: dict) -> dict:
     now = datetime.now().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE claude_instances SET is_processing = 0, last_activity = ? WHERE id = ?",
+            "UPDATE claude_instances SET status = 'idle', last_activity = ? WHERE id = ?",
             (now, session_id)
         )
         await db.commit()
@@ -3981,11 +4369,25 @@ async def handle_stop(payload: dict) -> dict:
 
 
 async def handle_pre_tool_use(payload: dict) -> dict:
-    """Handle PreToolUse hook - can block operations like 'make deploy'."""
+    """Handle PreToolUse hook - marks processing, can block operations like 'make deploy'."""
+    session_id = payload.get("session_id")
     tool_name = payload.get("tool_name", "")
     tool_input = payload.get("tool_input", {})
 
-    # Only check Bash commands
+    # Mark instance as processing (catches cases where prompt_submit was missed)
+    # Also resurrect stopped instances - activity means they're active
+    if session_id:
+        now = datetime.now().isoformat()
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """UPDATE claude_instances
+                   SET status = 'processing', last_activity = ?, stopped_at = NULL
+                   WHERE id = ?""",
+                (now, session_id)
+            )
+            await db.commit()
+
+    # Only check Bash commands for blocking
     if tool_name != "Bash":
         return {"success": True, "action": "allowed"}
 

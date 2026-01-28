@@ -66,7 +66,7 @@ def display_status(json_output=False):
         return
 
     # Instances
-    active = [i for i in instances if i.get("status") == "active"]
+    active = [i for i in instances if i.get("status") in ("processing", "idle")]
     stopped = [i for i in instances if i.get("status") == "stopped"]
 
     print(f"\n  Active: {len(active)}  Stopped: {len(stopped)}")
@@ -80,7 +80,7 @@ def display_status(json_output=False):
                 name = "/".join(wd.split("/")[-2:]) if wd else name
             device = inst.get("device_id", "?")
             duration = format_duration(inst.get("registered_at", ""))
-            processing = " \033[33m>\033[0m" if inst.get("is_processing") else "  "
+            processing = " \033[33m>\033[0m" if inst.get("status") == "processing" else "  "
             print(f"  {processing} {name[:25]:<25} {device:<12} {duration}")
 
 

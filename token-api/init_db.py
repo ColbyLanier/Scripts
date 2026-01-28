@@ -31,7 +31,7 @@ def init_database():
             tts_voice TEXT,
             notification_sound TEXT,
             pid INTEGER,
-            status TEXT DEFAULT 'active',
+            status TEXT DEFAULT 'idle',
             is_processing INTEGER DEFAULT 0,
             registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -46,6 +46,19 @@ def init_database():
         cursor.execute("ALTER TABLE claude_instances ADD COLUMN is_processing INTEGER DEFAULT 0")
     if 'working_dir' not in columns:
         cursor.execute("ALTER TABLE claude_instances ADD COLUMN working_dir TEXT")
+
+    # Migration: Convert two-field status (status + is_processing) to single enum
+    # Old: status='active' + is_processing=0/1 → New: status='processing'/'idle'/'stopped'
+    cursor.execute("SELECT COUNT(*) FROM claude_instances WHERE status = 'active'")
+    if cursor.fetchone()[0] > 0:
+        cursor.execute("""
+            UPDATE claude_instances SET status = CASE
+                WHEN status = 'active' AND is_processing = 1 THEN 'processing'
+                WHEN status = 'active' AND is_processing = 0 THEN 'idle'
+                ELSE status
+            END
+        """)
+        conn.commit()
 
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_instances_status ON claude_instances(status)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_instances_device ON claude_instances(device_id)")
