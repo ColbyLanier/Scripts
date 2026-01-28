@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""Clear all stopped Claude instances from the registry.
+
+Usage:
+    instances-clear              # Show stopped instances (dry run)
+    instances-clear --confirm    # Actually delete stopped instances
+    instances-clear --all        # Include active instances (dangerous!)
+    instances-clear -h, --help   # Show help
+
+Examples:
+    instances-clear              # Preview what would be deleted
+    instances-clear --confirm    # Delete all stopped instances
+"""
+
+import sys
+import json
+import sqlite3
+from pathlib import Path
+from datetime import datetime
+
+DB_PATH = Path.home() / ".claude" / "agents.db"
+API_URL = "http://localhost:7777"
+
+def get_instances(include_active: bool = False):
+    """Get instances from the database."""
+    if not DB_PATH.exists():
+        return []
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+
+    if include_active:
+        query = "SELECT * FROM claude_instances ORDER BY status, registered_at DESC"
+    else:
+        query = "SELECT * FROM claude_instances WHERE status = 'stopped' ORDER BY stopped_at DESC"
+
+    cursor = conn.execute(query)
+    instances = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return instances
+
+def delete_instance(instance_id: str) -> bool:
+    """Delete an instance from the database."""
+    if not DB_PATH.exists():
+        return False
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute("DELETE FROM claude_instances WHERE id = ?", (instance_id,))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error deleting {instance_id}: {e}", file=sys.stderr)
+        return False
+    finally:
+        conn.close()
+
+def format_instance(inst: dict) -> str:
+    """Format instance for display."""
+    name = inst.get("tab_name", "Unknown")
+    status = inst.get("status", "unknown")
+    inst_id = inst.get("id", "")[:8]
+    stopped_at = inst.get("stopped_at", "")
+
+    # Format timestamp
+    time_str = ""
+    if stopped_at:
+        try:
+            dt = datetime.fromisoformat(stopped_at.replace("Z", "+00:00"))
+            time_str = f" (stopped {dt.strftime('%m/%d %H:%M')})"
+        except:
+            pass
+
+    status_icon = "\033[0;31m●\033[0m" if status == "stopped" else "\033[0;32m●\033[0m"
+    return f"  {status_icon} {name} [{inst_id}...]{time_str}"
+
+def main():
+    args = sys.argv[1:]
+
+    if "-h" in args or "--help" in args:
+        print(__doc__)
+        sys.exit(0)
+
+    include_active = "--all" in args
+    confirm = "--confirm" in args
+
+    if include_active and not confirm:
+        print("Error: --all requires --confirm (this would delete active instances!)", file=sys.stderr)
+        sys.exit(1)
+
+    instances = get_instances(include_active=include_active)
+
+    if not instances:
+        print("No stopped instances to clear")
+        sys.exit(0)
+
+    if not confirm:
+        # Dry run - just show what would be deleted
+        print(f"Stopped instances ({len(instances)}):")
+        for inst in instances:
+            print(format_instance(inst))
+        print(f"\nRun with --confirm to delete these {len(instances)} instance(s)")
+        sys.exit(0)
+
+    # Actually delete
+    print(f"Clearing {len(instances)} instance(s)...")
+    deleted = 0
+    failed = 0
+
+    for inst in instances:
+        if delete_instance(inst["id"]):
+            deleted += 1
+            print(f"  Deleted: {inst['tab_name']} [{inst['id'][:8]}...]")
+        else:
+            failed += 1
+
+    print(f"\nCleared {deleted} instance(s)")
+    if failed:
+        print(f"Failed to delete {failed} instance(s)", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
