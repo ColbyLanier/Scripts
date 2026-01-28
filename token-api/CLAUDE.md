@@ -62,6 +62,7 @@ POST   /api/notify                      # Send notification
 POST   /api/notify/tts                  # TTS only
 POST   /api/notify/sound                # Sound only
 GET    /api/notify/queue/status         # TTS queue status
+POST   /api/tts/skip                    # Skip current TTS (?clear_queue=true to clear queue)
 ```
 
 ### System
@@ -88,15 +89,26 @@ Rename via:
 ## TUI Controls
 
 ```
-↑↓ / jk  - Navigate instances
+↑↓ / jk  - Navigate instances (up/down)
+h / l    - Switch info panel (Events ↔ Logs)
 r        - Rename selected
 s        - Stop selected
 d        - Delete (with confirm)
 c        - Clear all stopped
 o        - Change sort order
+x        - Skip current TTS
+X        - Skip TTS and clear queue
 R        - Restart server
 q        - Quit
 ```
+
+### Info Panel Pages
+
+The TUI has a paginated info panel (toggled with H/L):
+- **Page 0 (Events)**: Recent events from the database (registrations, stops, renames, TTS)
+- **Page 1 (Logs)**: Server logs from the API
+
+The current page is shown in the status bar.
 
 ## Common Debug Patterns
 
@@ -115,7 +127,13 @@ agents-db query "SELECT id, tab_name FROM claude_instances WHERE id='...'"
 
 # Watch server logs (if running via systemd)
 journalctl -u token-api -f
+
+# Test TTS (wait 10s after for user feedback)
+curl -s http://localhost:7777/api/notify/test | jq .
+# Then sleep 10 and ask user if they heard it
 ```
+
+**Testing TTS:** After running a TTS test, sleep for ~10 seconds before continuing so the user can confirm whether they heard sound and/or speech.
 
 ## Profile System
 
@@ -133,8 +151,12 @@ journalctl -u token-api -f
 |---------|---------|
 | `agents-db` | Query local agents.db database |
 | `token-status` | Quick server status check |
+| `token-restart` | Restart the server (systemd) |
 | `notify-test` | Send test notifications |
+| `tts-skip` | Skip current TTS (--all to clear queue) |
 | `instance-name` | Rename current session |
+| `instance-stop` | Stop instance by name (fuzzy match) |
+| `instances-clear` | Bulk clear stopped instances |
 
 ### General (also useful here)
 
@@ -149,14 +171,26 @@ journalctl -u token-api -f
 # Quick status check
 token-status
 
-# Continuous monitoring
-token-status --watch
+# Restart the server
+token-restart                    # Restart via systemd
+token-restart --watch            # Restart and tail logs
+token-restart --status           # Check status only
+
+# Stop/clear instances
+instance-stop "auth-refactor"    # Stop by name
+instance-stop --list             # List active instances
+instances-clear                  # Preview stopped instances
+instances-clear --confirm        # Delete stopped instances
 
 # Test TTS
 notify-test "Hello from Token-API"
 
 # Test sound only
 notify-test --sound-only
+
+# Skip TTS
+tts-skip                         # Skip current TTS
+tts-skip --all                   # Skip and clear queue
 
 # Query database
 agents-db events --limit 5
@@ -172,6 +206,22 @@ Location: `token-api-tui.py:280` - `is_custom_tab_name()` and `format_instance_n
 ### Backspace in TUI Rename
 The TUI rename input captures raw terminal characters. Backspace (`\x7f`) may appear in names if terminal handling is imperfect. Workaround: use `instance-name` CLI instead.
 
+### is_processing Flag Not Persisting (Fixed 2026-01-26)
+Three bugs caused the green arrow (processing indicator) to not display properly:
+
+1. **PostToolUse clearing flag**: The `handle_post_tool_use()` was setting `is_processing=0` on every tool use, immediately clearing the flag set by `prompt_submit`. Fixed to only update `last_activity` as a heartbeat.
+
+2. **Timezone mismatch in stale worker**: The `clear_stale_processing_flags()` worker compared Python local timestamps against SQLite UTC time, causing a 7-hour offset. All flags appeared "stale" immediately. Fixed by adding `'localtime'` to the SQLite datetime comparison.
+
+3. **Todos endpoint wrong path**: The `/api/instances/{id}/todos` endpoint looked in `~/.claude/todos/` (old format) instead of `~/.claude/tasks/{id}/` (new TaskCreate format). Fixed to read individual task JSON files from the correct location.
+
+Location: `main.py` - `handle_post_tool_use()`, `clear_stale_processing_flags()`, `get_instance_todos()`
+
+### TUI Todo Caching (Added 2026-01-26)
+The TUI now caches todo data per instance. When `is_processing=0`, it displays cached data instead of empty values. This prevents progress/task columns from disappearing between prompts.
+
+Location: `token-api-tui.py` - `todos_cache` global, `get_instance_todos()` with `use_cache` parameter
+
 ## Development Notes
 
 - Server runs on port 7777 (hardcoded in `main.py`)
@@ -181,6 +231,4 @@ The TUI rename input captures raw terminal characters. Backspace (`\x7f`) may ap
 
 ## Potential Future Tools/Skills
 
-- **instance-stop**: Stop instance by name (fuzzy match)
-- **clear-stopped**: Bulk clear stopped instances
 - **/token-debug skill**: Interactive debugging workflow
