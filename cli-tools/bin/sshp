@@ -1,0 +1,13 @@
+#!/bin/bash
+# sshp - SSH to phone (Termux via Tailscale)
+# Usage: sshp [command] - runs command and exits, or starts interactive session
+
+set -e
+
+if [[ $# -gt 0 ]]; then
+    # Run command and exit
+    ssh phone "$*"
+else
+    # Interactive session
+    ssh phone
+fi
