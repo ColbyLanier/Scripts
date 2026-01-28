@@ -1,5 +1,5 @@
-# PowerShell script to launch Windows Terminal with foreground focus
-# This script uses Windows API to force the terminal window to foreground
+# PowerShell script to launch Windows Terminal on the secondary (mini) monitor
+# without stealing focus from the main monitor.
 
 param(
     [string]$Title = "Terminal",
@@ -9,34 +9,28 @@ param(
     [string]$ProjectDir = ""
 )
 
-# Launch Windows Terminal with WSL profile
-$wtArgs = "-p Ubuntu --title `"$Title`" wsl.exe bash `"$WrapperScript`" `"$Environment`" `"$Flag`" `"$ProjectDir`""
-Start-Process "wt.exe" -ArgumentList $wtArgs
+# Detect secondary monitor bounds
+Add-Type -AssemblyName System.Windows.Forms
+$screens = [System.Windows.Forms.Screen]::AllScreens
+$secondary = $screens | Where-Object { -not $_.Primary } | Select-Object -First 1
 
-# Wait briefly for window to spawn
-Start-Sleep -Milliseconds 500
-
-# Find and activate the Windows Terminal window
-Add-Type @"
-    using System;
-    using System.Runtime.InteropServices;
-    public class Win32 {
-        [DllImport("user32.dll")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        public static extern bool SetForegroundWindow(IntPtr hWnd);
-
-        [DllImport("user32.dll")]
-        public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
-    }
-"@
-
-# Try to find the window by title and bring it to foreground
-$maxAttempts = 10
-for ($i = 0; $i -lt $maxAttempts; $i++) {
-    $hwnd = [Win32]::FindWindow($null, $Title)
-    if ($hwnd -ne [IntPtr]::Zero) {
-        [Win32]::SetForegroundWindow($hwnd)
-        break
-    }
-    Start-Sleep -Milliseconds 200
+if ($secondary) {
+    $area = $secondary.WorkingArea
+    $posX = $area.X
+    $posY = $area.Y
+    # Estimate columns/rows from ~80% of secondary monitor pixel area
+    # Typical character cell: ~8px wide, ~16px tall
+    $cols = [int](($area.Width * 0.8) / 8)
+    $rows = [int](($area.Height * 0.8) / 16)
+} else {
+    # Fallback: top-right of primary if no secondary monitor
+    $primary = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $posX = [int]($primary.Right - $primary.Width * 0.4)
+    $posY = $primary.Y
+    $cols = [int](($primary.Width * 0.4) / 8)
+    $rows = [int](($primary.Height * 0.5) / 16)
 }
+
+# Build wt.exe arguments: --pos takes pixels, --size takes columns,rows
+$wtArgs = "--pos $posX,$posY --size $cols,$rows -p Ubuntu --title `"$Title`" wsl.exe bash `"$WrapperScript`" `"$Environment`" `"$Flag`" `"$ProjectDir`""
+Start-Process "wt.exe" -ArgumentList $wtArgs
