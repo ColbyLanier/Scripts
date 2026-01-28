@@ -88,7 +88,9 @@ global AM_STATE := {
     isLocked: false,                 ; Manual lock status
     lockUntil: 0,                    ; Timestamp when lock expires
     lastTrigger: 0,                  ; Last time we triggered a mode change
-    lastWindowTitle: ""              ; Last detected window title (for token-api)
+    lastWindowTitle: "",             ; Last detected window title (for token-api)
+    lastBlockNotify: 0,              ; Timestamp of last block notification
+    blockNotifyCooldown: 60000       ; 60 second cooldown for block notifications
 }
 
 ; ========================================
@@ -299,13 +301,20 @@ SwitchMode(newMode, windowTitle := "") {
                     "Iconi Mute")
         }
     } else {
-        ; token-api blocked the change (e.g., video without productivity)
+        ; token-api blocked the change (e.g., video without productivity/break time)
         LogMessage("Mode change blocked by token-api: " . newMode)
 
+        ; Only show notification if cooldown has elapsed (prevents spam)
         if (AM_CONFIG.showNotifications) {
-            TrayTip("🚫 Mode Blocked",
-                    AM_MODES[newMode].name . " requires active productivity",
-                    "Iconx")
+            if (A_TickCount - AM_STATE.lastBlockNotify >= AM_STATE.blockNotifyCooldown) {
+                AM_STATE.lastBlockNotify := A_TickCount
+                TrayTip("🚫 Productivity Required",
+                        AM_MODES[newMode].name . " requires active work or earned break time",
+                        "Iconx")
+                LogMessage("Block notification shown (next in " . (AM_STATE.blockNotifyCooldown / 1000) . "s)")
+            } else {
+                LogMessage("Block notification suppressed (cooldown active)")
+            }
         }
     }
 }
