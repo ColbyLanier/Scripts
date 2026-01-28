@@ -1,0 +1,12 @@
+#!/bin/bash
+# Skip current TTS playback
+#
+# Usage:
+#   tts-skip         Skip current TTS, queue continues
+#   tts-skip --all   Skip current TTS and clear queue
+
+if [[ "$1" == "--all" || "$1" == "-a" ]]; then
+    curl -s -X POST "http://localhost:7777/api/tts/skip?clear_queue=true" | jq .
+else
+    curl -s -X POST "http://localhost:7777/api/tts/skip" | jq .
+fi

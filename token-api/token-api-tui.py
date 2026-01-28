@@ -2,16 +2,16 @@
 """
 Token-API TUI: Terminal dashboard for Claude instance management.
 
-Can run in two modes:
-  - Full mode: Starts API server + TUI in one terminal
-  - TUI-only mode (--tui-only): Just the dashboard, connects to existing server
+Connects to existing Token-API server running on port 7777.
 
 Controls:
-  arrow/jk  - Select instance
+  arrow/jk  - Select instance (up/down)
+  h/l       - Switch info panel (Events/Logs)
   r         - Rename selected instance
+  s         - Stop selected instance
   d         - Delete selected instance
   c         - Clear all instances
-  R         - Restart the API server
+  o         - Change sort order
   q         - Quit
 """
 
@@ -22,10 +22,7 @@ import json
 import sqlite3
 import time
 import threading
-import signal
 import urllib.request
-import logging
-from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -41,6 +38,7 @@ from rich.layout import Layout
 from rich.live import Live
 from rich.text import Text
 from rich.prompt import Prompt
+from rich.highlighter import JSONHighlighter
 
 # API configuration
 API_URL = "http://localhost:7777"
@@ -49,6 +47,18 @@ SERVER_PORT = 7777
 # Configuration
 DB_PATH = Path.home() / ".claude" / "agents.db"
 REFRESH_INTERVAL = 2  # seconds
+TIMER_STATE_PATH = Path("/mnt/c/Users/colby/Documents/Obsidian/Token-ENV/Scripts/timer-state.json")
+
+# TTS skip feedback state
+tts_skip_feedback: Optional[tuple[float, str]] = None  # (timestamp, message)
+
+# Timer/mode display cache
+timer_display_cache = {
+    "break_seconds": 0,
+    "mode": "silence",
+    "work_mode": "clocked_in",
+    "last_fetch": 0
+}
 
 # Layout detection thresholds
 MOBILE_TAILSCALE_IP = "100.102.92.24"
@@ -62,40 +72,14 @@ VERTICAL_ASPECT_RATIO_THRESHOLD = 2.5
 # Global state
 selected_index = 0
 instances_cache = []
+todos_cache = {}  # instance_id -> last known todos data (persists when not polling)
 api_healthy = True
 api_error_message = None
 layout_mode = "full"  # "mobile", "vertical", "compact", or "full"
 layout_mode_forced = False  # True if user used --mobile, --vertical, --compact, or --no-mobile
 sort_mode = "status"  # "status", "recent_activity", "recent_stopped", "created"
+panel_page = 0  # 0 = events view, 1 = server logs view
 console = Console()
-
-# Server log buffer (circular buffer for last N log entries)
-MAX_LOG_LINES = 50
-server_log_buffer = deque(maxlen=MAX_LOG_LINES)
-log_buffer_lock = threading.Lock()
-
-
-class TUILogHandler(logging.Handler):
-    """Custom log handler that captures logs to the TUI buffer."""
-
-    def emit(self, record):
-        try:
-            msg = self.format(record)
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            level = record.levelname[:4]
-            with log_buffer_lock:
-                server_log_buffer.append(f"[dim]{timestamp}[/dim] [{self._level_color(level)}]{level}[/{self._level_color(level)}] {msg}")
-        except Exception:
-            pass
-
-    def _level_color(self, level: str) -> str:
-        colors = {"INFO": "green", "WARN": "yellow", "ERRO": "red", "DEBU": "dim", "CRIT": "red bold"}
-        return colors.get(level, "white")
-
-# Server state
-server_thread: Optional[threading.Thread] = None
-server_should_stop = threading.Event()
-server_restart_requested = threading.Event()
 
 
 def detect_layout_mode() -> str:
@@ -137,97 +121,6 @@ def detect_layout_mode() -> str:
         return "compact"
 
     return "full"
-
-
-def setup_server_logging():
-    """Configure logging to capture server logs to the TUI buffer only (no stdout)."""
-    # Create our custom handler
-    tui_handler = TUILogHandler()
-    tui_handler.setLevel(logging.INFO)
-    tui_handler.setFormatter(logging.Formatter("%(message)s"))
-
-    # Also clear root logger handlers to prevent any stdout leakage
-    root_logger = logging.getLogger()
-    root_logger.handlers.clear()
-    root_logger.addHandler(tui_handler)
-    root_logger.setLevel(logging.WARNING)  # Only warnings+ from unknown loggers
-
-    # Configure uvicorn loggers - remove default handlers and add only ours
-    for logger_name in ["uvicorn", "uvicorn.access", "uvicorn.error", "fastapi", "asyncio"]:
-        logger = logging.getLogger(logger_name)
-        # Remove all existing handlers (prevents stdout output)
-        logger.handlers.clear()
-        logger.addHandler(tui_handler)
-        logger.setLevel(logging.INFO)
-        logger.propagate = False  # Don't send to root logger
-
-    # Also capture our app logs
-    app_logger = logging.getLogger("token_api")
-    app_logger.handlers.clear()
-    app_logger.addHandler(tui_handler)
-    app_logger.setLevel(logging.INFO)
-    app_logger.propagate = False
-
-    return tui_handler
-
-
-def run_server():
-    """Run the uvicorn server in a thread."""
-    import uvicorn
-    from main import app
-
-    # Add startup message to log buffer
-    with log_buffer_lock:
-        server_log_buffer.append(f"[dim]{datetime.now().strftime('%H:%M:%S')}[/dim] [green]INFO[/green] Starting server on port {SERVER_PORT}")
-
-    # Note: We don't redirect stdout/stderr here to allow startup errors to be visible.
-    # Logging capture is set up separately for runtime logs.
-    config = uvicorn.Config(
-        app,
-        host="0.0.0.0",
-        port=SERVER_PORT,
-        log_level="warning",  # Reduce noise - our app uses token_api logger
-        access_log=False
-    )
-    server = uvicorn.Server(config)
-    server.run()
-
-
-def start_server():
-    """Start the server in a background thread."""
-    global server_thread
-
-    server_thread = threading.Thread(target=run_server, daemon=True, name="uvicorn-server")
-    server_thread.start()
-
-    # Wait for server to be ready
-    max_wait = 10
-    start = time.time()
-    while time.time() - start < max_wait:
-        try:
-            req = urllib.request.Request(f"{API_URL}/health", method="GET")
-            with urllib.request.urlopen(req, timeout=1) as response:
-                if response.status == 200:
-                    # Server is healthy - now set up log capture for TUI
-                    setup_server_logging()
-                    with log_buffer_lock:
-                        server_log_buffer.append(f"[dim]{datetime.now().strftime('%H:%M:%S')}[/dim] [green]INFO[/green] Server ready and accepting connections")
-                    return True
-        except Exception:
-            pass
-        time.sleep(0.2)
-
-    # Server failed to start - add error to log buffer
-    with log_buffer_lock:
-        server_log_buffer.append(f"[dim]{datetime.now().strftime('%H:%M:%S')}[/dim] [red]ERRO[/red] Server failed to start within {max_wait}s")
-    return False
-
-
-def restart_server():
-    """Restart the server (requires full process restart for clean state)."""
-    # For a clean restart, we need to restart the whole process
-    # This is because uvicorn doesn't have a clean restart mechanism
-    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 def check_api_health() -> tuple[bool, str | None]:
@@ -346,14 +239,26 @@ def get_instances():
         return []
 
 
-def get_instance_todos(instance_id: str) -> dict:
-    """Fetch todos for an instance from the API."""
+def get_instance_todos(instance_id: str, use_cache: bool = False) -> dict:
+    """Fetch todos for an instance from the API.
+
+    If use_cache=True, returns cached data without polling.
+    Otherwise fetches fresh data and updates the cache.
+    """
+    global todos_cache
+    default = {"progress": 0, "current_task": None, "total": 0, "todos": []}
+
+    if use_cache:
+        return todos_cache.get(instance_id, default)
+
     try:
         req = urllib.request.Request(f"{API_URL}/api/instances/{instance_id}/todos")
         with urllib.request.urlopen(req, timeout=2) as response:
-            return json.loads(response.read().decode())
+            data = json.loads(response.read().decode())
+            todos_cache[instance_id] = data  # Update cache with fresh data
+            return data
     except Exception:
-        return {"progress": 0, "current_task": None, "total": 0, "todos": []}
+        return todos_cache.get(instance_id, default)  # On error, return cached or default
 
 
 def rename_instance(instance_id: str, new_name: str) -> bool:
@@ -404,15 +309,17 @@ def delete_all_instances() -> tuple[bool, int]:
 
 
 def get_recent_events(limit: int = 5):
-    """Fetch recent events from the database."""
+    """Fetch recent events from the database with instance names."""
     try:
         conn = get_db_connection()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
         cursor.execute("""
-            SELECT * FROM events
-            ORDER BY created_at DESC
+            SELECT e.*, ci.tab_name as instance_tab_name, ci.working_dir as instance_working_dir
+            FROM events e
+            LEFT JOIN claude_instances ci ON e.instance_id = ci.id
+            ORDER BY e.created_at DESC
             LIMIT ?
         """, (limit,))
         rows = cursor.fetchall()
@@ -432,6 +339,44 @@ def get_recent_events(limit: int = 5):
         return []
 
 
+def format_event_instance_name(event: dict, max_len: int = 15) -> str:
+    """Format instance name for event display using joined instance data or fallbacks."""
+    instance_id = event.get("instance_id", "")
+    details = event.get("details", {}) if isinstance(event.get("details"), dict) else {}
+
+    # First check joined instance data (from LEFT JOIN)
+    tab_name = event.get("instance_tab_name")
+    working_dir = event.get("instance_working_dir")
+
+    # If instance still exists and has a custom name, use it
+    if is_custom_tab_name(tab_name):
+        if len(tab_name) > max_len:
+            return tab_name[:max_len - 2] + ".."
+        return tab_name
+
+    # Check details for name (some events store it there)
+    details_name = details.get("tab_name") or details.get("new_name")
+    if is_custom_tab_name(details_name):
+        if len(details_name) > max_len:
+            return details_name[:max_len - 2] + ".."
+        return details_name
+
+    # Derive from working_dir if available
+    if working_dir:
+        parts = working_dir.rstrip("/").split("/")
+        parts = [p for p in parts if p and p not in ("home", "mnt", "c", "Users")]
+        if parts:
+            name = parts[-1]
+            if len(name) > max_len:
+                name = name[:max_len - 2] + ".."
+            return name
+
+    # Fallback to truncated ID
+    if instance_id:
+        return instance_id[:8] + ".." if len(instance_id) > 10 else instance_id
+    return "system"
+
+
 def get_tts_queue_status():
     """Fetch TTS queue status from the API."""
     try:
@@ -440,6 +385,95 @@ def get_tts_queue_status():
             return json.loads(response.read().decode())
     except Exception:
         return {"current": None, "queue": [], "queue_length": 0}
+
+
+def get_timer_state() -> dict:
+    """Read Obsidian timer-state.json for break availability."""
+    try:
+        if TIMER_STATE_PATH.exists():
+            with open(TIMER_STATE_PATH, 'r') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {"breakAvailableSeconds": 0, "currentMode": "work_silence"}
+
+
+def get_desktop_mode() -> dict:
+    """Fetch current desktop/work mode from API."""
+    try:
+        req = urllib.request.Request(f"{API_URL}/api/work-mode")
+        with urllib.request.urlopen(req, timeout=1) as response:
+            return json.loads(response.read().decode())
+    except Exception:
+        return {"work_mode": "clocked_in", "current_timer_mode": "silence"}
+
+
+def format_break_time(seconds: int) -> str:
+    """Format break time as HH:MM:SS or MM:SS."""
+    if seconds <= 0:
+        return "00:00"
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def get_timer_header_text() -> Text:
+    """Generate timer/mode display for header."""
+    global timer_display_cache
+
+    # Fetch fresh data
+    timer_state = get_timer_state()
+    desktop_mode = get_desktop_mode()
+
+    break_secs = timer_state.get("breakAvailableSeconds", 0)
+    obsidian_mode = timer_state.get("currentMode", "work_silence")
+    work_mode = desktop_mode.get("work_mode", "clocked_in")
+
+    # Mode icons
+    mode_icons = {
+        "work_silence": "🔇",
+        "work_music": "🎵",
+        "work_video": "📺",
+        "work_gaming": "🎮",
+        "gym": "🏋️",
+    }
+
+    # Parse obsidian mode for display
+    icon = mode_icons.get(obsidian_mode, "❓")
+    mode_name = obsidian_mode.replace("work_", "").replace("_", " ").title()
+
+    # Break time color based on amount
+    if break_secs > 1800:  # > 30 min
+        break_color = "green"
+    elif break_secs > 300:  # > 5 min
+        break_color = "yellow"
+    else:
+        break_color = "red"
+
+    break_str = format_break_time(break_secs)
+
+    # Work mode indicator
+    if work_mode == "clocked_out":
+        work_indicator = "[dim]OFF[/dim]"
+    elif work_mode == "gym":
+        work_indicator = "[magenta]GYM[/magenta]"
+    else:
+        work_indicator = ""
+
+    # Build display text
+    text = Text()
+    text.append(f"{icon} ", style="bold")
+    text.append(f"{mode_name}", style="bold white")
+    text.append("  ", style="dim")
+    text.append("⏱ ", style="dim")
+    text.append(break_str, style=f"bold {break_color}")
+    if work_indicator:
+        text.append(f"  {work_indicator}")
+
+    return text
 
 
 def make_progress_bar(progress: int, width: int = 10) -> str:
@@ -464,7 +498,7 @@ def create_instances_table(instances: list, selected_idx: int) -> Table:
         max_name_len = max(max_name_len, len(name) + 2)
 
     table = Table(
-        title="Claude Instances  [dim](↑↓ r=rename s=stop d=delete c=clear o=sort R=restart q=quit)[/dim]",
+        title="Claude Instances  [dim](jk=nav h/l=page r=rename s=stop d=delete c=clear o=sort q=quit)[/dim]",
         show_header=True,
         header_style="bold cyan",
         border_style="blue",
@@ -486,10 +520,12 @@ def create_instances_table(instances: list, selected_idx: int) -> Table:
             name = f"[bold yellow]{name}[/bold yellow]"
 
         device = instance.get("device_id", "?")
-        todos = {"progress": 0, "current_task": None, "total": 0}
-        # Only poll for todos when instance is actively processing (not just "active" status)
+        instance_id = instance.get("id", "")
+        # Poll for fresh todos when processing, otherwise use cached data
         if instance.get("is_processing", 0):
-            todos = get_instance_todos(instance.get("id", ""))
+            todos = get_instance_todos(instance_id, use_cache=False)
+        else:
+            todos = get_instance_todos(instance_id, use_cache=True)
 
         is_processing = instance.get("is_processing", 0)
         has_active_subtask = todos.get("current_task") is not None
@@ -530,7 +566,7 @@ def create_instances_table(instances: list, selected_idx: int) -> Table:
 def create_mobile_instances_table(instances: list, selected_idx: int) -> Table:
     """Create a compact instances table for mobile."""
     table = Table(
-        title="Instances [dim](jk r s d c o R q)[/dim]",
+        title="Instances [dim](jk r s d c o q)[/dim]",
         show_header=True,
         header_style="bold cyan",
         border_style="blue",
@@ -550,10 +586,12 @@ def create_mobile_instances_table(instances: list, selected_idx: int) -> Table:
         if i == selected_idx:
             name = f"[bold yellow]{name}[/bold yellow]"
 
-        todos = {"progress": 0, "total": 0, "current_task": None}
-        # Only poll for todos when instance is actively processing (not just "active" status)
+        instance_id = instance.get("id", "")
+        # Poll for fresh todos when processing, otherwise use cached data
         if instance.get("is_processing", 0):
-            todos = get_instance_todos(instance.get("id", ""))
+            todos = get_instance_todos(instance_id, use_cache=False)
+        else:
+            todos = get_instance_todos(instance_id, use_cache=True)
 
         is_processing = instance.get("is_processing", 0)
         has_active_subtask = todos.get("current_task") is not None
@@ -592,7 +630,7 @@ def create_compact_instances_table(instances: list, selected_idx: int) -> Table:
         max_name_len = max(max_name_len, len(name) + 2)
 
     table = Table(
-        title="Claude Instances  [dim](↑↓/jk r=rename s=stop d=delete c=clear o=sort R=restart q=quit)[/dim]",
+        title="Claude Instances  [dim](jk=nav h/l=page r=rename s=stop d=delete c=clear o=sort q=quit)[/dim]",
         show_header=True,
         header_style="bold cyan",
         border_style="blue",
@@ -613,10 +651,12 @@ def create_compact_instances_table(instances: list, selected_idx: int) -> Table:
             name = f"[bold yellow]{name}[/bold yellow]"
 
         device = instance.get("device_id", "?")
-        todos = {"progress": 0, "current_task": None, "total": 0}
-        # Only poll for todos when instance is actively processing
+        instance_id = instance.get("id", "")
+        # Poll for fresh todos when processing, otherwise use cached data
         if instance.get("is_processing", 0):
-            todos = get_instance_todos(instance.get("id", ""))
+            todos = get_instance_todos(instance_id, use_cache=False)
+        else:
+            todos = get_instance_todos(instance_id, use_cache=True)
 
         is_processing = instance.get("is_processing", 0)
         has_active_subtask = todos.get("current_task") is not None
@@ -670,28 +710,27 @@ def create_events_panel(events: list) -> Panel:
                 time_str = "??:??"
 
             event_type = event.get("event_type", "unknown")
-            instance_id = event.get("instance_id", "")
             details = event.get("details", {}) if isinstance(event.get("details"), dict) else {}
 
-            tab_name = details.get("tab_name", "") or details.get("new_name", "") or instance_id or "system"
+            # Get human-readable name using the helper function
+            display_name = format_event_instance_name(event, max_len=18)
             color, icon, action = EVENT_STYLES.get(event_type, ("dim", ".", event_type))
 
             if event_type == "instance_registered":
-                tab_name = details.get("tab_name", instance_id) or instance_id
-                msg = f"[{color}]{icon}[/{color}] [bold]{tab_name}[/bold]: [green]registered[/green]"
+                msg = f"[{color}]{icon}[/{color}] [bold]{display_name}[/bold]: [green]registered[/green]"
             elif event_type == "instance_stopped":
-                msg = f"[{color}]{icon}[/{color}] [bold]{instance_id}[/bold]: [red]stopped[/red]"
+                msg = f"[{color}]{icon}[/{color}] [bold]{display_name}[/bold]: [red]stopped[/red]"
             elif event_type == "instance_renamed":
                 old_name = details.get("old_name", "?")
                 new_name = details.get("new_name", "?")
                 msg = f"[{color}]{icon}[/{color}] [bold]{old_name}[/bold] -> [bold]{new_name}[/bold]"
             elif event_type in ("tts_queued", "tts_playing", "tts_completed"):
                 voice = details.get("voice", "").replace("Microsoft ", "").replace(" Desktop", "")
-                msg = f"[{color}]{icon}[/{color}] [bold]{tab_name}[/bold]: [{color}]{action}[/{color}]"
+                msg = f"[{color}]{icon}[/{color}] [bold]{display_name}[/bold]: [{color}]{action}[/{color}]"
                 if voice and event_type == "tts_playing":
                     msg += f" [dim]({voice})[/dim]"
             else:
-                msg = f"[{color}]{icon}[/{color}] [bold]{tab_name}[/bold]: [{color}]{action}[/{color}]"
+                msg = f"[{color}]{icon}[/{color}] [bold]{display_name}[/bold]: [{color}]{action}[/{color}]"
 
             lines.append(f"[dim]{time_str}[/dim]  {msg}")
         except Exception:
@@ -700,7 +739,7 @@ def create_events_panel(events: list) -> Panel:
     if not lines:
         lines.append("[dim]No recent events[/dim]")
 
-    content = "\n\n".join(lines[:6])
+    content = "\n".join(lines[:6])
     return Panel(content, title="Recent Events", border_style="blue")
 
 
@@ -722,14 +761,12 @@ def create_mobile_events_panel(events: list) -> Panel:
             time_str = created.split(" ")[1][:5] if " " in created else "??:??"
 
             event_type = event.get("event_type", "unknown")
-            details = event.get("details", {}) if isinstance(event.get("details"), dict) else {}
-
             icon = EVENT_ICONS.get(event_type, "[dim].[/dim]")
-            tab_name = details.get("tab_name", "") or details.get("new_name", "") or event.get("instance_id", "?")
-            if len(tab_name) > 12:
-                tab_name = tab_name[:10] + ".."
 
-            lines.append(f"[dim]{time_str}[/dim] {icon} {tab_name}")
+            # Get human-readable name using the helper function
+            display_name = format_event_instance_name(event, max_len=12)
+
+            lines.append(f"[dim]{time_str}[/dim] {icon} {display_name}")
         except Exception:
             continue
 
@@ -740,49 +777,104 @@ def create_mobile_events_panel(events: list) -> Panel:
 
 
 def create_tts_queue_panel(queue_status: dict) -> Panel:
-    """Create the TTS queue panel."""
-    lines = []
+    """Create a compact one-row TTS queue panel showing instance names in order."""
+    global tts_skip_feedback
 
     current = queue_status.get("current")
-    if current:
-        voice_short = current.get("voice", "").replace("Microsoft ", "").replace(" Desktop", "")
-        lines.append(f"[yellow]> NOW:[/yellow] {current.get('tab_name', '?')}")
-        lines.append(f"  [dim]{voice_short}: {current.get('message', '')[:40]}[/dim]")
-
     queue = queue_status.get("queue", [])
-    if queue:
-        lines.append("")
-        lines.append(f"[cyan]Queued ({len(queue)}):[/cyan]")
-        for i, item in enumerate(queue[:3]):
-            voice_short = item.get("voice", "").replace("Microsoft ", "").replace(" Desktop", "")
-            lines.append(f"  {i+1}. {item.get('tab_name', '?')} ({voice_short})")
 
-        if len(queue) > 3:
-            lines.append(f"  [dim]... and {len(queue) - 3} more[/dim]")
-    elif not current:
-        lines.append("[dim]No TTS playing or queued[/dim]")
+    # Check for recent skip feedback (show for 2 seconds)
+    skip_msg = None
+    if tts_skip_feedback:
+        skip_time, skip_text = tts_skip_feedback
+        if time.time() - skip_time < 2.0:
+            skip_msg = skip_text
+        else:
+            tts_skip_feedback = None
 
-    content = "\n".join(lines) if lines else "[dim]Queue empty[/dim]"
+    # Build compact queue string
+    queue_items = []
+
+    if current:
+        current_name = current.get('tab_name', '?')
+        if len(current_name) > 12:
+            current_name = current_name[:10] + ".."
+        queue_items.append(f"[yellow]{current_name}[/yellow]")
+
+    for item in queue[:5]:  # Show max 5 queued items
+        name = item.get('tab_name', '?')
+        if len(name) > 12:
+            name = name[:10] + ".."
+        queue_items.append(name)
+
+    if len(queue) > 5:
+        queue_items.append(f"[dim]+{len(queue) - 5} more[/dim]")
+
+    if skip_msg:
+        content = f"[bold red]{skip_msg}[/bold red]"
+    elif queue_items:
+        content = "Queue: " + " → ".join(queue_items)
+    else:
+        content = "[dim]Queue: (empty)[/dim]"
+
     return Panel(content, title="TTS Queue", border_style="yellow")
 
 
 def create_server_logs_panel(max_lines: int = 8) -> Panel:
-    """Create a panel showing recent server logs."""
-    with log_buffer_lock:
-        recent_logs = list(server_log_buffer)
+    """Create a panel showing recent server logs fetched from API."""
+    json_highlighter = JSONHighlighter()
 
-    if not recent_logs:
-        content = "[dim]No server logs yet...[/dim]"
-    else:
-        # Get the most recent logs that fit
-        display_logs = recent_logs[-max_lines:]
-        content = "\n".join(display_logs)
+    try:
+        req = urllib.request.Request(f"{API_URL}/api/logs/recent?limit={max_lines}")
+        with urllib.request.urlopen(req, timeout=2) as response:
+            data = json.loads(response.read().decode())
+            logs = data.get("logs", [])
+
+            if not logs:
+                content = Text("No server logs available", style="dim")
+            else:
+                # Format logs with timestamp and level colors
+                # Build a Text object to support JSON highlighting
+                content = Text()
+                level_colors = {
+                    "INFO": "green",
+                    "WARN": "yellow",
+                    "ERRO": "red",
+                    "DEBU": "dim",
+                    "CRIT": "red bold"
+                }
+
+                for i, log in enumerate(logs):
+                    if i > 0:
+                        content.append("\n")
+
+                    timestamp = log.get("timestamp", "??:??:??")
+                    level = log.get("level", "INFO")[:4]
+                    message = log.get("message", "")
+                    level_color = level_colors.get(level, "white")
+
+                    # Add timestamp and level prefix
+                    content.append(f"{timestamp} ", style="dim")
+                    content.append(f"{level} ", style=level_color)
+
+                    # Apply JSON highlighting to message if it might contain JSON
+                    if '{' in message or '[' in message:
+                        message_text = json_highlighter(Text(message))
+                        content.append_text(message_text)
+                    else:
+                        content.append(message)
+
+    except Exception:
+        content = Text("Server logs unavailable", style="dim")
 
     return Panel(content, title="Server Logs", border_style="blue")
 
 
-def create_instance_details_panel(instance: dict, todos_data: dict) -> Panel:
-    """Create a panel showing details for the selected instance."""
+def create_instance_details_panel(instance: dict, todos_data: dict, compact: bool = False) -> Panel:
+    """Create a panel showing details for the selected instance.
+
+    If compact=True, shows a single-line summary suitable for bottom of vertical layout.
+    """
     lines = []
 
     if not instance:
@@ -793,7 +885,43 @@ def create_instance_details_panel(instance: dict, todos_data: dict) -> Panel:
     device = instance.get("device_id", "?")
     status_icon = "[green]*[/green]" if status == "active" else "[dim]o[/dim]"
 
+    # Get TTS voice profile info
+    tts_voice = instance.get("tts_voice", "")
+    # Clean up voice name: "Microsoft David Desktop" -> "David"
+    if tts_voice:
+        voice_short = tts_voice.replace("Microsoft ", "").replace(" Desktop", "")
+    else:
+        voice_short = "?"
+
+    profile_name = instance.get("profile_name", "")
+    # Extract profile number: "profile_1" -> "1"
+    profile_num = profile_name.replace("profile_", "") if profile_name else "?"
+
+    if compact:
+        # Compact single-line format for vertical layout bottom
+        todos = todos_data.get("todos", [])
+        total = todos_data.get("total", 0)
+        progress = todos_data.get("progress", 0)
+        current_task = todos_data.get("current_task", "")
+
+        # Build compact line: status icon, name, device, voice, progress, current task
+        parts = [f"{status_icon} [bold]{name}[/bold]"]
+        parts.append(f"[dim]({device})[/dim]")
+        parts.append(f"[cyan]Voice:[/cyan] {voice_short}")
+
+        if total > 0:
+            parts.append(f"[yellow]{progress}%[/yellow]")
+
+        if current_task:
+            if len(current_task) > 30:
+                current_task = current_task[:27] + "..."
+            parts.append(f"[italic]{current_task}[/italic]")
+
+        content = "  ".join(parts)
+        return Panel(content, title="Instance Details", border_style="magenta")
+
     lines.append(f"{status_icon} [bold]{name}[/bold]  [dim]({device})[/dim]")
+    lines.append(f"[cyan]Voice:[/cyan] {voice_short}  [dim](profile {profile_num})[/dim]")
     lines.append("")
 
     todos = todos_data.get("todos", [])
@@ -837,7 +965,12 @@ def create_mobile_instance_details_panel(instance: dict, todos_data: dict) -> Pa
     name = format_instance_name(instance, max_len=15)
     status = instance.get("status", "unknown")
     status_icon = "[green]*[/green]" if status == "active" else "[dim]o[/dim]"
-    lines.append(f"{status_icon} [bold]{name}[/bold]")
+
+    # Get TTS voice profile info
+    tts_voice = instance.get("tts_voice", "")
+    voice_short = tts_voice.replace("Microsoft ", "").replace(" Desktop", "") if tts_voice else "?"
+
+    lines.append(f"{status_icon} [bold]{name}[/bold]  [dim]{voice_short}[/dim]")
 
     current_task = todos_data.get("current_task")
     progress = todos_data.get("progress", 0)
@@ -861,7 +994,7 @@ def create_mobile_instance_details_panel(instance: dict, todos_data: dict) -> Pa
 def create_server_status_panel() -> Panel:
     """Create a panel showing server status."""
     if api_healthy:
-        content = "[green]* Server running[/green] on port 7777\n[dim]Press R to restart[/dim]"
+        content = "[green]* Server running[/green] on port 7777"
         border = "green"
     else:
         content = f"[red]! Server error[/red]\n[dim]{api_error_message or 'Unknown error'}[/dim]"
@@ -870,21 +1003,43 @@ def create_server_status_panel() -> Panel:
     return Panel(content, title="API Server", border_style=border)
 
 
+def create_info_panel(max_lines: int = 8) -> Panel:
+    """Create the info panel - events or server logs based on panel_page."""
+    if panel_page == 0:
+        events = get_recent_events(max_lines)
+        return create_events_panel(events)
+    else:
+        return create_server_logs_panel(max_lines=max_lines)
+
+
+def create_mobile_info_panel(max_lines: int = 4) -> Panel:
+    """Create a compact info panel for mobile - events or server logs based on panel_page."""
+    if panel_page == 0:
+        events = get_recent_events(max_lines)
+        return create_mobile_events_panel(events)
+    else:
+        return create_server_logs_panel(max_lines=max_lines)
+
+
 def create_status_bar(instances: list, selected_idx: int) -> Text:
     """Create the status bar."""
     active_count = sum(1 for i in instances if i.get("status") == "active")
     total_count = len(instances)
-    productivity = "[green]ACTIVE[/green]" if active_count > 0 else "[dim]IDLE[/dim]"
 
     # Mode indicator with color
     mode_colors = {"mobile": "yellow", "vertical": "magenta", "compact": "blue", "full": "cyan"}
     mode_color = mode_colors.get(layout_mode, "white")
 
+    # Page indicator
+    page_names = ["Events", "Logs"]
+    page_name = page_names[panel_page] if panel_page < len(page_names) else "?"
+
     text = Text()
     text.append(f"Instances: {active_count}/{total_count}  |  ", style="white")
     text.append_text(Text.from_markup(f"[{mode_color}]{layout_mode}[/{mode_color}]"))
     text.append(f"  |  {selected_idx + 1}/{total_count}  |  ", style="white")
-    text.append("[dim]c=clear  R=restart  q=quit[/dim]")
+    text.append_text(Text.from_markup(f"[cyan]{page_name}[/cyan] [dim](h/l)[/dim]  |  "))
+    text.append_text(Text.from_markup("[dim]c=clear  o=sort  q=quit[/dim]"))
 
     return text
 
@@ -894,6 +1049,9 @@ def create_mobile_status_bar(instances: list, selected_idx: int) -> Text:
     active_count = sum(1 for i in instances if i.get("status") == "active")
     total_count = len(instances)
 
+    # Page indicator
+    page_indicator = "E" if panel_page == 0 else "L"
+
     text = Text()
     text.append(f"{active_count}/{total_count} ", style="white")
     if active_count > 0:
@@ -901,6 +1059,7 @@ def create_mobile_status_bar(instances: list, selected_idx: int) -> Text:
     else:
         text.append("o", style="dim")
     text.append(f"  sel:{selected_idx + 1}", style="dim")
+    text.append(f"  [{page_indicator}]", style="cyan")
 
     return text
 
@@ -909,15 +1068,16 @@ def generate_mobile_dashboard(instances: list, selected_idx: int) -> Layout:
     """Generate a compact dashboard layout for mobile."""
     global api_healthy, api_error_message
 
-    events = get_recent_events(4)
-
     selected_instance = None
     selected_todos = {"progress": 0, "current_task": None, "total": 0, "todos": []}
     if instances and 0 <= selected_idx < len(instances):
         selected_instance = instances[selected_idx]
-        # Only poll for todos when instance is actively processing (not just "active" status)
+        instance_id = selected_instance.get("id", "")
+        # Poll for fresh todos when processing, otherwise use cached data
         if selected_instance.get("is_processing", 0):
-            selected_todos = get_instance_todos(selected_instance.get("id", ""))
+            selected_todos = get_instance_todos(instance_id, use_cache=False)
+        else:
+            selected_todos = get_instance_todos(instance_id, use_cache=True)
 
     layout = Layout()
 
@@ -926,7 +1086,7 @@ def generate_mobile_dashboard(instances: list, selected_idx: int) -> Layout:
             Layout(name="error", size=2),
             Layout(name="instances"),
             Layout(name="details", size=5),
-            Layout(name="server_logs", size=5),
+            Layout(name="info_panel", size=5),
             Layout(name="footer", size=1)
         )
         error_text = Text()
@@ -936,13 +1096,13 @@ def generate_mobile_dashboard(instances: list, selected_idx: int) -> Layout:
         layout.split_column(
             Layout(name="instances"),
             Layout(name="details", size=5),
-            Layout(name="server_logs", size=5),
+            Layout(name="info_panel", size=5),
             Layout(name="footer", size=1)
         )
 
     layout["instances"].update(create_mobile_instances_table(instances, selected_idx))
     layout["details"].update(create_mobile_instance_details_panel(selected_instance, selected_todos))
-    layout["server_logs"].update(create_server_logs_panel(max_lines=3))
+    layout["info_panel"].update(create_mobile_info_panel(max_lines=3))
     layout["footer"].update(create_mobile_status_bar(instances, selected_idx))
 
     return layout
@@ -956,8 +1116,12 @@ def generate_compact_dashboard(instances: list, selected_idx: int) -> Layout:
     selected_todos = {"progress": 0, "current_task": None, "total": 0, "todos": []}
     if instances and 0 <= selected_idx < len(instances):
         selected_instance = instances[selected_idx]
+        instance_id = selected_instance.get("id", "")
+        # Poll for fresh todos when processing, otherwise use cached data
         if selected_instance.get("is_processing", 0):
-            selected_todos = get_instance_todos(selected_instance.get("id", ""))
+            selected_todos = get_instance_todos(instance_id, use_cache=False)
+        else:
+            selected_todos = get_instance_todos(instance_id, use_cache=True)
 
     layout = Layout()
 
@@ -965,7 +1129,7 @@ def generate_compact_dashboard(instances: list, selected_idx: int) -> Layout:
     layout.split_column(
         Layout(name="header", size=3),
         Layout(name="instances"),
-        Layout(name="server_logs", size=4),
+        Layout(name="info_panel", size=4),
         Layout(name="footer", size=1)
     )
 
@@ -981,18 +1145,20 @@ def generate_compact_dashboard(instances: list, selected_idx: int) -> Layout:
     else:
         server_text = f"[red]●[/red] {api_error_message or 'Error'}"
 
+    timer_text = get_timer_header_text()
+    timer_text.justify = "center"
     header_layout["title"].update(Panel(
-        Text("TOKEN-API TUI", style="bold white", justify="center"),
+        timer_text,
         border_style="cyan"
     ))
     header_layout["server_status"].update(Panel(
-        Text(server_text, justify="center"),
+        Text.from_markup(server_text, justify="center"),
         border_style="green" if api_healthy else "red"
     ))
     layout["header"].update(header_layout)
 
     layout["instances"].update(create_compact_instances_table(instances, selected_idx))
-    layout["server_logs"].update(create_server_logs_panel(max_lines=3))
+    layout["info_panel"].update(create_info_panel(max_lines=3))
     layout["footer"].update(create_status_bar(instances, selected_idx))
 
     return layout
@@ -1001,9 +1167,12 @@ def generate_compact_dashboard(instances: list, selected_idx: int) -> Layout:
 def generate_vertical_dashboard(instances: list, selected_idx: int) -> Layout:
     """Generate vertical dashboard with stacked panels (for vertical monitors).
 
-    Dynamically sizes panels based on available height and content:
-    - Instance table sized to fit content (with reasonable bounds)
-    - Extra space distributed to details and logs
+    Layout (top to bottom):
+    - Header (timer + server status)
+    - Instance table (sized to fit content, primary element)
+    - Recent events (fills remaining space)
+    - Instance details (compact, bottom-aligned)
+    - Footer (status bar)
     """
     global api_healthy, api_error_message
 
@@ -1011,8 +1180,12 @@ def generate_vertical_dashboard(instances: list, selected_idx: int) -> Layout:
     selected_todos = {"progress": 0, "current_task": None, "total": 0, "todos": []}
     if instances and 0 <= selected_idx < len(instances):
         selected_instance = instances[selected_idx]
+        instance_id = selected_instance.get("id", "")
+        # Poll for fresh todos when processing, otherwise use cached data
         if selected_instance.get("is_processing", 0):
-            selected_todos = get_instance_todos(selected_instance.get("id", ""))
+            selected_todos = get_instance_todos(instance_id, use_cache=False)
+        else:
+            selected_todos = get_instance_todos(instance_id, use_cache=True)
 
     # Calculate adaptive sizes based on terminal height and content
     height = console.size.height
@@ -1020,57 +1193,35 @@ def generate_vertical_dashboard(instances: list, selected_idx: int) -> Layout:
     # Fixed elements
     header_size = 3
     footer_size = 1
-    spacer_size = 1  # Breathing room between table and details
+    details_size = 3  # Compact instance details at bottom (single line + borders)
 
-    # Instance table: needs rows for header + data + borders
+    # Instance table: sized to fit content (primary element)
     num_instances = max(len(instances), 1)
     # Table needs: title + header + separator + N data rows + borders = N + 6
     table_ideal = num_instances + 6
-    # Clamp between reasonable bounds
-    table_min = 8   # At least show a few rows with full borders
-    table_max = 22  # Don't let table dominate
-
-    # Available space for flexible content (minus spacer)
-    available = height - header_size - footer_size - spacer_size
-
-    # Minimum sizes for other panels
-    details_min = 6
-    logs_min = 4
+    # Reasonable bounds - table is primary, but don't let it dominate
+    table_min = 6   # Minimum to show a couple rows
+    table_max = 20  # Allow more room for table as primary element
 
     # Calculate instance table size
     instance_size = max(table_min, min(table_ideal, table_max))
 
-    # Remaining space after fixed elements and table
-    remaining = available - instance_size
-
-    if remaining >= details_min + logs_min + 10:
-        # Plenty of space - distribute extra to details and logs
-        extra = remaining - details_min - logs_min
-        details_size = details_min + (extra * 2 // 3)  # 2/3 to details
-        logs_size = logs_min + (extra // 3)            # 1/3 to logs
-    elif remaining >= details_min + logs_min:
-        # Just enough - use minimums
-        details_size = details_min
-        logs_size = logs_min
-    else:
-        # Tight space - shrink proportionally
-        details_size = max(4, remaining * 2 // 3)
-        logs_size = max(3, remaining // 3)
+    # Events panel gets all remaining space
+    # Available = total - header - footer - details - table
+    events_size = height - header_size - footer_size - details_size - instance_size
+    events_min = 6  # Minimum readable events panel
+    events_size = max(events_min, events_size)
 
     layout = Layout()
 
-    # Vertical layout: everything stacked with calculated sizes + spacer for breathing room
+    # Vertical layout: Table → Events → Details (bottom)
     layout.split_column(
         Layout(name="header", size=header_size),
         Layout(name="instances", size=instance_size),
-        Layout(name="spacer", size=spacer_size),
+        Layout(name="info_panel"),  # Events - takes remaining space (no size = flex)
         Layout(name="details", size=details_size),
-        Layout(name="server_logs", size=logs_size),
         Layout(name="footer", size=footer_size)
     )
-
-    # Empty spacer
-    layout["spacer"].update(Text(""))
 
     # Compact header: title + server status side by side
     header_layout = Layout()
@@ -1084,22 +1235,24 @@ def generate_vertical_dashboard(instances: list, selected_idx: int) -> Layout:
     else:
         server_text = f"[red]●[/red] {api_error_message or 'Error'}"
 
+    timer_text = get_timer_header_text()
+    timer_text.justify = "center"
     header_layout["title"].update(Panel(
-        Text("TOKEN-API TUI", style="bold white", justify="center"),
+        timer_text,
         border_style="cyan"
     ))
     header_layout["server_status"].update(Panel(
-        Text(server_text, justify="center"),
+        Text.from_markup(server_text, justify="center"),
         border_style="green" if api_healthy else "red"
     ))
     layout["header"].update(header_layout)
 
-    # Calculate how many log lines fit in the allocated space (panel has 2 border lines)
-    log_lines = max(1, logs_size - 2)
+    # Calculate how many lines fit in the info panel (panel has 2 border lines)
+    info_lines = max(1, events_size - 2)
 
     layout["instances"].update(create_compact_instances_table(instances, selected_idx))
-    layout["details"].update(create_instance_details_panel(selected_instance, selected_todos))
-    layout["server_logs"].update(create_server_logs_panel(max_lines=log_lines))
+    layout["info_panel"].update(create_info_panel(max_lines=info_lines))
+    layout["details"].update(create_instance_details_panel(selected_instance, selected_todos, compact=True))
     layout["footer"].update(create_status_bar(instances, selected_idx))
 
     return layout
@@ -1109,16 +1262,18 @@ def generate_dashboard(instances: list, selected_idx: int) -> Layout:
     """Generate the full dashboard layout."""
     global api_healthy, api_error_message
 
-    events = get_recent_events(6)
     tts_queue = get_tts_queue_status()
 
     selected_instance = None
     selected_todos = {"progress": 0, "current_task": None, "total": 0, "todos": []}
     if instances and 0 <= selected_idx < len(instances):
         selected_instance = instances[selected_idx]
-        # Only poll for todos when instance is actively processing (not just "active" status)
+        instance_id = selected_instance.get("id", "")
+        # Poll for fresh todos when processing, otherwise use cached data
         if selected_instance.get("is_processing", 0):
-            selected_todos = get_instance_todos(selected_instance.get("id", ""))
+            selected_todos = get_instance_todos(instance_id, use_cache=False)
+        else:
+            selected_todos = get_instance_todos(instance_id, use_cache=True)
 
     layout = Layout()
 
@@ -1135,8 +1290,10 @@ def generate_dashboard(instances: list, selected_idx: int) -> Layout:
         Layout(name="title", ratio=2),
         Layout(name="server_status", ratio=1)
     )
+    timer_text = get_timer_header_text()
+    timer_text.justify = "center"
     header_layout["title"].update(Panel(
-        Text("TOKEN-API TUI  [dim]v1.1[/dim]", style="bold white", justify="center"),
+        timer_text,
         border_style="cyan"
     ))
     header_layout["server_status"].update(create_server_status_panel())
@@ -1148,22 +1305,23 @@ def generate_dashboard(instances: list, selected_idx: int) -> Layout:
         Layout(name="sidebar", ratio=2)
     )
 
-    # Left column: instances table + server logs
+    # Left column: instances table + details section (instance_details + tts_queue)
     layout["left_column"].split_column(
         Layout(name="instances", ratio=3),
-        Layout(name="server_logs", ratio=1)
+        Layout(name="details_section", ratio=1)
     )
 
-    layout["sidebar"].split_column(
-        Layout(name="instance_details", ratio=2),
-        Layout(name="events", ratio=1),
+    # Details section: instance details (3/4) + TTS queue (1/4)
+    layout["details_section"].split_column(
+        Layout(name="instance_details", ratio=3),
         Layout(name="tts_queue", ratio=1)
     )
 
+    # Sidebar shows events or server logs based on panel_page
+    layout["sidebar"].update(create_info_panel(max_lines=20))
+
     layout["instances"].update(create_instances_table(instances, selected_idx))
-    layout["server_logs"].update(create_server_logs_panel(max_lines=6))
     layout["instance_details"].update(create_instance_details_panel(selected_instance, selected_todos))
-    layout["events"].update(create_events_panel(events))
     layout["tts_queue"].update(create_tts_queue_panel(tts_queue))
 
     layout["footer"].update(create_status_bar(instances, selected_idx))
@@ -1189,7 +1347,7 @@ def get_dashboard(instances: list, selected_idx: int) -> Layout:
 
 def main():
     """Main entry point."""
-    global selected_index, instances_cache, api_healthy, api_error_message, layout_mode, layout_mode_forced, sort_mode
+    global selected_index, instances_cache, api_healthy, api_error_message, layout_mode, layout_mode_forced, sort_mode, panel_page
 
     parser = argparse.ArgumentParser(description="Token-API TUI Dashboard")
     parser.add_argument("--mobile", "-m", action="store_true",
@@ -1200,8 +1358,6 @@ def main():
                         help="Force compact layout (no sidebar)")
     parser.add_argument("--no-mobile", action="store_true",
                         help="Force full desktop layout even on narrow terminals")
-    parser.add_argument("--tui-only", action="store_true",
-                        help="Don't start server, just run TUI (connects to existing server)")
     args = parser.parse_args()
 
     if args.mobile:
@@ -1223,16 +1379,7 @@ def main():
     mode_colors = {"mobile": "yellow", "vertical": "magenta", "compact": "blue", "full": "cyan"}
     mode_indicator = f"[{mode_colors.get(layout_mode, 'white')}]{layout_mode}[/{mode_colors.get(layout_mode, 'white')}]"
 
-    if not args.tui_only:
-        console.print(f"[cyan]Starting Token-API TUI + Server[/cyan] ({mode_indicator} mode)")
-        console.print("[dim]Starting API server...[/dim]")
-
-        if start_server():
-            console.print("[green]* Server started on port 7777[/green]")
-        else:
-            console.print("[yellow]! Server may not have started properly[/yellow]")
-    else:
-        console.print(f"[cyan]Starting Token-API TUI[/cyan] ({mode_indicator} mode)")
+    console.print(f"[cyan]Starting Token-API TUI[/cyan] ({mode_indicator} mode)")
 
     # Health check
     api_healthy, api_error_message = check_api_health()
@@ -1245,7 +1392,7 @@ def main():
         console.print("Run the Token-API server first to initialize the database.")
         sys.exit(1)
 
-    console.print("[dim]Controls: arrow/jk=select, r=rename, d=delete, c=clear all, R=restart, q=quit[/dim]\n")
+    console.print("[dim]Controls: jk=select, h/l=page, r=rename, s=stop, d=delete, c=clear all, o=sort, q=quit[/dim]\n")
 
     quit_flag = threading.Event()
     input_mode = threading.Event()
@@ -1287,10 +1434,6 @@ def main():
                                 elif seq == '[B':
                                     action_queue.append('down')
                             update_flag.set()
-                    elif key == 'R':  # Uppercase R for restart
-                        with action_lock:
-                            action_queue.append('restart')
-                        update_flag.set()
                     elif key.lower() == 'r':
                         with action_lock:
                             action_queue.append('rename')
@@ -1318,6 +1461,22 @@ def main():
                     elif key == 'k':
                         with action_lock:
                             action_queue.append('up')
+                        update_flag.set()
+                    elif key == 'h':
+                        with action_lock:
+                            action_queue.append('page_prev')
+                        update_flag.set()
+                    elif key == 'l':
+                        with action_lock:
+                            action_queue.append('page_next')
+                        update_flag.set()
+                    elif key == 'x':
+                        with action_lock:
+                            action_queue.append('tts_skip')
+                        update_flag.set()
+                    elif key == 'X':
+                        with action_lock:
+                            action_queue.append('tts_skip_all')
                         update_flag.set()
         except Exception:
             pass
@@ -1354,18 +1513,7 @@ def main():
                         live.update(get_dashboard(instances_cache, selected_index))
                         live.refresh()
 
-                    elif action == 'restart':
-                        input_mode.set()
-                        time.sleep(0.1)
-                        live.stop()
-
-                        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, original_terminal_settings)
-
-                        console.print("\n[yellow]Restarting server...[/yellow]")
-                        time.sleep(0.5)
-                        restart_server()
-
-                    elif action == 'rename' and instances_cache:
+                    if action == 'rename' and instances_cache:
                         if 0 <= selected_index < len(instances_cache):
                             instance = instances_cache[selected_index]
                             instance_id = instance.get("id")
@@ -1519,6 +1667,60 @@ def main():
                         input_mode.clear()
                         instances_cache = get_instances()
                         live.start()
+                        live.update(get_dashboard(instances_cache, selected_index))
+                        live.refresh()
+
+                    elif action == 'page_prev':
+                        panel_page = max(0, panel_page - 1)
+                        live.update(get_dashboard(instances_cache, selected_index))
+                        live.refresh()
+
+                    elif action == 'page_next':
+                        panel_page = min(1, panel_page + 1)
+                        live.update(get_dashboard(instances_cache, selected_index))
+                        live.refresh()
+
+                    elif action == 'tts_skip':
+                        # Skip current TTS (x key)
+                        global tts_skip_feedback
+                        try:
+                            req = urllib.request.Request(
+                                f"{API_URL}/api/tts/skip",
+                                method="POST",
+                                data=b""
+                            )
+                            with urllib.request.urlopen(req, timeout=2) as resp:
+                                result = json.loads(resp.read().decode())
+                                if result.get("skipped"):
+                                    tts_skip_feedback = (time.time(), "Skipped!")
+                                else:
+                                    tts_skip_feedback = (time.time(), "Nothing playing")
+                        except Exception as e:
+                            tts_skip_feedback = (time.time(), f"Skip failed: {str(e)[:20]}")
+                        live.update(get_dashboard(instances_cache, selected_index))
+                        live.refresh()
+
+                    elif action == 'tts_skip_all':
+                        # Skip current TTS and clear queue (X key)
+                        try:
+                            req = urllib.request.Request(
+                                f"{API_URL}/api/tts/skip?clear_queue=true",
+                                method="POST",
+                                data=b""
+                            )
+                            with urllib.request.urlopen(req, timeout=2) as resp:
+                                result = json.loads(resp.read().decode())
+                                msg_parts = []
+                                if result.get("skipped"):
+                                    msg_parts.append("Skipped")
+                                if result.get("cleared", 0) > 0:
+                                    msg_parts.append(f"cleared {result['cleared']}")
+                                if msg_parts:
+                                    tts_skip_feedback = (time.time(), ", ".join(msg_parts) + "!")
+                                else:
+                                    tts_skip_feedback = (time.time(), "Nothing to skip/clear")
+                        except Exception as e:
+                            tts_skip_feedback = (time.time(), f"Skip failed: {str(e)[:20]}")
                         live.update(get_dashboard(instances_cache, selected_index))
                         live.refresh()
 

@@ -33,10 +33,106 @@ from apscheduler.triggers.cron import CronTrigger
 logger = logging.getLogger("token_api")
 logger.setLevel(logging.INFO)
 
+# ============ Server-side Log Buffer ============
+from collections import deque
+from typing import Deque
+
+# Circular buffer to store recent log entries (max 100)
+log_buffer: Deque[dict] = deque(maxlen=100)
+
+
+class LogBufferHandler(logging.Handler):
+    """Custom logging handler that captures logs to circular buffer."""
+
+    def emit(self, record: logging.LogRecord):
+        """Capture log record to buffer with timestamp, level, and message."""
+        try:
+            log_entry = {
+                "timestamp": datetime.fromtimestamp(record.created).strftime("%H:%M:%S"),
+                "level": record.levelname,
+                "message": self.format(record)
+            }
+            log_buffer.append(log_entry)
+        except Exception:
+            # Silently fail to avoid logging errors in logging system
+            pass
+
+
+# Add buffer handler to logger
+buffer_handler = LogBufferHandler()
+buffer_handler.setLevel(logging.DEBUG)
+buffer_handler.setFormatter(logging.Formatter('%(message)s'))
+logger.addHandler(buffer_handler)
+
+# Also capture uvicorn and fastapi logs
+uvicorn_logger = logging.getLogger("uvicorn")
+uvicorn_logger.addHandler(buffer_handler)
+
+fastapi_logger = logging.getLogger("fastapi")
+fastapi_logger.addHandler(buffer_handler)
+
 
 # Configuration
 DB_PATH = Path.home() / ".claude" / "agents.db"
 SERVER_PORT = 7777  # Authoritative port for Token API
+CRASH_LOG_PATH = Path.home() / ".claude" / "token-api-crash.log"
+
+
+# ============ Crash Logging ============
+import sys
+import traceback
+
+
+def log_crash(exc_type, exc_value, exc_tb, context: str = "unhandled"):
+    """Write crash info to persistent file for post-mortem debugging."""
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        tb_lines = traceback.format_exception(exc_type, exc_value, exc_tb)
+        tb_str = "".join(tb_lines)
+
+        with open(CRASH_LOG_PATH, "a") as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"CRASH [{context}] at {timestamp}\n")
+            f.write(f"{'='*60}\n")
+            f.write(tb_str)
+            f.write("\n")
+
+        # Also print to stderr so journald captures it
+        print(f"CRASH [{context}]: {exc_type.__name__}: {exc_value}", file=sys.stderr)
+    except Exception:
+        pass  # Don't crash while logging a crash
+
+
+def _global_exception_handler(exc_type, exc_value, exc_tb):
+    """Global exception handler for uncaught sync exceptions."""
+    log_crash(exc_type, exc_value, exc_tb, context="sync")
+    # Call the default handler to preserve normal behavior
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+
+def _asyncio_exception_handler(loop, context):
+    """Handler for uncaught exceptions in asyncio tasks."""
+    exception = context.get("exception")
+    if exception:
+        log_crash(type(exception), exception, exception.__traceback__, context="asyncio")
+    else:
+        # Log context message if no exception object
+        try:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(CRASH_LOG_PATH, "a") as f:
+                f.write(f"\n{'='*60}\n")
+                f.write(f"ASYNCIO ERROR at {timestamp}\n")
+                f.write(f"{'='*60}\n")
+                f.write(f"{context}\n\n")
+        except Exception:
+            pass
+
+    # Call the default handler
+    loop.default_exception_handler(context)
+
+
+# Install global exception handlers
+sys.excepthook = _global_exception_handler
 
 # Device IP mapping for SSH detection
 DEVICE_IPS = {
@@ -45,11 +141,13 @@ DEVICE_IPS = {
 }
 
 # Profile pool for voice/sound assignment
+# Available voices: David, Zira (US), George, Hazel, Susan (UK), Catherine, James (AU),
+#                   Sean (IE), Heera, Ravi (IN), Linda, Richard (CA), Mark (US)
 PROFILES = [
-    {"name": "profile_1", "tts_voice": "Microsoft David Desktop", "notification_sound": "chimes.wav", "color": "#0099ff"},
-    {"name": "profile_2", "tts_voice": "Microsoft Zira Desktop", "notification_sound": "notify.wav", "color": "#00cc66"},
-    {"name": "profile_3", "tts_voice": "Microsoft David Desktop", "notification_sound": "ding.wav", "color": "#ff9900"},
-    {"name": "profile_4", "tts_voice": "Microsoft Zira Desktop", "notification_sound": "tada.wav", "color": "#cc66ff"},
+    {"name": "profile_1", "tts_voice": "Microsoft George", "notification_sound": "chimes.wav", "color": "#0099ff"},      # British
+    {"name": "profile_2", "tts_voice": "Microsoft Catherine", "notification_sound": "notify.wav", "color": "#00cc66"},   # Australian
+    {"name": "profile_3", "tts_voice": "Microsoft Sean", "notification_sound": "ding.wav", "color": "#ff9900"},          # Irish
+    {"name": "profile_4", "tts_voice": "Microsoft Ravi", "notification_sound": "tada.wav", "color": "#cc66ff"},          # Indian
 ]
 
 # Scheduler instance
@@ -227,6 +325,23 @@ class DesktopDetectionResponse(BaseModel):
     active_instance_count: int
 
 
+# ============ Phone Activity Models ============
+
+class PhoneActivityRequest(BaseModel):
+    """Request from MacroDroid for phone app activity."""
+    app: str  # App name: "twitter", "youtube", "game", or app package name
+    action: str = "open"  # "open" | "close"
+    package: Optional[str] = None  # Optional package name for games
+
+
+class PhoneActivityResponse(BaseModel):
+    """Response for phone activity detection."""
+    allowed: bool
+    reason: str  # "break_time_available", "productivity_active", "blocked", "closed"
+    break_seconds: int = 0
+    message: Optional[str] = None
+
+
 # ============ Headless Mode Models ============
 
 class HeadlessStatusResponse(BaseModel):
@@ -266,6 +381,26 @@ class ShutdownResponse(BaseModel):
     action: str
     delay_seconds: int
     message: str
+
+
+# ============ Claude Code Hook Models ============
+
+class HookResponse(BaseModel):
+    """Standard response for hook handlers."""
+    success: bool = True
+    action: str
+    details: Optional[dict] = None
+
+
+class PreToolUseResponse(BaseModel):
+    """Response for PreToolUse hooks that can block operations."""
+    permissionDecision: Optional[str] = None  # "allow" or "deny"
+    permissionDecisionReason: Optional[str] = None
+
+
+# ============ Hook Handler State ============
+# Debouncing for PostToolUse to avoid excessive API calls
+_post_tool_debounce: dict = {}  # session_id -> last_call_time
 
 
 # Database initialization
@@ -742,6 +877,19 @@ async def run_overdue_tasks():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global tts_worker_task, stale_flag_cleaner_task
+
+    # Install asyncio exception handler for this loop
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(_asyncio_exception_handler)
+
+    # Log startup to crash log for context
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(CRASH_LOG_PATH, "a") as f:
+            f.write(f"\n--- SERVER STARTED at {timestamp} ---\n")
+    except Exception:
+        pass
+
     # Startup
     await init_db()
     await load_tasks_from_db()
@@ -755,6 +903,15 @@ async def lifespan(app: FastAPI):
     print("Stale flag cleaner started")
     await run_overdue_tasks()
     yield
+
+    # Log shutdown to crash log
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(CRASH_LOG_PATH, "a") as f:
+            f.write(f"--- SERVER STOPPING at {timestamp} ---\n")
+    except Exception:
+        pass
+
     # Shutdown
     if tts_worker_task:
         tts_worker_task.cancel()
@@ -968,6 +1125,19 @@ class RenameInstanceRequest(BaseModel):
     tab_name: str
 
 
+class LogEntry(BaseModel):
+    """Single log entry."""
+    timestamp: str
+    level: str
+    message: str
+
+
+class LogsResponse(BaseModel):
+    """Response for recent logs."""
+    logs: List[LogEntry]
+    count: int
+
+
 @app.patch("/api/instances/{instance_id}/rename")
 async def rename_instance(instance_id: str, request: RenameInstanceRequest):
     """Rename an instance's tab_name."""
@@ -1037,21 +1207,24 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
 
 @app.get("/api/instances/{instance_id}/todos")
 async def get_instance_todos(instance_id: str):
-    """Get the todo list for an instance (uses instance_id as conversation ID)."""
-    todos_dir = Path.home() / ".claude" / "todos"
+    """Get the task list for an instance from ~/.claude/tasks/{instance_id}/."""
+    tasks_dir = Path.home() / ".claude" / "tasks" / instance_id
 
-    # Todo files are named with the conversation ID (which is the instance_id)
-    todo_file = todos_dir / f"{instance_id}-agent-{instance_id}.json"
-
-    if not todo_file.exists():
-        return {"todos": [], "progress": 0, "current_task": None}
+    if not tasks_dir.exists():
+        return {"todos": [], "progress": 0, "current_task": None, "total": 0, "completed": 0}
 
     try:
-        with open(todo_file) as f:
-            todos = json.load(f)
+        todos = []
+        for task_file in tasks_dir.glob("*.json"):
+            with open(task_file) as f:
+                task = json.load(f)
+                todos.append(task)
 
         if not todos:
-            return {"todos": [], "progress": 0, "current_task": None}
+            return {"todos": [], "progress": 0, "current_task": None, "total": 0, "completed": 0}
+
+        # Sort by ID (numeric)
+        todos.sort(key=lambda t: int(t.get("id", 0)))
 
         completed = sum(1 for t in todos if t.get("status") == "completed")
         total = len(todos)
@@ -1060,7 +1233,7 @@ async def get_instance_todos(instance_id: str):
         current_task = None
         for t in todos:
             if t.get("status") == "in_progress":
-                current_task = t.get("activeForm") or t.get("content")
+                current_task = t.get("activeForm") or t.get("subject")
                 break
 
         return {
@@ -1071,7 +1244,7 @@ async def get_instance_todos(instance_id: str):
             "current_task": current_task
         }
     except Exception as e:
-        return {"todos": [], "progress": 0, "current_task": None, "error": str(e)}
+        return {"todos": [], "progress": 0, "current_task": None, "total": 0, "completed": 0, "error": str(e)}
 
 
 @app.get("/api/instances", response_model=List[dict])
@@ -1194,6 +1367,47 @@ DESKTOP_STATE = {
     "work_mode": "clocked_in",
     "work_mode_changed_at": None,
 }
+
+# Phone activity state (tracks current app from MacroDroid)
+PHONE_STATE = {
+    "current_app": None,  # Current distraction app or None
+    "last_activity": None,
+    "is_distracted": False,
+}
+
+# App categories for phone distraction detection
+PHONE_DISTRACTION_APPS = {
+    # Twitter/X
+    "twitter": "video",
+    "x": "video",
+    "com.twitter.android": "video",
+    # YouTube
+    "youtube": "video",
+    "com.google.android.youtube": "video",
+    # Games - add specific games here
+    "game": "gaming",
+    "minecraft": "gaming",
+    "com.mojang.minecraftpe": "gaming",
+}
+
+# ============ Obsidian Timer State ============
+# Read timer-state.json to check break availability
+TIMER_STATE_PATH = Path("/mnt/c/Users/colby/Documents/Obsidian/Token-ENV/Scripts/timer-state.json")
+
+
+def get_obsidian_timer_state() -> dict:
+    """
+    Read Obsidian timer-state.json for break availability.
+    Returns dict with breakAvailableSeconds, isInBacklog, etc.
+    """
+    try:
+        if TIMER_STATE_PATH.exists():
+            with open(TIMER_STATE_PATH, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"Error reading timer state: {e}")
+    return {"breakAvailableSeconds": 0, "isInBacklog": False}
+
 
 # ============ Audio Proxy State ============
 # Tracks phone audio proxy status for routing phone audio through PC
@@ -1493,18 +1707,22 @@ def close_distraction_windows() -> dict:
     }
 "@ -ErrorAction SilentlyContinue
 
+    # Get all brave.exe PIDs first for matching
+    $bravePids = @(Get-Process -Name "brave" -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+
     $callback = {
         param($hwnd, $lparam)
         if ([Win32Enum]::IsWindowVisible($hwnd)) {
             $sb = New-Object System.Text.StringBuilder 512
             [Win32Enum]::GetWindowText($hwnd, $sb, 512) | Out-Null
             $title = $sb.ToString()
-            # Match YouTube in any Brave window
-            if ($title -match "YouTube" -and $title -match "Brave") {
-                [Win32Enum]::handles.Add($hwnd) | Out-Null
+            # Check if title contains YouTube
+            if ($title -match "YouTube") {
                 $pid = 0
                 [Win32Enum]::GetWindowThreadProcessId($hwnd, [ref]$pid) | Out-Null
-                if ($pid -gt 0) {
+                # Only target if window belongs to a brave.exe process
+                if ($pid -gt 0 -and $bravePids -contains $pid) {
+                    [Win32Enum]::handles.Add($hwnd) | Out-Null
                     [Win32Enum]::pids.Add($pid) | Out-Null
                 }
             }
@@ -1746,12 +1964,26 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
         allowed = True
         reason = "gym_mode"
         print(f"    Gym mode - all modes allowed")
-    # CLOCKED IN: Video mode (distraction) requires productivity to be active
-    elif detected_mode == "video":
-        if not productivity_active:
+    # CLOCKED IN: Video/gaming mode requires either break time OR productivity
+    elif detected_mode == "video" or detected_mode == "gaming":
+        timer_state = get_obsidian_timer_state()
+        has_break_time = timer_state.get("breakAvailableSeconds", 0) > 0
+
+        if has_break_time:
+            # User has earned break time - allow video/gaming, Obsidian will consume it
+            allowed = True
+            reason = "break_time_available"
+            print(f"    {detected_mode.title()} allowed: {timer_state.get('breakAvailableSeconds', 0)}s break available")
+        elif productivity_active:
+            # No break time but actively working - video drains break (penalty)
+            allowed = True
+            reason = "productivity_active"
+            print(f"    {detected_mode.title()} allowed: productivity active (penalty mode)")
+        else:
+            # No break time AND no productivity - block
             allowed = False
-            reason = "productivity_inactive"
-            print(f"    Video mode blocked: no productivity active")
+            reason = "no_productivity_no_break"
+            print(f"    {detected_mode.title()} blocked: no break time, no productivity")
 
     if allowed:
         # Update state
@@ -1821,6 +2053,170 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
                 active_instance_count=active_count
             ).model_dump()
         )
+
+
+# ============ Phone Activity Detection ============
+# MacroDroid sends app open/close events from phone
+
+@app.post("/phone", response_model=PhoneActivityResponse)
+async def handle_phone_activity(request: PhoneActivityRequest):
+    """
+    Handle phone app activity from MacroDroid.
+
+    Called when distraction apps (Twitter, YouTube, games) are opened/closed.
+    Returns whether the app is allowed based on break time or productivity.
+
+    Unlike desktop, we don't force-close apps - just return allowed/blocked
+    for MacroDroid to handle (show notification, etc).
+    """
+    app_name = request.app.lower()
+    action = request.action.lower()
+    package = request.package
+
+    print(f">>> Phone activity: app={app_name} action={action} package={package}")
+
+    # Handle app close
+    if action == "close":
+        PHONE_STATE["current_app"] = None
+        PHONE_STATE["is_distracted"] = False
+        PHONE_STATE["last_activity"] = datetime.now().isoformat()
+
+        await log_event(
+            "phone_app_closed",
+            details={"app": app_name, "package": package}
+        )
+
+        return PhoneActivityResponse(
+            allowed=True,
+            reason="closed",
+            message="App closed"
+        )
+
+    # Determine distraction category
+    distraction_mode = PHONE_DISTRACTION_APPS.get(app_name)
+    if not distraction_mode and package:
+        distraction_mode = PHONE_DISTRACTION_APPS.get(package)
+
+    # If not a known distraction app, allow it
+    if not distraction_mode:
+        print(f"    Unknown app, allowing: {app_name}")
+        return PhoneActivityResponse(
+            allowed=True,
+            reason="not_tracked",
+            message="App not in distraction list"
+        )
+
+    # Check work mode
+    work_mode = DESKTOP_STATE.get("work_mode", "clocked_in")
+
+    # Clocked out or gym mode = all allowed
+    if work_mode in ("clocked_out", "gym"):
+        PHONE_STATE["current_app"] = app_name
+        PHONE_STATE["is_distracted"] = True
+        PHONE_STATE["last_activity"] = datetime.now().isoformat()
+
+        await log_event(
+            "phone_distraction_allowed",
+            details={"app": app_name, "reason": work_mode}
+        )
+
+        return PhoneActivityResponse(
+            allowed=True,
+            reason=work_mode,
+            message=f"Allowed ({work_mode})"
+        )
+
+    # Clocked in - check break time and productivity
+    timer_state = get_obsidian_timer_state()
+    break_secs = timer_state.get("breakAvailableSeconds", 0)
+
+    # Check productivity (active Claude instances)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM claude_instances WHERE status = 'active'"
+        )
+        row = await cursor.fetchone()
+        active_count = row[0] if row else 0
+
+    productivity_active = active_count > 0
+
+    # Decision logic (same as desktop)
+    if break_secs > 0:
+        # Has break time - allow
+        PHONE_STATE["current_app"] = app_name
+        PHONE_STATE["is_distracted"] = True
+        PHONE_STATE["last_activity"] = datetime.now().isoformat()
+
+        await log_event(
+            "phone_distraction_allowed",
+            details={
+                "app": app_name,
+                "reason": "break_time",
+                "break_seconds": break_secs
+            }
+        )
+
+        print(f"    Allowed: {break_secs}s break available")
+        return PhoneActivityResponse(
+            allowed=True,
+            reason="break_time_available",
+            break_seconds=break_secs,
+            message=f"Break time: {break_secs // 60}m {break_secs % 60}s"
+        )
+
+    elif productivity_active:
+        # No break but productive - allow with penalty
+        PHONE_STATE["current_app"] = app_name
+        PHONE_STATE["is_distracted"] = True
+        PHONE_STATE["last_activity"] = datetime.now().isoformat()
+
+        await log_event(
+            "phone_distraction_allowed",
+            details={
+                "app": app_name,
+                "reason": "productivity_active",
+                "active_instances": active_count
+            }
+        )
+
+        print(f"    Allowed: productivity active ({active_count} instances)")
+        return PhoneActivityResponse(
+            allowed=True,
+            reason="productivity_active",
+            break_seconds=0,
+            message="Productivity active (penalty mode)"
+        )
+
+    else:
+        # No break, no productivity - block
+        await log_event(
+            "phone_distraction_blocked",
+            details={
+                "app": app_name,
+                "reason": "no_break_no_productivity"
+            }
+        )
+
+        print(f"    BLOCKED: no break time, no productivity")
+        return PhoneActivityResponse(
+            allowed=False,
+            reason="blocked",
+            break_seconds=0,
+            message="No break time or productivity"
+        )
+
+
+@app.get("/phone")
+async def get_phone_state():
+    """Get current phone activity state."""
+    timer_state = get_obsidian_timer_state()
+    return {
+        "current_app": PHONE_STATE.get("current_app"),
+        "is_distracted": PHONE_STATE.get("is_distracted", False),
+        "last_activity": PHONE_STATE.get("last_activity"),
+        "break_seconds": timer_state.get("breakAvailableSeconds", 0),
+        "work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
+    }
 
 
 # ============ Work Mode / Geofence Endpoints ============
@@ -2510,6 +2906,29 @@ async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 
+@app.get("/api/logs/recent", response_model=LogsResponse)
+async def get_recent_logs(limit: int = 50):
+    """
+    Get recent server logs from circular buffer.
+
+    Args:
+        limit: Maximum number of logs to return (default 50, max 100)
+
+    Returns:
+        LogsResponse with recent logs and count
+    """
+    # Limit the limit parameter to max 100
+    limit = min(limit, 100)
+
+    # Get the most recent N entries from the buffer
+    recent_logs = list(log_buffer)[-limit:]
+
+    return {
+        "logs": recent_logs,
+        "count": len(recent_logs)
+    }
+
+
 # Root endpoint
 @app.get("/")
 async def root():
@@ -2535,6 +2954,8 @@ def is_wsl() -> bool:
 
 IS_WSL = is_wsl()
 DEFAULT_SOUND = "chimes.wav"  # Windows Media sound name
+# Full path to powershell.exe for systemd services that don't have Windows PATH
+POWERSHELL_PATH = "/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/powershell.exe"
 
 
 def play_sound(sound_file: str = None) -> dict:
@@ -2546,7 +2967,7 @@ def play_sound(sound_file: str = None) -> dict:
         sound_path = f"C:\\\\Windows\\\\Media\\\\{sound_name}"
         try:
             result = subprocess.run(
-                ["powershell.exe", "-c", f"(New-Object Media.SoundPlayer '{sound_path}').PlaySync()"],
+                [POWERSHELL_PATH, "-c", f"(New-Object Media.SoundPlayer '{sound_path}').PlaySync()"],
                 capture_output=True,
                 timeout=10
             )
@@ -2584,13 +3005,21 @@ async def log_event_sync(event_type: str, instance_id: str = None, device_id: st
 
 
 def speak_tts(message: str, voice: str = None, rate: int = 0, instance_id: str = None) -> dict:
-    """Speak a message using TTS. In WSL, uses Windows SAPI via PowerShell."""
+    """Speak a message using TTS. In WSL, uses Windows SAPI via PowerShell.
+
+    Uses Popen instead of run() to allow process termination via skip_tts().
+    """
+    global tts_current_process
+
     if not message:
         return {"success": False, "error": "No message provided"}
 
     if IS_WSL:
         # Use Windows SAPI via PowerShell
         voice = voice or "Microsoft Zira Desktop"
+
+        # Use faster rate by default (SAPI rate: -10 to 10, 0=normal, 2≈1.5x)
+        effective_rate = 2 if rate == 0 else rate
 
         # Escape special characters for PowerShell
         escaped = message.replace("\\", "\\\\").replace("'", "''").replace("$", "\\$").replace("`", "\\`")
@@ -2599,39 +3028,71 @@ def speak_tts(message: str, voice: str = None, rate: int = 0, instance_id: str =
 Add-Type -AssemblyName System.Speech
 $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
 $synth.SelectVoice('{voice}')
-$synth.Rate = [int]{rate}
+$synth.Rate = [int]{effective_rate}
 $synth.Speak('{escaped}')
 """
         try:
-            result = subprocess.run(
-                ["powershell.exe"],
-                input=ps_script.encode(),
-                capture_output=True,
-                timeout=30
+            process = subprocess.Popen(
+                [POWERSHELL_PATH],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
             )
-            if result.returncode == 0:
+            tts_current_process = process
+            stdout, stderr = process.communicate(input=ps_script.encode(), timeout=300)
+            tts_current_process = None
+
+            if process.returncode == 0:
                 return {"success": True, "method": "windows_sapi", "voice": voice, "message": message[:50]}
-            error = result.stderr.decode()[:200] if result.stderr else "Unknown error"
+            error = stderr.decode()[:200] if stderr else "Unknown error"
             return {"success": False, "error": f"SAPI failed: {error}"}
         except subprocess.TimeoutExpired:
+            if tts_current_process:
+                tts_current_process.kill()
+                tts_current_process = None
             return {"success": False, "error": "TTS timed out"}
         except Exception as e:
+            tts_current_process = None
             return {"success": False, "error": str(e)}
     else:
         # Linux: try espeak then festival
         try:
             espeak_rate = 175 + (rate * 25)  # Convert -10..10 to espeak scale
             espeak_rate = max(80, min(500, espeak_rate))
-            result = subprocess.run(["espeak", "-s", str(espeak_rate), message], capture_output=True, timeout=30)
-            if result.returncode == 0:
+
+            process = subprocess.Popen(
+                ["espeak", "-s", str(espeak_rate), message],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            tts_current_process = process
+            process.wait(timeout=300)
+            tts_current_process = None
+
+            if process.returncode == 0:
                 return {"success": True, "method": "espeak", "message": message[:50]}
 
-            result = subprocess.run(["festival", "--tts"], input=message.encode(), capture_output=True, timeout=30)
-            if result.returncode == 0:
+            process = subprocess.Popen(
+                ["festival", "--tts"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            tts_current_process = process
+            process.communicate(input=message.encode(), timeout=300)
+            tts_current_process = None
+
+            if process.returncode == 0:
                 return {"success": True, "method": "festival", "message": message[:50]}
 
             return {"success": False, "error": "Both espeak and festival failed"}
+        except subprocess.TimeoutExpired:
+            if tts_current_process:
+                tts_current_process.kill()
+                tts_current_process = None
+            return {"success": False, "error": "TTS timed out"}
         except Exception as e:
+            tts_current_process = None
             return {"success": False, "error": str(e)}
 
 
@@ -2639,8 +3100,6 @@ $synth.Speak('{escaped}')
 # Ensures TTS messages don't overlap - each plays sequentially
 
 from dataclasses import dataclass, field
-from typing import Deque
-from collections import deque
 
 @dataclass
 class TTSQueueItem:
@@ -2656,6 +3115,7 @@ class TTSQueueItem:
 # Global TTS queue state
 tts_queue: Deque[TTSQueueItem] = deque()
 tts_current: Optional[TTSQueueItem] = None
+tts_current_process: Optional[subprocess.Popen] = None  # Current TTS/sound process for skip support
 tts_queue_lock = asyncio.Lock()
 tts_worker_task: Optional[asyncio.Task] = None
 stale_flag_cleaner_task: Optional[asyncio.Task] = None
@@ -2686,23 +3146,44 @@ async def tts_queue_worker():
                     }
                 )
 
-                # Play notification sound first
+                # Play notification sound first (run in executor to not block event loop)
+                sound_result = None
                 if tts_current.sound:
-                    play_sound(tts_current.sound)
+                    loop = asyncio.get_event_loop()
+                    sound_result = await loop.run_in_executor(None, play_sound, tts_current.sound)
+                    logger.info(f"TTS worker: sound result = {json.dumps(sound_result)}")
+                    if not sound_result.get("success"):
+                        logger.warning(f"Sound failed: {sound_result.get('error')}")
                     await asyncio.sleep(0.3)  # Brief pause after sound
 
-                # Speak the message
-                speak_tts(tts_current.message, tts_current.voice)
+                # Speak the message (run in executor to allow skip API to interrupt)
+                logger.info(f"TTS worker: speaking {len(tts_current.message)} chars with {tts_current.voice}")
+                loop = asyncio.get_event_loop()
+                tts_result = await loop.run_in_executor(None, speak_tts, tts_current.message, tts_current.voice)
+                logger.info(f"TTS worker: speak result = {json.dumps(tts_result)}")
 
-                # Log completion
-                await log_event(
-                    "tts_completed",
-                    instance_id=tts_current.instance_id,
-                    details={
-                        "message": tts_current.message[:50],
-                        "voice": tts_current.voice
-                    }
-                )
+                # Log completion or failure
+                if tts_result.get("success"):
+                    await log_event(
+                        "tts_completed",
+                        instance_id=tts_current.instance_id,
+                        details={
+                            "message": tts_current.message[:50],
+                            "voice": tts_current.voice
+                        }
+                    )
+                else:
+                    logger.error(f"TTS failed for {tts_current.instance_id}: {tts_result.get('error')}")
+                    await log_event(
+                        "tts_failed",
+                        instance_id=tts_current.instance_id,
+                        details={
+                            "message": tts_current.message[:50],
+                            "voice": tts_current.voice,
+                            "error": tts_result.get("error", "Unknown error"),
+                            "sound_result": sound_result
+                        }
+                    )
 
                 tts_current = None
                 await asyncio.sleep(0.5)  # Brief pause between items
@@ -2724,7 +3205,7 @@ async def clear_stale_processing_flags():
                     UPDATE claude_instances
                     SET is_processing = 0
                     WHERE is_processing = 1
-                      AND datetime(last_activity) < datetime('now', '-5 minutes')
+                      AND datetime(last_activity) < datetime('now', 'localtime', '-5 minutes')
                 """)
                 await db.commit()
 
@@ -2814,6 +3295,54 @@ def get_tts_queue_status() -> dict:
         "queue": queue_list,
         "queue_length": len(queue_list)
     }
+
+
+async def skip_tts(clear_queue: bool = False) -> dict:
+    """Skip current TTS and optionally clear the queue.
+
+    Args:
+        clear_queue: If True, also clear all pending items in the queue.
+
+    Returns:
+        Dict with skipped (bool) and cleared (int) counts.
+    """
+    global tts_current_process, tts_current, tts_queue
+
+    result = {"skipped": False, "cleared": 0}
+
+    # Kill current TTS process if running
+    if tts_current_process and tts_current_process.poll() is None:
+        try:
+            if IS_WSL:
+                # In WSL, process.kill() doesn't stop Windows processes
+                # Use Windows taskkill via cmd.exe to forcefully terminate PowerShell
+                subprocess.run(
+                    ["/mnt/c/WINDOWS/System32/cmd.exe", "/c", "taskkill /IM powershell.exe /F"],
+                    timeout=5,
+                    capture_output=True
+                )
+                result["skipped"] = True
+                logger.info("TTS process killed via Windows taskkill")
+            else:
+                # On native Linux, regular kill works
+                tts_current_process.kill()
+                tts_current_process.wait(timeout=1.0)
+                result["skipped"] = True
+                logger.info("TTS process killed via skip")
+        except Exception as e:
+            logger.warning(f"Error killing TTS process: {e}")
+
+        tts_current_process = None
+
+    # Clear queue if requested
+    if clear_queue:
+        async with tts_queue_lock:
+            result["cleared"] = len(tts_queue)
+            tts_queue.clear()
+            if result["cleared"] > 0:
+                logger.info(f"Cleared {result['cleared']} items from TTS queue")
+
+    return result
 
 
 def send_webhook(webhook_url: str, message: str, data: dict = None) -> dict:
@@ -2927,7 +3456,9 @@ async def notify_tts(request: TTSRequest):
         details={"message": request.message[:100], "voice": request.voice or "default"}
     )
 
-    result = speak_tts(request.message, request.voice, request.rate)
+    # Run in executor to allow skip API to interrupt
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, speak_tts, request.message, request.voice, request.rate)
 
     # Log TTS result
     await log_event(
@@ -2973,6 +3504,21 @@ async def get_queue_status():
     return get_tts_queue_status()
 
 
+@app.post("/api/tts/skip")
+async def api_tts_skip(clear_queue: bool = False):
+    """Skip current TTS playback and optionally clear the queue.
+
+    Args:
+        clear_queue: Query param - if true, also clears all pending items.
+
+    Returns:
+        Dict with 'skipped' (bool) and 'cleared' (int count).
+    """
+    result = await skip_tts(clear_queue)
+    await log_event("tts_skipped", details=result)
+    return result
+
+
 @app.get("/api/notify/test")
 async def test_notification():
     """Test the notification system with a simple message."""
@@ -2984,6 +3530,412 @@ async def test_notification():
         "tts": tts_result,
         "message": "Test notification sent"
     }
+
+
+# ============ Claude Code Hook Handlers ============
+# Centralized handling for all Claude Code hooks
+# Replaces shell scripts with Python for better reliability and debugging
+
+async def handle_session_start(payload: dict) -> dict:
+    """Handle SessionStart hook - register new Claude instance."""
+    session_id = payload.get("session_id") or payload.get("conversation_id")
+    if not session_id:
+        session_id = f"claude-{int(time.time())}-{os.getpid()}"
+
+    # Detect origin type from SSH_CLIENT env var in payload
+    origin_type = "local"
+    source_ip = None
+    if payload.get("env", {}).get("SSH_CLIENT"):
+        origin_type = "ssh"
+        source_ip = payload["env"]["SSH_CLIENT"].split()[0]
+
+    # Get working directory and tab name
+    working_dir = payload.get("cwd") or os.getcwd()
+    tab_name = payload.get("env", {}).get("CLAUDE_TAB_NAME") or f"Claude {datetime.now().strftime('%H:%M')}"
+
+    # Resolve device_id from source_ip
+    device_id = resolve_device_from_ip(source_ip) if source_ip else "desktop"
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Check if already registered
+        cursor = await db.execute(
+            "SELECT id FROM claude_instances WHERE id = ?",
+            (session_id,)
+        )
+        if await cursor.fetchone():
+            return {"success": True, "action": "already_registered", "instance_id": session_id}
+
+        # Get currently used profiles
+        cursor = await db.execute(
+            "SELECT profile_name FROM claude_instances WHERE status = 'active'"
+        )
+        rows = await cursor.fetchall()
+        used_profiles = {row[0] for row in rows if row[0]}
+
+        # Assign profile
+        profile = get_next_available_profile(used_profiles)
+
+        # Insert instance
+        now = datetime.now().isoformat()
+        internal_session_id = str(uuid.uuid4())
+        await db.execute(
+            """INSERT INTO claude_instances
+               (id, session_id, tab_name, working_dir, origin_type, source_ip, device_id,
+                profile_name, tts_voice, notification_sound, pid, status,
+                registered_at, last_activity)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+            (
+                session_id,
+                internal_session_id,
+                tab_name,
+                working_dir,
+                origin_type,
+                source_ip,
+                device_id,
+                profile["name"],
+                profile["tts_voice"],
+                profile["notification_sound"],
+                payload.get("pid"),
+                now,
+                now
+            )
+        )
+        await db.commit()
+
+    logger.info(f"Hook: SessionStart registered {session_id[:12]}... ({working_dir})")
+    await log_event("instance_registered", instance_id=session_id, device_id=device_id,
+                    details={"tab_name": tab_name, "origin_type": origin_type, "source": "hook"})
+
+    return {
+        "success": True,
+        "action": "registered",
+        "instance_id": session_id,
+        "profile": profile["name"]
+    }
+
+
+async def handle_session_end(payload: dict) -> dict:
+    """Handle SessionEnd hook - deregister Claude instance."""
+    session_id = payload.get("session_id") or payload.get("conversation_id")
+    if not session_id:
+        return {"success": False, "action": "no_session_id"}
+
+    now = datetime.now().isoformat()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, device_id FROM claude_instances WHERE id = ?",
+            (session_id,)
+        )
+        row = await cursor.fetchone()
+
+        if not row:
+            return {"success": False, "action": "not_found", "instance_id": session_id}
+
+        await db.execute(
+            "UPDATE claude_instances SET status = 'stopped', stopped_at = ? WHERE id = ?",
+            (now, session_id)
+        )
+        await db.commit()
+
+        # Check remaining active instances
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM claude_instances WHERE status = 'active'"
+        )
+        count_row = await cursor.fetchone()
+        remaining_active = count_row[0] if count_row else 0
+
+    logger.info(f"Hook: SessionEnd stopped {session_id[:12]}...")
+    await log_event("instance_stopped", instance_id=session_id, device_id=row[1],
+                    details={"source": "hook"})
+
+    # Handle productivity enforcement if needed
+    result = {"success": True, "action": "stopped", "instance_id": session_id}
+    if remaining_active == 0 and DESKTOP_STATE.get("current_mode") == "video":
+        enforce_result = close_distraction_windows()
+        result["enforcement_triggered"] = True
+        result["enforcement_result"] = enforce_result
+
+    return result
+
+
+async def handle_prompt_submit(payload: dict) -> dict:
+    """Handle UserPromptSubmit hook - mark instance as processing."""
+    session_id = payload.get("session_id")
+    if not session_id:
+        return {"success": False, "action": "no_session_id"}
+
+    now = datetime.now().isoformat()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id FROM claude_instances WHERE id = ?",
+            (session_id,)
+        )
+        if not await cursor.fetchone():
+            return {"success": False, "action": "not_found"}
+
+        await db.execute(
+            "UPDATE claude_instances SET is_processing = 1, last_activity = ? WHERE id = ?",
+            (now, session_id)
+        )
+        await db.commit()
+
+    logger.info(f"Hook: PromptSubmit {session_id[:12]}... -> processing")
+    return {"success": True, "action": "processing", "instance_id": session_id}
+
+
+async def handle_post_tool_use(payload: dict) -> dict:
+    """Handle PostToolUse hook - heartbeat with debouncing."""
+    session_id = payload.get("session_id")
+    if not session_id:
+        return {"success": False, "action": "no_session_id"}
+
+    # Debounce: only update every 2 seconds per session
+    current_time = time.time()
+    last_call = _post_tool_debounce.get(session_id, 0)
+    if current_time - last_call < 2:
+        return {"success": True, "action": "debounced"}
+
+    _post_tool_debounce[session_id] = current_time
+
+    # Update last_activity as heartbeat (don't touch is_processing - that's managed by prompt_submit/stop)
+    now = datetime.now().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE claude_instances SET last_activity = ? WHERE id = ?",
+            (now, session_id)
+        )
+        await db.commit()
+
+    return {"success": True, "action": "heartbeat", "instance_id": session_id}
+
+
+async def handle_stop(payload: dict) -> dict:
+    """Handle Stop hook - response completed, trigger TTS/notifications."""
+    session_id = payload.get("session_id")
+    if not session_id:
+        return {"success": False, "action": "no_session_id"}
+
+    # Prevent infinite loops
+    if payload.get("stop_hook_active"):
+        return {"success": True, "action": "skipped_recursive"}
+
+    # Get instance info
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM claude_instances WHERE id = ?",
+            (session_id,)
+        )
+        instance = await cursor.fetchone()
+
+    if not instance:
+        return {"success": False, "action": "instance_not_found"}
+
+    instance = dict(instance)
+    device_id = instance.get("device_id", "desktop")
+    tab_name = instance.get("tab_name", "Claude")
+    tts_voice = instance.get("tts_voice", "Microsoft Zira Desktop")
+    notification_sound = instance.get("notification_sound", "chimes.wav")
+
+    # Mark as no longer processing
+    now = datetime.now().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE claude_instances SET is_processing = 0, last_activity = ? WHERE id = ?",
+            (now, session_id)
+        )
+        await db.commit()
+
+    result = {
+        "success": True,
+        "action": "stop_processed",
+        "instance_id": session_id,
+        "device_id": device_id
+    }
+
+    # Mobile path: send webhook notification
+    if device_id == "Token-S24":
+        webhook_result = send_webhook(
+            "http://100.102.92.24:7777/notify",
+            f"[{tab_name}] Claude finished"
+        )
+        result["notification"] = webhook_result
+        logger.info(f"Hook: Stop {session_id[:12]}... -> mobile notification")
+        return result
+
+    # Desktop path: TTS and notification
+    # Extract TTS text from transcript
+    transcript_path = payload.get("transcript_path")
+    tts_text = None
+
+    if transcript_path and os.path.exists(transcript_path):
+        try:
+            with open(transcript_path, 'r') as f:
+                lines = f.readlines()
+
+            # Find last assistant message
+            for line in reversed(lines):
+                if '"role":"assistant"' in line:
+                    try:
+                        data = json.loads(line)
+                        content = data.get("message", {}).get("content")
+                        if isinstance(content, str):
+                            tts_text = content
+                        elif isinstance(content, list):
+                            # Extract text from content array
+                            texts = [c.get("text", "") for c in content if c.get("type") == "text"]
+                            tts_text = "\n".join(texts)
+                        elif isinstance(content, dict) and "text" in content:
+                            tts_text = content["text"]
+                        break
+                    except json.JSONDecodeError:
+                        continue
+        except Exception as e:
+            logger.warning(f"Failed to read transcript: {e}")
+
+    # Check TTS config
+    tts_config_file = Path.home() / ".claude" / ".tts-config.json"
+    tts_enabled = True
+
+    if tts_config_file.exists():
+        try:
+            with open(tts_config_file) as f:
+                config = json.load(f)
+                tts_enabled = config.get("enabled", True)
+        except Exception:
+            pass
+
+    # Sanitize TTS text (remove markdown formatting and normalize whitespace)
+    if tts_text:
+        # Strip markdown headers (must be before newline conversion)
+        tts_text = re.sub(r'^#{1,6}\s*', '', tts_text, flags=re.MULTILINE)
+        # Strip markdown bold/italic
+        tts_text = re.sub(r'\*\*([^*]+)\*\*', r'\1', tts_text)  # **bold**
+        tts_text = re.sub(r'\*([^*]+)\*', r'\1', tts_text)      # *italic*
+        tts_text = re.sub(r'__([^_]+)__', r'\1', tts_text)      # __bold__
+        tts_text = re.sub(r'_([^_]+)_', r'\1', tts_text)        # _italic_
+        # Strip inline code
+        tts_text = re.sub(r'`([^`]+)`', r'\1', tts_text)
+        # Strip code blocks
+        tts_text = re.sub(r'```[\s\S]*?```', '', tts_text)
+        # Strip bullet points and list markers
+        tts_text = re.sub(r'^[\s]*[-*+]\s+', '', tts_text, flags=re.MULTILINE)
+        tts_text = re.sub(r'^[\s]*\d+\.\s+', '', tts_text, flags=re.MULTILINE)
+        # Convert newlines to spaces
+        tts_text = tts_text.replace('\n', ' ')
+        # Normalize multiple spaces
+        tts_text = re.sub(r' +', ' ', tts_text)
+        tts_text = tts_text.strip()
+
+    # Queue TTS if enabled and we have text
+    if tts_enabled and tts_text:
+        logger.info(f"Hook: Stop queuing TTS, {len(tts_text)} chars: {tts_text[:80]}...")
+        tts_result = await queue_tts(session_id, tts_text)
+        logger.info(f"Hook: Stop queue_tts result: {json.dumps(tts_result)}")
+        result["tts"] = tts_result
+    else:
+        # Just play notification sound without TTS
+        logger.info(f"Hook: Stop no TTS text (tts_enabled={tts_enabled}, has_text={bool(tts_text)})")
+        play_sound(notification_sound)
+        result["sound"] = {"played": notification_sound}
+
+    logger.info(f"Hook: Stop {session_id[:12]}... -> desktop notification")
+    await log_event("hook_stop", instance_id=session_id, details={"tts_enabled": tts_enabled, "tts_length": len(tts_text) if tts_text else 0})
+
+    return result
+
+
+async def handle_pre_tool_use(payload: dict) -> dict:
+    """Handle PreToolUse hook - can block operations like 'make deploy'."""
+    tool_name = payload.get("tool_name", "")
+    tool_input = payload.get("tool_input", {})
+
+    # Only check Bash commands
+    if tool_name != "Bash":
+        return {"success": True, "action": "allowed"}
+
+    command = tool_input.get("command", "")
+
+    # Block 'make deploy' commands
+    if "make deploy" in command or command.strip() == "make deploy":
+        # Build alternative command suggestion
+        deploy_args = []
+        if "ENVIRONMENT=production" in command:
+            deploy_args.append("production")
+        if "--blocking" in command:
+            deploy_args.append("--blocking")
+
+        alt_command = "deploy"
+        if deploy_args:
+            alt_command += " " + " ".join(deploy_args)
+
+        return {
+            "permissionDecision": "deny",
+            "permissionDecisionReason": (
+                f"'make deploy' is disabled. Use autonomous deployment instead:\n\n"
+                f"  {alt_command}\n\n"
+                f"This provides better error detection and log monitoring."
+            )
+        }
+
+    return {"success": True, "action": "allowed"}
+
+
+async def handle_notification(payload: dict) -> dict:
+    """Handle Notification hook - play notification sound."""
+    session_id = payload.get("session_id")
+
+    # Get instance profile for sound selection
+    sound_file = "chimes.wav"  # default
+
+    if session_id:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT notification_sound FROM claude_instances WHERE id = ?",
+                (session_id,)
+            )
+            row = await cursor.fetchone()
+            if row and row["notification_sound"]:
+                sound_file = row["notification_sound"]
+
+    result = play_sound(sound_file)
+    return {"success": True, "action": "sound_played", "sound": sound_file, "result": result}
+
+
+# Hook dispatcher endpoint
+@app.post("/api/hooks/{action_type}")
+async def dispatch_hook(action_type: str, payload: dict) -> dict:
+    """
+    Unified hook dispatcher for Claude Code hooks.
+
+    Receives hook events from generic-hook.sh and routes to appropriate handler.
+    Always returns a response - errors are logged but don't cause failures.
+    """
+    handlers = {
+        "SessionStart": handle_session_start,
+        "SessionEnd": handle_session_end,
+        "UserPromptSubmit": handle_prompt_submit,
+        "PostToolUse": handle_post_tool_use,
+        "Stop": handle_stop,
+        "PreToolUse": handle_pre_tool_use,
+        "Notification": handle_notification,
+    }
+
+    handler = handlers.get(action_type)
+    if not handler:
+        logger.warning(f"Hook: Unknown action type: {action_type}")
+        return {"success": False, "action": "unknown_hook_type", "type": action_type}
+
+    try:
+        result = await handler(payload)
+        return result
+    except Exception as e:
+        logger.error(f"Hook handler error ({action_type}): {e}")
+        await log_event("hook_error", details={"action_type": action_type, "error": str(e)})
+        return {"success": False, "action": "handler_error", "error": str(e)}
 
 
 if __name__ == "__main__":
