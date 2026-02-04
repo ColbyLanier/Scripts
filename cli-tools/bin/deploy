@@ -39,7 +39,13 @@ Targets (for backend service):
   local               Local continuous server with ngrok
   debug               Local server with debugpy on port 5678
 
-Targets (for web/proxy services):
+Targets (for web service):
+  dev, development    Cloud development deployment (default)
+  prod, production    Cloud production deployment
+  local               Local backend + frontend (backend in local mode)
+  debug               Local backend + frontend (backend in debug mode with debugpy)
+
+Targets (for proxy services):
   dev, development    Development environment (default)
   prod, production    Production environment
 
@@ -61,6 +67,9 @@ One-Shot Testing:
   --test-and-stop     Alias for --one-shot
   --auto-stop         Alias for --one-shot
 
+Frontend Options (for web local):
+  --verify            Capture Vite output, verify env vars loaded correctly
+
 Google Chat Testing:
   --google-chat-message <text>  Send test message (auto-configures request)
 
@@ -77,7 +86,9 @@ Examples:
   # Frontend deployments
   deploy web                    # Frontend to dev
   deploy web prod               # Frontend to prod
-  deploy frontend local         # Local frontend + backend
+  deploy web local              # Local backend + frontend
+  deploy web local --verify     # Local with env verification
+  deploy web debug              # Local backend (debugpy) + frontend
 
   # Proxy deployments
   deploy widget-proxy           # Widget proxy to dev
@@ -101,6 +112,15 @@ GIT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     echo "Error: must be run from within a git repository" >&2
     exit 1
 }
+
+# Two-layer deployment: use current git root if it has a Makefile, otherwise fall back to main project
+MAIN_PROJECT="$HOME/ProcAgentDir/ProcurementAgentAI"
+if [[ -f "$GIT_ROOT/Makefile" ]]; then
+    PROJECT_DIR="$GIT_ROOT"
+else
+    echo "No Makefile in $GIT_ROOT, using main project..."
+    PROJECT_DIR="$MAIN_PROJECT"
+fi
 
 # Verify trigger-deploy.js exists
 if [[ ! -f "$DEPLOY_DIR/trigger-deploy.js" ]]; then
@@ -147,7 +167,7 @@ for arg in "$@"; do
 done
 
 # Execute from the project directory
-cd "$GIT_ROOT"
+cd "$PROJECT_DIR"
 
 # Determine environment from remaining args
 ENV="development"
@@ -158,13 +178,184 @@ for arg in "${ARGS[@]}"; do
     esac
 done
 
+# Check for local/debug target and --verify flag
+TARGET=""
+VERIFY_MODE=false
+for arg in "${ARGS[@]}"; do
+    case "$arg" in
+        local) TARGET="local" ;;
+        debug) TARGET="debug" ;;
+        --verify) VERIFY_MODE=true ;;
+    esac
+done
+
 # Handle different service types
 case "$SERVICE" in
     web)
-        echo "Deploying frontend to $ENV..."
-        if [[ " ${ARGS[*]} " =~ " local " ]]; then
-            exec make deploy-web FLAG=-l ENVIRONMENT="$ENV"
+        if [[ "$TARGET" == "local" || "$TARGET" == "debug" ]]; then
+            SRC_ENV="$PROJECT_DIR/widget/.env.pax-local"
+            TARGET_ENV="$PROJECT_DIR/widget/.env"
+            STATE_FILE="$PROJECT_DIR/.claude-local-server-state.json"
+
+            if [[ ! -f "$SRC_ENV" ]]; then
+                echo "Error: $SRC_ENV not found" >&2
+                exit 1
+            fi
+
+            echo "Starting local development environment (backend=$TARGET)..."
+
+            # Trap to cleanup on exit
+            trap 'echo "Cleaning up..."; rm -f "'"$TARGET_ENV"'"; node "$DEPLOY_DIR/stop-local-server.js" 2>/dev/null; exit 0' INT TERM
+
+            # Start backend (local or debug mode)
+            echo "Starting backend in $TARGET mode..."
+            node "$DEPLOY_DIR/trigger-deploy.js" "$TARGET"
+
+            # Wait for backend health
+            echo "Waiting for backend health check..."
+            node "$DEPLOY_DIR/wait-for-health.js" http://localhost:8080
+
+            # Try to capture the freshest ngrok URL from the local server state file
+            NGROK_URL=""
+            if [[ -f "$STATE_FILE" ]]; then
+                NGROK_URL=$(node -e "const fs=require('fs');const p=process.argv[1];try{const d=JSON.parse(fs.readFileSync(p,'utf8'));if(d.ngrokUrl){process.stdout.write(d.ngrokUrl);}}catch(e){}" "$STATE_FILE") || NGROK_URL=""
+                NGROK_URL="${NGROK_URL//$'\n'/}"
+            fi
+
+            # Fallback to querying the local ngrok API directly if needed
+            if [[ -z "$NGROK_URL" ]]; then
+                NGROK_URL=$(python3 - <<'PY' 2>/dev/null || true
+import json
+import urllib.request
+
+try:
+    with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=2) as resp:
+        data = json.load(resp)
+    for tunnel in data.get('tunnels', []):
+        if tunnel.get('proto') == 'https':
+            print(tunnel.get('public_url', ''), end='')
+            break
+except Exception:
+    pass
+PY
+)
+                NGROK_URL="${NGROK_URL//$'\n'/}"
+            fi
+
+            # Update ngrok URL in source file (persists for next run)
+            if [[ -n "$NGROK_URL" ]]; then
+                echo "Updating $SRC_ENV with ngrok URL: $NGROK_URL"
+                python3 "$PROJECT_DIR/scripts/update_env_var.py" --file "$SRC_ENV" --var VITE_API_URL --value "$NGROK_URL"
+            else
+                echo "Warning: Unable to determine ngrok URL; using existing value"
+            fi
+
+            CURRENT_API_URL=$(grep -E '^VITE_API_URL=' "$SRC_ENV" | tail -n 1 | cut -d= -f2- || true)
+            if [[ -z "$CURRENT_API_URL" ]]; then
+                echo "Error: VITE_API_URL is not set in $SRC_ENV"
+                exit 1
+            fi
+
+            echo "Using API URL: $CURRENT_API_URL"
+
+            # Copy source env to .env for Vite
+            echo "Copying $SRC_ENV → $TARGET_ENV"
+            cp "$SRC_ENV" "$TARGET_ENV"
+
+            echo "Starting frontend dev server..."
+
+            if [[ "$VERIFY_MODE" == "true" ]]; then
+                # Start Vite in background and capture output for verification
+                VITE_LOG="$PROJECT_DIR/.vite-startup.log"
+                cd "$PROJECT_DIR/widget"
+                npm run dev > "$VITE_LOG" 2>&1 &
+                VITE_PID=$!
+
+                echo "Waiting for Vite to start (capturing output)..."
+
+                # Wait for port 3000 to be ready (up to 30 seconds)
+                for i in {1..30}; do
+                    if nc -z localhost 3000 2>/dev/null; then
+                        break
+                    fi
+                    sleep 1
+                done
+
+                if ! nc -z localhost 3000 2>/dev/null; then
+                    echo "✗ Vite server failed to start on port 3000"
+                    cat "$VITE_LOG"
+                    kill $VITE_PID 2>/dev/null || true
+                    exit 1
+                fi
+
+                echo "✓ Vite server ready on http://localhost:3000"
+
+                # Extract env vars from Vite output
+                echo ""
+                echo "=== Vite Startup Output ==="
+                cat "$VITE_LOG"
+                echo "==========================="
+                echo ""
+
+                # Parse env vars from the [vite.config] Loaded env: line
+                if grep -q '\[vite.config\] Loaded env:' "$VITE_LOG"; then
+                    ENV_LINE=$(grep '\[vite.config\] Loaded env:' "$VITE_LOG")
+                    echo "Env vars loaded by Vite:"
+                    echo "$ENV_LINE" | sed 's/.*Loaded env: /  /'
+                else
+                    echo "⚠ Could not find env vars in Vite output"
+                fi
+
+                # Verify the app loads correctly
+                echo ""
+                echo "Verifying app loads..."
+                sleep 2  # Give React a moment to hydrate
+
+                if curl -s http://localhost:3000 | grep -q 'procurement-chat-root\|root\|React'; then
+                    echo "✓ App HTML loaded successfully"
+                else
+                    echo "⚠ Could not verify app HTML (may still be working)"
+                fi
+
+                # Capture browser console output
+                echo ""
+                echo "=== Browser Console Output ==="
+                BROWSER_CONSOLE_BIN="$HOME/Scripts/cli-tools/bin/browser-console"
+                if [[ -x "$BROWSER_CONSOLE_BIN" ]]; then
+                    CONSOLE_OUTPUT=$("$BROWSER_CONSOLE_BIN" http://localhost:3000 --wait 3 2>&1) || true
+                    echo "$CONSOLE_OUTPUT"
+
+                    # Check for specific errors
+                    if echo "$CONSOLE_OUTPUT" | grep -q '\[error\].*No API URL configured'; then
+                        echo ""
+                        echo "⚠ WARNING: API URL not configured in browser!"
+                        echo "  Check that VITE_API_URL is set in .env before Vite starts"
+                    fi
+                else
+                    echo "(browser-console tool not available - install playwright)"
+                fi
+                echo "==============================="
+
+                # Verify env vars are set correctly
+                echo ""
+                echo "=== Environment Verification ==="
+                echo "VITE_API_URL: $CURRENT_API_URL"
+                echo "VITE_CLERK_PUBLISHABLE_KEY: $(grep -E '^VITE_CLERK_PUBLISHABLE_KEY=' "$TARGET_ENV" | cut -d= -f2- | head -c 20)..."
+                echo "VITE_GOOGLE_PROJECT_ID: $(grep -E '^VITE_GOOGLE_PROJECT_ID=' "$TARGET_ENV" | cut -d= -f2-)"
+                echo "================================"
+                echo ""
+                echo "✓ Verification complete - server running in background (PID: $VITE_PID)"
+                echo "  To stop: kill $VITE_PID"
+                echo "  Log file: $VITE_LOG"
+
+                # Keep running - user can Ctrl+C to stop
+                wait $VITE_PID
+            else
+                echo "Press Ctrl+C to stop both frontend and backend"
+                cd "$PROJECT_DIR/widget" && exec npm run dev
+            fi
         else
+            echo "Deploying frontend to $ENV..."
             exec make deploy-web ENVIRONMENT="$ENV"
         fi
         ;;
