@@ -204,8 +204,8 @@ case "$SERVICE" in
 
             echo "Starting local development environment (backend=$TARGET)..."
 
-            # Trap to cleanup on exit
-            trap 'echo "Cleaning up..."; rm -f "'"$TARGET_ENV"'"; node "$DEPLOY_DIR/stop-local-server.js" 2>/dev/null; exit 0' INT TERM
+            # Trap to cleanup on exit (cd to project root for state file)
+            trap 'echo "Cleaning up..."; rm -f "'"$TARGET_ENV"'"; cd "'"$PROJECT_DIR"'" && node "$DEPLOY_DIR/stop-local-server.js" 2>/dev/null; exit 0' INT TERM
 
             # Start backend (local or debug mode)
             echo "Starting backend in $TARGET mode..."
@@ -352,7 +352,14 @@ PY
                 wait $VITE_PID
             else
                 echo "Press Ctrl+C to stop both frontend and backend"
-                cd "$PROJECT_DIR/widget" && exec npm run dev
+                cd "$PROJECT_DIR/widget"
+                npm run dev &
+                NPM_PID=$!
+
+                # Re-set trap to include npm process cleanup (cd back to project root for state file)
+                trap 'echo "Cleaning up..."; kill $NPM_PID 2>/dev/null; rm -f "'"$TARGET_ENV"'"; cd "'"$PROJECT_DIR"'" && node "$DEPLOY_DIR/stop-local-server.js" 2>/dev/null; exit 0' INT TERM
+
+                wait $NPM_PID
             fi
         else
             echo "Deploying frontend to $ENV..."

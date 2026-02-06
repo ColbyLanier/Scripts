@@ -19,7 +19,9 @@ from typing import Any, Sequence
 from .terminal_launcher import detect_terminal_emulator, launch_in_new_terminal
 
 CLI_TOOLS_ROOT = Path(__file__).resolve().parents[3]
+PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 _EXECUTABLE_NAMES = ("codex", "codex.exe", "codex.bat", "codex.cmd")
+_AVAILABLE_TYPES = ("tool-creator", "implementor")
 _DEFAULT_ENV_DIRS = (
     ".venv-packaged",
     "packaged-venv",
@@ -300,8 +302,16 @@ def _relative_display(path: Path, root: Path) -> Path:
 
 
 def _handle_codex(args: argparse.Namespace, paths: CodexPaths) -> None:
+    # Handle --list-types
+    if getattr(args, "list_types", False):
+        print("Available agent types:")
+        for agent_type in _AVAILABLE_TYPES:
+            print(f"  {agent_type}")
+        return
+
     prompt_file = getattr(args, "prompt_file", None)
     command_parts = getattr(args, "codex_command", []) or []
+    agent_type = getattr(args, "type", None)
 
     if not prompt_file and not command_parts:
         raise SystemExit("No command provided. Use 'subagent <prompt>' or '--prompt-file <file>'.")
@@ -322,6 +332,14 @@ def _handle_codex(args: argparse.Namespace, paths: CodexPaths) -> None:
         prompt_content = source_file_path.read_text(encoding="utf-8")
     else:
         prompt_content = " ".join(command_parts)
+
+    # Prepend type-specific system prompt if --type is specified
+    if agent_type:
+        type_prompt = _load_type_prompt(agent_type)
+        if type_prompt is None:
+            raise SystemExit(f"System prompt for type '{agent_type}' not found.")
+        prompt_content = type_prompt + "\n\n" + prompt_content
+        print(f"🎯 Using agent type: {agent_type}")
 
     codex_path = _validate_codex_launch(paths, command_parts)
     agent_id_value = _get_next_codex_agent_id(paths)
@@ -442,6 +460,16 @@ def _write_prompt_file(path: Path, contents: str) -> None:
         os.fsync(handle.fileno())
 
 
+def _load_type_prompt(agent_type: str) -> str | None:
+    """Load the system prompt for a given agent type."""
+    # Convert kebab-case to snake_case for filename
+    filename = agent_type.replace("-", "_") + ".md"
+    prompt_path = PROMPTS_DIR / filename
+    if not prompt_path.exists():
+        return None
+    return prompt_path.read_text(encoding="utf-8")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="subagent",
@@ -458,6 +486,18 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         metavar="FILE",
         help="Read the prompt from a file instead of command line arguments. Overrides inline commands.",
+    )
+    parser.add_argument(
+        "--type", "-t",
+        type=str,
+        choices=_AVAILABLE_TYPES,
+        metavar="TYPE",
+        help=f"Agent type with specialized system prompt. Available: {', '.join(_AVAILABLE_TYPES)}",
+    )
+    parser.add_argument(
+        "--list-types",
+        action="store_true",
+        help="List available agent types and exit.",
     )
     return parser
 

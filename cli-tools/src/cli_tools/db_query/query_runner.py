@@ -140,7 +140,7 @@ ALLOWED_PATTERNS = [
 ]
 
 DEFAULT_LIMIT = 100
-QUERY_TIMEOUT = 90  # 1.5 minutes
+QUERY_TIMEOUT = 600  # 10 minutes — increased for large dblink transfers
 
 
 @dataclass

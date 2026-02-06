@@ -198,8 +198,11 @@ if (googleChatMessage) {
 
 // Main execution wrapped in async function to support mutex waiting
 (async () => {
+  // Derive repo name from current directory (supports worktrees)
+  const repoName = path.basename(process.cwd());
+
   // Wait for mutex to become available (with 20 min timeout, 30 sec polling)
-  const acquired = await waitForMutex('ProcurementAgentAI', environment, flag);
+  const acquired = await waitForMutex(repoName, environment, flag);
 
   if (!acquired) {
     console.error('Could not acquire deployment mutex (timeout or conflict)');
