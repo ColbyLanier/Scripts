@@ -52,7 +52,7 @@ global tvConnected := false
     Send "#k"
     Sleep 800
     if (!tvConnected) {
-	Sleep 250
+	    Sleep 2000
         Send "{Tab}{Enter}"
         tvConnected := true
     } else {

@@ -22,7 +22,7 @@ PragmaOnce(A_ScriptFullPath, A_ScriptHwnd)
 
 ; ============== CONFIGURATION ==============
 RING_DEVICE_ID := 0  ; Auto-detected below (set manually to override)
-MINIMUM_RING_ID := 13  ; IDs below this are assumed to be built-in devices (trackpad, etc.)
+MINIMUM_RING_ID := 15  ; IDs below this are assumed to be built-in devices (trackpad, etc.)
 TAP_THRESHOLD_MS := 200  ; Mod-tap threshold for right button
 LEFT_TAP_THRESHOLD_MS := 200  ; Mod-tap threshold for left button
 DOUBLE_TAP_MS := 500  ; Double-tap window for Enter
@@ -30,7 +30,7 @@ DICTATION_BUFFER_MS := 1000  ; Buffer after dictation ends before sending queued
 DOUBLE_TAP_BYPASS_MS := 10000  ; Time window after dictation ends where single tap bypasses double-tap requirement
 DEVICE_POLL_INTERVAL_MS := 3000  ; How often to check for ring when not found
 DEVICE_POLL_MAX_ATTEMPTS := 100  ; Stop polling after 100 attempts
-INACTIVITY_CHECK_MS := 300000  ; Check connection after 5 minutes of no input
+INACTIVITY_CHECK_MS := 30000  ; Check connection after 30 seconds of no input (was 5 minutes)
 TRAYTIP_DURATION_MS := 2000  ; Auto-dismiss tray notifications after 2 seconds
 
 ; ============== AUTO-DETECT RING DEVICE ==============
@@ -80,6 +80,64 @@ global scriptEnabled := true
     }
 }
 #SuspendExempt false
+
+; Bluetooth reconnect - force disconnect/reconnect at Windows Bluetooth layer
+; Use when device shows "connected" but is unresponsive
+^#d::{
+    global ringConnected, scriptEnabled
+    if (!scriptEnabled)
+        return
+
+    if (ringConnected)
+        UnsubscribeFromRing()
+
+    QuickTrayTip("Resetting Bluetooth", "Disconnecting D06 Pro...", 1)
+
+    ; PowerShell command to disable and re-enable Bluetooth device
+    psScript := 'Get-PnpDevice -FriendlyName "*D06*" -Class Bluetooth | Disable-PnpDevice -Confirm:$false; Start-Sleep -Milliseconds 500; Get-PnpDevice -FriendlyName "*D06*" -Class Bluetooth | Enable-PnpDevice -Confirm:$false'
+
+    try {
+        RunWait('*RunAs powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "' psScript '"',, 'Hide')
+        QuickTrayTip("Bluetooth Reset", "Waiting for device...", 1)
+    } catch {
+        QuickTrayTip("Bluetooth Reset Failed", "PowerShell command failed. Check admin privileges.", 2)
+        return
+    }
+
+    Sleep(1000)  ; Give device time to reappear
+
+    WaitForRing()
+    SubscribeToRing()
+    ResetActivityTimer()
+    QuickTrayTip("Bluetooth Restored", "D06 Pro reconnected successfully", 1)
+}
+
+; Nuclear option - completely remove Bluetooth device (requires manual re-pairing)
+; Use only if Bluetooth reconnect fails repeatedly
+^#!d::{
+    global ringConnected, scriptEnabled
+    if (!scriptEnabled)
+        return
+
+    if (ringConnected)
+        UnsubscribeFromRing()
+
+    QuickTrayTip("Removing Bluetooth Device", "This is a nuclear option. Device will be deleted.", 2)
+    Sleep(2000)
+
+    ; PowerShell command to remove the Bluetooth device completely
+    psScript := 'Get-PnpDevice -FriendlyName "*D06*" -Class Bluetooth | Remove-PnpDevice -Confirm:$false'
+
+    try {
+        RunWait('*RunAs powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "' psScript '"',, 'Hide')
+        QuickTrayTip("Device Removed", "D06 Pro deleted. Manually re-pair in Windows Bluetooth settings.", 2)
+        Sleep(2000)
+        ExitApp
+    } catch {
+        QuickTrayTip("Removal Failed", "PowerShell command failed. Check admin privileges.", 2)
+        return
+    }
+}
 
 DetectRingDevice() {
     global AHI, MINIMUM_RING_ID
@@ -281,11 +339,11 @@ ACTION_RIGHT := "^!#3"      ; Move cursor to right monitor
 ; Single swipes are ignored - only double-swipes execute
 global GestureCombo := Map()
 
-; Same-direction doubles (basic movements)
-GestureCombo["left-left"] := "left"           ; Move cursor left
-GestureCombo["right-right"] := "right"        ; Move cursor right
-GestureCombo["up-up"] := "up"                 ; Click
-GestureCombo["down-down"] := "down"           ; Center cursor
+; Same-direction doubles (terminal tab navigation)
+GestureCombo["left-left"] := "!{Left}"        ; Alt+Left - previous tab
+GestureCombo["right-right"] := "!{Right}"     ; Alt+Right - next tab
+GestureCombo["up-up"] := "!{Up}"              ; Alt+Up - move tab up
+GestureCombo["down-down"] := "!{Down}"        ; Alt+Down - move tab down
 
 ; Compound gestures (execute multiple actions)
 GestureCombo["left-up"] := "left+up"          ; Move left, then click
