@@ -7,9 +7,13 @@
 # terminal-margin-vertical = 0
 
 # Extra keys toolbar (always visible) - 7x2 with popups
+# Notes:
+#   - SHIFT key explicit (mobile keyboard shift doesn't send proper shift input)
+#   - HOME/END on hold for | and PASTE (arrow key hold sends repeats, not useful)
+#   - && on ~ key (double-tap tilde popup for actual ~)
 extra-keys = [ \
-  ['ESC', '~', {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, {key: '|', popup: '&'}, 'UP', 'PASTE'], \
-  ['TAB', {macro: '\\x1b[Z', display: 'S-TAB'}, 'CTRL', 'ALT', 'LEFT', 'DOWN', 'RIGHT'] \
+  ['ESC', {key: '&&', popup: '~'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, {key: '|', popup: 'HOME'}, 'UP', {key: 'PASTE', popup: 'END'}], \
+  ['TAB', 'SHIFT', 'CTRL', 'ALT', 'LEFT', 'DOWN', 'RIGHT'] \
 ]
 
 # Better text handling

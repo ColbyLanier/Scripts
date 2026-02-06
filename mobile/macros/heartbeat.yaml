@@ -1,0 +1,18 @@
+# Heartbeat Endpoint
+# Simple reachability check for the server
+# Returns OK to confirm phone is reachable
+
+name: "Heartbeat"
+category: "Telemetry"
+description: "HTTP endpoint for server reachability checks"
+enabled: true
+
+triggers:
+  - type: http_server
+    identifier: "heartbeat"
+    send_response: true
+
+actions:
+  - type: http_response
+    code: "OK"
+    text: '{"status": "alive", "time": "{system_time}"}'
