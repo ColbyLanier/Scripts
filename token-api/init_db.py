@@ -17,6 +17,13 @@ def init_database():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
+    # Enable WAL mode for concurrent read/write access
+    # This prevents TUI reads from blocking server writes
+    cursor.execute("PRAGMA journal_mode=WAL")
+
+    # Set busy timeout to 5 seconds (prevents indefinite blocking on lock contention)
+    cursor.execute("PRAGMA busy_timeout=5000")
+
     # Create claude_instances table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS claude_instances (

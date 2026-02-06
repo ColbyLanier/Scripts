@@ -6,12 +6,20 @@ Connects to existing Token-API server running on port 7777.
 
 Controls:
   arrow/jk  - Select instance (up/down)
-  h/l       - Switch info panel (Events/Logs)
+  g/G       - Jump to first/last instance
+  h/l       - Switch info panel (Events/Logs/Deploy)
+  Enter     - Open selected instance in new terminal tab
   r         - Rename selected instance
+  y         - Copy resume command to clipboard (yank)
   v         - Change voice for instance
+  f         - Cycle filter (all/active/stopped)
   s         - Stop selected instance
   d         - Delete selected instance
-  K         - Kill frozen instance (SIGTERM/SIGKILL)
+  U         - Unstick frozen instance (SIGWINCH, gentle nudge)
+  I         - Interrupt frozen instance (SIGINT, cancel op)
+  K         - Kill deadlocked instance (SIGKILL, preserves terminal for /resume)
+  R         - Restart Token-API server
+  Ctrl+R    - Full refresh (restart server + reload TUI code)
   c         - Clear all instances
   o         - Change sort order
   q         - Quit
@@ -23,6 +31,7 @@ import re
 import argparse
 import json
 import sqlite3
+import subprocess
 import time
 import threading
 import urllib.request
@@ -55,6 +64,15 @@ TIMER_STATE_PATH = Path("/mnt/c/Users/colby/Documents/Obsidian/Token-ENV/Scripts
 # TTS skip feedback state
 tts_skip_feedback: Optional[tuple[float, str]] = None  # (timestamp, message)
 
+# Resume copy feedback state
+resume_feedback: Optional[tuple[float, str]] = None  # (timestamp, message)
+
+# Unstick feedback state
+unstick_feedback: Optional[tuple[float, str]] = None  # (timestamp, message)
+
+# Restart feedback state
+restart_feedback: Optional[tuple[float, str]] = None  # (timestamp, message)
+
 # Timer/mode display cache
 timer_display_cache = {
     "break_seconds": 0,
@@ -80,7 +98,8 @@ api_healthy = True
 api_error_message = None
 layout_mode = "full"  # "mobile", "vertical", "compact", or "full"
 layout_mode_forced = False  # True if user used --mobile, --vertical, --compact, or --no-mobile
-sort_mode = "status"  # "status", "recent_activity", "recent_stopped", "created"
+sort_mode = "recent_activity"  # "status", "recent_activity", "recent_stopped", "created"
+filter_mode = "all"  # "all", "active", "stopped"
 panel_page = 0  # 0 = events view, 1 = server logs view, 2 = deploy logs view
 PANEL_PAGE_MAX = 2  # 0=Events, 1=Logs, 2=Deploy
 deploy_active = False
@@ -206,6 +225,34 @@ def format_duration(start_time_str: str, end_time_str: str = None) -> str:
             return f"{minutes}m"
     except Exception:
         return "?"
+
+
+def format_duration_colored(start_time_str: str, end_time_str: str = None) -> str:
+    """Format duration with color based on age: green <30m, yellow 30m-2h, dim >2h."""
+    duration = format_duration(start_time_str, end_time_str)
+    try:
+        start = datetime.fromisoformat(start_time_str.replace("Z", "+00:00").replace("T", " ").split(".")[0])
+        end = datetime.fromisoformat(end_time_str.replace("Z", "+00:00").replace("T", " ").split(".")[0]) if end_time_str else datetime.now()
+        total_minutes = int((end - start).total_seconds()) // 60
+    except Exception:
+        return duration
+    if total_minutes < 30:
+        return f"[green]{duration}[/green]"
+    elif total_minutes < 120:
+        return f"[yellow]{duration}[/yellow]"
+    else:
+        return f"[dim]{duration}[/dim]"
+
+
+def filter_instances(instances: list) -> list:
+    """Filter instances based on current filter_mode."""
+    if filter_mode == "all":
+        return instances
+    elif filter_mode == "active":
+        return [i for i in instances if i.get("status") in ("processing", "idle")]
+    elif filter_mode == "stopped":
+        return [i for i in instances if i.get("status") == "stopped"]
+    return instances
 
 
 def is_custom_tab_name(tab_name: str) -> bool:
@@ -340,7 +387,7 @@ def kill_instance(instance_id: str) -> dict:
             headers={"Content-Type": "application/json"},
             data=b"{}"
         )
-        resp = urllib.request.urlopen(req, timeout=15)  # longer timeout for kill sequence
+        resp = urllib.request.urlopen(req, timeout=20)  # longer timeout for SIGINT×2 sequence
         return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         try:
@@ -350,6 +397,59 @@ def kill_instance(instance_id: str) -> dict:
             return {"status": "error", "detail": str(e)}
     except Exception:
         return None
+
+
+def unstick_instance(instance_id: str, level: int = 1) -> dict:
+    """Nudge a stuck instance. Level 1=SIGWINCH (gentle), Level 2=SIGINT (cancel op). Returns result dict or None on failure."""
+    try:
+        req = urllib.request.Request(
+            f"{API_URL}/api/instances/{instance_id}/unstick?level={level}",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+            data=b"{}"
+        )
+        resp = urllib.request.urlopen(req, timeout=10)  # 4s server wait + margin
+        return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read())
+            return {"status": "error", "detail": body.get("detail", str(e))}
+        except Exception:
+            return {"status": "error", "detail": str(e)}
+    except Exception:
+        return None
+
+
+def copy_to_clipboard(text: str) -> tuple[bool, str]:
+    """Copy text to clipboard. Returns (success, message)."""
+    # Try clip.exe first (WSL)
+    try:
+        subprocess.run(["clip.exe"], input=text, text=True, check=True, timeout=2)
+        return (True, "Copied to clipboard")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        pass
+
+    # Try xclip
+    try:
+        subprocess.run(["xclip", "-selection", "clipboard"], input=text, text=True, check=True, timeout=2)
+        return (True, "Copied to clipboard")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        pass
+
+    # Try xsel
+    try:
+        subprocess.run(["xsel", "--clipboard", "--input"], input=text, text=True, check=True, timeout=2)
+        return (True, "Copied to clipboard")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        return (False, f"Copy failed: {str(e)[:25]}")
+
+    return (False, "No clipboard tool (need clip.exe/xclip/xsel)")
 
 
 def get_available_voices() -> list:
@@ -595,7 +695,6 @@ def create_instances_table(instances: list, selected_idx: int) -> Table:
         max_name_len = max(max_name_len, len(name) + 2)
 
     table = Table(
-        title="Claude Instances  [dim](jk=nav h/l=page r=rename s=stop d=delete K=kill c=clear o=sort q=quit)[/dim]",
         show_header=True,
         header_style="bold cyan",
         border_style="blue",
@@ -608,7 +707,7 @@ def create_instances_table(instances: list, selected_idx: int) -> Table:
     table.add_column("Device", style="yellow", width=10)
     table.add_column("Progress", width=14)
     table.add_column("Task", style="dim", min_width=20, max_width=30)
-    table.add_column("Time", style="green", width=6, justify="right")
+    table.add_column("Time", width=6, justify="right")
 
     for i, instance in enumerate(instances):
         selector = "[yellow]>[/yellow]" if i == selected_idx else " "
@@ -650,7 +749,7 @@ def create_instances_table(instances: list, selected_idx: int) -> Table:
             current_task = "[dim]-[/dim]"
 
         end_time = instance.get("stopped_at") if instance["status"] == "stopped" else None
-        duration = format_duration(instance.get("registered_at", ""), end_time)
+        duration = format_duration_colored(instance.get("registered_at", ""), end_time)
 
         table.add_row(selector, status_icon, name, device, progress_text, current_task, duration)
 
@@ -675,7 +774,7 @@ def create_mobile_instances_table(instances: list, selected_idx: int) -> Table:
     table.add_column("*", width=1, justify="center")
     table.add_column("Name", style="white", no_wrap=True, max_width=20)
     table.add_column("Prog", width=6)
-    table.add_column("T", style="green", width=4, justify="right")
+    table.add_column("T", width=4, justify="right")
 
     for i, instance in enumerate(instances):
         selector = "[yellow]>[/yellow]" if i == selected_idx else " "
@@ -707,9 +806,7 @@ def create_mobile_instances_table(instances: list, selected_idx: int) -> Table:
             progress_bar = "[dim]-----[/dim]"
 
         end_time = instance.get("stopped_at") if status == "stopped" else None
-        duration = format_duration(instance.get("registered_at", ""), end_time)
-        if " " in duration:
-            duration = duration.split()[0]
+        duration = format_duration_colored(instance.get("registered_at", ""), end_time)
 
         table.add_row(selector, status_icon, name, progress_bar, duration)
 
@@ -727,7 +824,6 @@ def create_compact_instances_table(instances: list, selected_idx: int) -> Table:
         max_name_len = max(max_name_len, len(name) + 2)
 
     table = Table(
-        title="Claude Instances  [dim](jk=nav h/l=page r=rename s=stop d=delete K=kill c=clear o=sort q=quit)[/dim]",
         show_header=True,
         header_style="bold cyan",
         border_style="blue",
@@ -739,7 +835,7 @@ def create_compact_instances_table(instances: list, selected_idx: int) -> Table:
     table.add_column("Name", style="white")  # Dynamic width - fills available space
     table.add_column("Device", style="yellow", width=10)
     table.add_column("Progress", width=14)
-    table.add_column("Time", style="green", width=6, justify="right")
+    table.add_column("Time", width=6, justify="right")
 
     for i, instance in enumerate(instances):
         selector = "[yellow]>[/yellow]" if i == selected_idx else " "
@@ -773,7 +869,7 @@ def create_compact_instances_table(instances: list, selected_idx: int) -> Table:
             progress_text = "[dim]-[/dim]"
 
         end_time = instance.get("stopped_at") if status == "stopped" else None
-        duration = format_duration(instance.get("registered_at", ""), end_time)
+        duration = format_duration_colored(instance.get("registered_at", ""), end_time)
 
         table.add_row(selector, status_icon, name, device, progress_text, duration)
 
@@ -791,6 +887,7 @@ def create_events_panel(events: list) -> Panel:
         "instance_registered": ("green", "+", "registered"),
         "instance_stopped": ("red", "-", "stopped"),
         "instance_killed": ("red", "x", "killed"),
+        "instance_unstick": ("cyan", "!", "nudged"),
         "instance_renamed": ("yellow", "~", "renamed"),
         "tts_queued": ("yellow", "o", "queued TTS"),
         "tts_playing": ("cyan", ">", "speaking"),
@@ -849,6 +946,7 @@ def create_mobile_events_panel(events: list) -> Panel:
         "instance_registered": "[green]+[/green]",
         "instance_stopped": "[red]-[/red]",
         "instance_killed": "[red]x[/red]",
+        "instance_unstick": "[cyan]![/cyan]",
         "instance_renamed": "[yellow]~[/yellow]",
         "tts_playing": "[cyan]>[/cyan]",
         "notification_sent": "[magenta]*[/magenta]",
@@ -1055,6 +1153,13 @@ def create_instance_details_panel(instance: dict, todos_data: dict, compact: boo
     # Extract profile number: "profile_1" -> "1"
     profile_num = profile_name.replace("profile_", "") if profile_name else "?"
 
+    working_dir = instance.get("working_dir", "")
+    if working_dir:
+        # Shorten home prefix for display
+        working_dir_short = working_dir.replace(str(Path.home()), "~")
+    else:
+        working_dir_short = "?"
+
     if compact:
         # Compact single-line format for vertical layout bottom
         todos = todos_data.get("todos", [])
@@ -1062,10 +1167,11 @@ def create_instance_details_panel(instance: dict, todos_data: dict, compact: boo
         progress = todos_data.get("progress", 0)
         current_task = todos_data.get("current_task", "")
 
-        # Build compact line: status icon, name, device, voice, progress, current task
+        # Build compact line: status icon, name, device, voice, dir, progress, current task
         parts = [f"{status_icon} [bold]{name}[/bold]"]
         parts.append(f"[dim]({device})[/dim]")
         parts.append(f"[cyan]Voice:[/cyan] {voice_short}")
+        parts.append(f"[dim]{working_dir_short}[/dim]")
 
         if total > 0:
             parts.append(f"[yellow]{progress}%[/yellow]")
@@ -1080,6 +1186,7 @@ def create_instance_details_panel(instance: dict, todos_data: dict, compact: boo
 
     lines.append(f"{status_icon} [bold]{name}[/bold]  [dim]({device})[/dim]")
     lines.append(f"[cyan]Voice:[/cyan] {voice_short}  [dim](profile {profile_num})[/dim]")
+    lines.append(f"[cyan]Dir:[/cyan]   [dim]{working_dir_short}[/dim]")
     lines.append("")
 
     todos = todos_data.get("todos", [])
@@ -1190,6 +1297,8 @@ def create_mobile_info_panel(max_lines: int = 4) -> Panel:
 
 def create_status_bar(instances: list, selected_idx: int) -> Text:
     """Create the status bar."""
+    global unstick_feedback, resume_feedback, restart_feedback
+
     active_count = sum(1 for i in instances if i.get("status") in ("processing", "idle"))
     total_count = len(instances)
 
@@ -1201,12 +1310,49 @@ def create_status_bar(instances: list, selected_idx: int) -> Text:
     page_names = ["Events", "Logs", "Deploy"]
     page_name = page_names[panel_page] if panel_page < len(page_names) else "?"
 
+    # Filter indicator
+    filter_indicator = ""
+    if filter_mode != "all":
+        filter_indicator = f"  [magenta]F:{filter_mode}[/magenta]"
+
     text = Text()
     text.append(f"Instances: {active_count}/{total_count}  |  ", style="white")
     text.append_text(Text.from_markup(f"[{mode_color}]{layout_mode}[/{mode_color}]"))
     text.append(f"  |  {selected_idx + 1}/{total_count}  |  ", style="white")
-    text.append_text(Text.from_markup(f"[cyan]{page_name}[/cyan] [dim](h/l)[/dim]  |  "))
-    text.append_text(Text.from_markup("[dim]K=kill  c=clear  o=sort  q=quit[/dim]"))
+    text.append_text(Text.from_markup(f"[cyan]{page_name}[/cyan] [dim](h/l)[/dim]"))
+    if filter_indicator:
+        text.append_text(Text.from_markup(filter_indicator))
+    text.append("  |  ", style="white")
+
+    # Check for feedback messages (show for 3 seconds)
+    feedback_msg = None
+    if restart_feedback:
+        fb_time, fb_text = restart_feedback
+        if time.time() - fb_time < 3.0:
+            feedback_msg = fb_text
+        else:
+            restart_feedback = None
+    if not feedback_msg and unstick_feedback:
+        fb_time, fb_text = unstick_feedback
+        if time.time() - fb_time < 3.0:
+            feedback_msg = fb_text
+        else:
+            unstick_feedback = None
+    if not feedback_msg and resume_feedback:
+        fb_time, fb_text = resume_feedback
+        if time.time() - fb_time < 3.0:
+            feedback_msg = fb_text
+        else:
+            resume_feedback = None
+
+    if feedback_msg:
+        # Use green for success messages, yellow for warnings
+        if "Copied" in feedback_msg or "Skipped" in feedback_msg or "Restarted" in feedback_msg:
+            text.append_text(Text.from_markup(f"[green bold]✓ {feedback_msg}[/green bold]"))
+        else:
+            text.append_text(Text.from_markup(f"[yellow bold]{feedback_msg}[/yellow bold]"))
+    else:
+        text.append_text(Text.from_markup("[dim]jk=nav r=rename s=stop d=del y=copy f=filter R=restart q=quit[/dim]"))
 
     return text
 
@@ -1515,7 +1661,7 @@ def get_dashboard(instances: list, selected_idx: int) -> Layout:
 
 def main():
     """Main entry point."""
-    global selected_index, instances_cache, api_healthy, api_error_message, layout_mode, layout_mode_forced, sort_mode, panel_page
+    global selected_index, instances_cache, api_healthy, api_error_message, layout_mode, layout_mode_forced, sort_mode, filter_mode, panel_page
     global deploy_active, deploy_log_path, deploy_metadata, deploy_previous_page, deploy_auto_switched
 
     parser = argparse.ArgumentParser(description="Token-API TUI Dashboard")
@@ -1561,7 +1707,7 @@ def main():
         console.print("Run the Token-API server first to initialize the database.")
         sys.exit(1)
 
-    console.print("[dim]Controls: jk=select, h/l=page, r=rename, s=stop, d=delete, K=kill, c=clear all, o=sort, q=quit[/dim]\n")
+    console.print("[dim]Controls: jk=nav, gG=top/btm, h/l=page, Enter=open, r=rename, f=filter, s=stop, d=del, R=restart, q=quit[/dim]\n")
 
     quit_flag = threading.Event()
     input_mode = threading.Event()
@@ -1603,7 +1749,11 @@ def main():
                                 elif seq == '[B':
                                     action_queue.append('down')
                             update_flag.set()
-                    elif key.lower() == 'r':
+                    elif key == '\x12':  # Ctrl+R: full refresh (restart server + re-exec TUI)
+                        with action_lock:
+                            action_queue.append('full_refresh')
+                        update_flag.set()
+                    elif key == 'r':
                         with action_lock:
                             action_queue.append('rename')
                         update_flag.set()
@@ -1643,6 +1793,10 @@ def main():
                         with action_lock:
                             action_queue.append('tts_skip')
                         update_flag.set()
+                    elif key == 'y':
+                        with action_lock:
+                            action_queue.append('resume')
+                        update_flag.set()
                     elif key == 'X':
                         with action_lock:
                             action_queue.append('tts_skip_all')
@@ -1651,9 +1805,37 @@ def main():
                         with action_lock:
                             action_queue.append('voice')
                         update_flag.set()
+                    elif key == 'U':
+                        with action_lock:
+                            action_queue.append('unstick')
+                        update_flag.set()
+                    elif key == 'I':
+                        with action_lock:
+                            action_queue.append('unstick2')
+                        update_flag.set()
                     elif key == 'K':
                         with action_lock:
                             action_queue.append('kill')
+                        update_flag.set()
+                    elif key == 'f':
+                        with action_lock:
+                            action_queue.append('filter')
+                        update_flag.set()
+                    elif key == 'R':
+                        with action_lock:
+                            action_queue.append('restart')
+                        update_flag.set()
+                    elif key == '\r' or key == '\n':
+                        with action_lock:
+                            action_queue.append('open_terminal')
+                        update_flag.set()
+                    elif key == 'g':
+                        with action_lock:
+                            action_queue.append('go_top')
+                        update_flag.set()
+                    elif key == 'G':
+                        with action_lock:
+                            action_queue.append('go_bottom')
                         update_flag.set()
         except Exception:
             pass
@@ -1667,9 +1849,29 @@ def main():
     listener_thread.start()
 
     instances_cache = get_instances()
+    prev_instance_ids = set(i.get("id") for i in instances_cache)
+
+    def _get_displayed():
+        """Get filtered instances for display."""
+        return filter_instances(instances_cache)
+
+    def _refresh(live_ref):
+        """Refresh dashboard with filtered instances."""
+        displayed = _get_displayed()
+        live_ref.update(get_dashboard(displayed, selected_index))
+        live_ref.refresh()
+
+    def _clamp_selection():
+        """Clamp selected_index to filtered list bounds."""
+        global selected_index
+        displayed = _get_displayed()
+        if displayed:
+            selected_index = min(selected_index, len(displayed) - 1)
+        else:
+            selected_index = 0
 
     try:
-        with Live(get_dashboard(instances_cache, selected_index), console=console, refresh_per_second=10, screen=True) as live:
+        with Live(get_dashboard(_get_displayed(), selected_index), console=console, refresh_per_second=10, screen=True) as live:
             last_refresh = time.time()
 
             while not quit_flag.is_set():
@@ -1679,20 +1881,28 @@ def main():
                         actions_to_process = action_queue.copy()
                         action_queue.clear()
 
+                displayed = _get_displayed()
+
                 for action in actions_to_process:
-                    if action == 'up' and instances_cache:
+                    if action == 'up' and displayed:
                         selected_index = max(0, selected_index - 1)
-                        live.update(get_dashboard(instances_cache, selected_index))
-                        live.refresh()
+                        _refresh(live)
 
-                    elif action == 'down' and instances_cache:
-                        selected_index = min(len(instances_cache) - 1, selected_index + 1)
-                        live.update(get_dashboard(instances_cache, selected_index))
-                        live.refresh()
+                    elif action == 'down' and displayed:
+                        selected_index = min(len(displayed) - 1, selected_index + 1)
+                        _refresh(live)
 
-                    if action == 'rename' and instances_cache:
-                        if 0 <= selected_index < len(instances_cache):
-                            instance = instances_cache[selected_index]
+                    elif action == 'go_top' and displayed:
+                        selected_index = 0
+                        _refresh(live)
+
+                    elif action == 'go_bottom' and displayed:
+                        selected_index = len(displayed) - 1
+                        _refresh(live)
+
+                    if action == 'rename' and displayed:
+                        if 0 <= selected_index < len(displayed):
+                            instance = displayed[selected_index]
                             instance_id = instance.get("id")
                             current_name = format_instance_name(instance)
 
@@ -1716,15 +1926,16 @@ def main():
                                 console.print("[dim]Cancelled[/dim]")
 
                             time.sleep(0.3)
+                            tty.setcbreak(sys.stdin.fileno())
                             input_mode.clear()
                             instances_cache = get_instances()
+                            _clamp_selection()
                             live.start()
-                            live.update(get_dashboard(instances_cache, selected_index))
-                            live.refresh()
+                            _refresh(live)
 
-                    elif action == 'delete' and instances_cache:
-                        if 0 <= selected_index < len(instances_cache):
-                            instance = instances_cache[selected_index]
+                    elif action == 'delete' and displayed:
+                        if 0 <= selected_index < len(displayed):
+                            instance = displayed[selected_index]
                             instance_id = instance.get("id")
                             instance_name = format_instance_name(instance)
 
@@ -1740,8 +1951,6 @@ def main():
                                 if confirm.lower() == 'yes':
                                     if delete_instance(instance_id):
                                         console.print(f"[green]v[/green] Deleted: {instance_name}")
-                                        if selected_index >= len(instances_cache) - 1:
-                                            selected_index = max(0, selected_index - 1)
                                     else:
                                         console.print("[red]x[/red] Delete failed")
                                 else:
@@ -1750,17 +1959,16 @@ def main():
                                 console.print("[dim]Cancelled[/dim]")
 
                             time.sleep(0.3)
+                            tty.setcbreak(sys.stdin.fileno())
                             input_mode.clear()
                             instances_cache = get_instances()
-                            if instances_cache:
-                                selected_index = min(selected_index, len(instances_cache) - 1)
+                            _clamp_selection()
                             live.start()
-                            live.update(get_dashboard(instances_cache, selected_index))
-                            live.refresh()
+                            _refresh(live)
 
-                    elif action == 'voice' and instances_cache:
-                        if 0 <= selected_index < len(instances_cache):
-                            instance = instances_cache[selected_index]
+                    elif action == 'voice' and displayed:
+                        if 0 <= selected_index < len(displayed):
+                            instance = displayed[selected_index]
                             instance_id = instance.get("id")
                             instance_name = format_instance_name(instance)
                             current_voice = instance.get("tts_voice", "")
@@ -1814,11 +2022,11 @@ def main():
                                     console.print("[dim]Cancelled[/dim]")
 
                             time.sleep(0.3)
+                            tty.setcbreak(sys.stdin.fileno())
                             input_mode.clear()
                             instances_cache = get_instances()
                             live.start()
-                            live.update(get_dashboard(instances_cache, selected_index))
-                            live.refresh()
+                            _refresh(live)
 
                     elif action == 'delete_all':
                         total_count = len(instances_cache) if instances_cache else 0
@@ -1828,10 +2036,10 @@ def main():
                             live.stop()
                             console.print("\n[dim]No instances to clear.[/dim]")
                             time.sleep(1)
+                            tty.setcbreak(sys.stdin.fileno())
                             input_mode.clear()
                             live.start()
-                            live.update(get_dashboard(instances_cache, selected_index))
-                            live.refresh()
+                            _refresh(live)
                             continue
 
                         input_mode.set()
@@ -1857,64 +2065,174 @@ def main():
                             console.print("[dim]Cancelled[/dim]")
 
                         time.sleep(0.3)
+                        tty.setcbreak(sys.stdin.fileno())
                         input_mode.clear()
                         instances_cache = get_instances()
-                        if instances_cache:
-                            selected_index = min(selected_index, len(instances_cache) - 1)
+                        _clamp_selection()
                         live.start()
-                        live.update(get_dashboard(instances_cache, selected_index))
-                        live.refresh()
+                        _refresh(live)
 
-                    elif action == 'stop' and instances_cache:
-                        if 0 <= selected_index < len(instances_cache):
-                            instance = instances_cache[selected_index]
+                    elif action == 'stop' and displayed:
+                        if 0 <= selected_index < len(displayed):
+                            instance = displayed[selected_index]
                             instance_id = instance.get("id")
-                            instance_name = format_instance_name(instance)
 
                             # Stop without confirmation (it's non-destructive)
                             if delete_instance(instance_id):
                                 instances_cache = get_instances()
-                                live.update(get_dashboard(instances_cache, selected_index))
-                                live.refresh()
+                                _clamp_selection()
+                                _refresh(live)
 
-                    elif action == 'kill' and instances_cache:
-                        if 0 <= selected_index < len(instances_cache):
-                            instance = instances_cache[selected_index]
+                    elif action in ('unstick', 'unstick2') and displayed:
+                        if 0 <= selected_index < len(displayed):
+                            instance = displayed[selected_index]
                             instance_id = instance.get("id")
                             instance_name = format_instance_name(instance)
+                            level = 2 if action == 'unstick2' else 1
+                            level_desc = "Interrupting" if level == 2 else "Nudging"
 
-                            input_mode.set()
-                            time.sleep(0.1)
-                            live.stop()
-                            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, original_terminal_settings)
+                            # Non-destructive: no confirmation needed, run in background
+                            global unstick_feedback
+                            unstick_feedback = (time.time(), f"{level_desc} {instance_name}...")
+                            _refresh(live)
 
-                            console.print(f"\n[red bold]Kill frozen instance:[/red bold] {instance_name}")
-                            console.print("[dim]This sends SIGTERM/SIGKILL to the Claude process[/dim]")
-                            try:
-                                confirm = Prompt.ask("Type 'yes' to kill", default="no")
-                                if confirm.lower() == 'yes':
-                                    result = kill_instance(instance_id)
-                                    if result and result.get("status") in ("killed", "already_dead"):
-                                        pid = result.get("pid", "?")
-                                        sig = result.get("signal", "?")
-                                        console.print(f"[green]v[/green] Killed: {instance_name} (PID {pid}, {sig})")
-                                    elif result and result.get("detail"):
-                                        console.print(f"[red]x[/red] {result['detail']}")
-                                    else:
-                                        console.print("[red]x[/red] Kill failed (see server logs)")
+                            def _do_unstick(iid, iname, lvl):
+                                global unstick_feedback
+                                result = unstick_instance(iid, level=lvl)
+                                sig = result.get("signal", "?") if result else "?"
+                                if result and result.get("status") == "nudged":
+                                    unstick_feedback = (time.time(), f"{sig}: {iname} - activity detected")
+                                elif result and result.get("status") == "no_change":
+                                    unstick_feedback = (time.time(), f"{sig}: {iname} - no change")
+                                elif result and result.get("detail"):
+                                    unstick_feedback = (time.time(), f"Failed: {result['detail'][:30]}")
                                 else:
-                                    console.print("[dim]Cancelled[/dim]")
-                            except (KeyboardInterrupt, EOFError):
-                                console.print("[dim]Cancelled[/dim]")
+                                    unstick_feedback = (time.time(), f"Unstick failed for {iname}")
+                                update_flag.set()
 
-                            time.sleep(0.3)
-                            input_mode.clear()
-                            instances_cache = get_instances()
-                            if instances_cache:
-                                selected_index = min(selected_index, len(instances_cache) - 1)
-                            live.start()
-                            live.update(get_dashboard(instances_cache, selected_index))
-                            live.refresh()
+                            threading.Thread(target=_do_unstick, args=(instance_id, instance_name, level), daemon=True).start()
+
+                    elif action == 'kill' and displayed:
+                        # Kill uses unstick level 3 (SIGKILL) - no confirmation needed
+                        # since terminal is preserved and instance can be resumed
+                        if 0 <= selected_index < len(displayed):
+                            instance = displayed[selected_index]
+                            instance_id = instance.get("id")
+                            instance_name = format_instance_name(instance)
+                            working_dir = instance.get("working_dir", "")
+
+                            # Show immediate feedback, run in background
+                            unstick_feedback = (time.time(), f"Killing {instance_name}...")
+                            _refresh(live)
+
+                            def _do_kill(iid, iname, wdir):
+                                global unstick_feedback
+                                result = unstick_instance(iid, level=3)
+                                if result and result.get("status") in ("nudged", "no_change"):
+                                    # SIGKILL always "works" - process is dead
+                                    # Auto-copy resume command to clipboard
+                                    if wdir:
+                                        resume_cmd = f"cd {wdir} && claude --resume {iid}"
+                                        copied, _ = copy_to_clipboard(resume_cmd)
+                                        if copied:
+                                            unstick_feedback = (time.time(), f"Killed {iname} - resume cmd copied!")
+                                        else:
+                                            unstick_feedback = (time.time(), f"Killed {iname} (use y to copy resume)")
+                                    else:
+                                        unstick_feedback = (time.time(), f"Killed {iname}")
+                                elif result and result.get("detail"):
+                                    unstick_feedback = (time.time(), f"Kill failed: {result['detail'][:30]}")
+                                else:
+                                    unstick_feedback = (time.time(), f"Kill failed for {iname}")
+                                update_flag.set()
+
+                            threading.Thread(target=_do_kill, args=(instance_id, instance_name, working_dir), daemon=True).start()
+
+                    elif action == 'filter':
+                        # Cycle filter: all -> active -> stopped -> all
+                        filter_cycle = {"all": "active", "active": "stopped", "stopped": "all"}
+                        filter_mode = filter_cycle.get(filter_mode, "all")
+                        _clamp_selection()
+                        _refresh(live)
+
+                    elif action == 'restart':
+                        # Restart the Token-API server
+                        global restart_feedback
+                        restart_feedback = (time.time(), "Restarting server...")
+                        _refresh(live)
+
+                        def _do_restart():
+                            global restart_feedback, api_healthy, api_error_message
+                            try:
+                                result = subprocess.run(
+                                    ["token-restart"],
+                                    capture_output=True, text=True, timeout=15
+                                )
+                                if result.returncode == 0:
+                                    restart_feedback = (time.time(), "Restarted server!")
+                                    # Give server a moment to come back up
+                                    time.sleep(2)
+                                    api_healthy, api_error_message = check_api_health()
+                                else:
+                                    restart_feedback = (time.time(), f"Restart failed: {result.stderr[:30]}")
+                            except FileNotFoundError:
+                                restart_feedback = (time.time(), "token-restart not found")
+                            except subprocess.TimeoutExpired:
+                                restart_feedback = (time.time(), "Restart timed out")
+                            except Exception as e:
+                                restart_feedback = (time.time(), f"Restart error: {str(e)[:25]}")
+                            update_flag.set()
+
+                        threading.Thread(target=_do_restart, daemon=True).start()
+
+                    elif action == 'full_refresh':
+                        # Ctrl+R: restart server + re-exec TUI to pick up code changes
+                        live.stop()
+                        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, original_terminal_settings)
+                        console.print("\n[cyan bold]Full refresh: restarting server and TUI...[/cyan bold]")
+                        try:
+                            subprocess.run(["token-restart"], capture_output=True, text=True, timeout=15)
+                            console.print("[green]Server restarted.[/green] Re-launching TUI...")
+                            time.sleep(1)
+                        except Exception as e:
+                            console.print(f"[yellow]Server restart issue: {e}[/yellow] Re-launching TUI anyway...")
+                            time.sleep(0.5)
+                        # Re-exec this process to pick up code changes
+                        quit_flag.set()
+                        listener_thread.join(timeout=0.5)
+                        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+                    elif action == 'open_terminal' and displayed:
+                        # Open a new terminal tab with resume command for selected instance
+                        global resume_feedback
+                        if 0 <= selected_index < len(displayed):
+                            instance = displayed[selected_index]
+                            instance_id = instance.get("id", "")
+                            working_dir = instance.get("working_dir", "")
+                            instance_name = format_instance_name(instance)
+
+                            if not instance_id or not working_dir:
+                                resume_feedback = (time.time(), "Missing instance data")
+                            else:
+                                resume_cmd = f"cd {working_dir} && claude --resume {instance_id}"
+                                # Try to open in a new Windows Terminal tab
+                                try:
+                                    subprocess.Popen(
+                                        ["cmd.exe", "/c", "start", "wt.exe", "-w", "0", "nt",
+                                         "wsl.exe", "-e", "bash", "-ic", resume_cmd],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                                    )
+                                    resume_feedback = (time.time(), f"Opened terminal for {instance_name}")
+                                except FileNotFoundError:
+                                    # Fallback: copy to clipboard
+                                    copied, msg = copy_to_clipboard(resume_cmd)
+                                    if copied:
+                                        resume_feedback = (time.time(), f"Copied resume cmd (no wt.exe)")
+                                    else:
+                                        resume_feedback = (time.time(), msg)
+                                except Exception as e:
+                                    resume_feedback = (time.time(), f"Open failed: {str(e)[:25]}")
+                        _refresh(live)
 
                     elif action == 'sort':
                         input_mode.set()
@@ -1942,27 +2260,25 @@ def main():
                             console.print("[dim]Cancelled[/dim]")
 
                         time.sleep(0.3)
+                        tty.setcbreak(sys.stdin.fileno())
                         input_mode.clear()
                         instances_cache = get_instances()
                         live.start()
-                        live.update(get_dashboard(instances_cache, selected_index))
-                        live.refresh()
+                        _refresh(live)
 
                     elif action == 'page_prev':
                         panel_page = max(0, panel_page - 1)
                         # If user manually navigates away from Deploy during active deploy, disable auto-switch-back
                         if deploy_active and deploy_auto_switched and panel_page != 2:
                             deploy_auto_switched = False
-                        live.update(get_dashboard(instances_cache, selected_index))
-                        live.refresh()
+                        _refresh(live)
 
                     elif action == 'page_next':
                         panel_page = min(PANEL_PAGE_MAX, panel_page + 1)
                         # If user manually navigates away from Deploy during active deploy, disable auto-switch-back
                         if deploy_active and deploy_auto_switched and panel_page != 2:
                             deploy_auto_switched = False
-                        live.update(get_dashboard(instances_cache, selected_index))
-                        live.refresh()
+                        _refresh(live)
 
                     elif action == 'tts_skip':
                         # Skip current TTS (x key)
@@ -1981,8 +2297,7 @@ def main():
                                     tts_skip_feedback = (time.time(), "Nothing playing")
                         except Exception as e:
                             tts_skip_feedback = (time.time(), f"Skip failed: {str(e)[:20]}")
-                        live.update(get_dashboard(instances_cache, selected_index))
-                        live.refresh()
+                        _refresh(live)
 
                     elif action == 'tts_skip_all':
                         # Skip current TTS and clear queue (X key)
@@ -2005,16 +2320,51 @@ def main():
                                     tts_skip_feedback = (time.time(), "Nothing to skip/clear")
                         except Exception as e:
                             tts_skip_feedback = (time.time(), f"Skip failed: {str(e)[:20]}")
-                        live.update(get_dashboard(instances_cache, selected_index))
-                        live.refresh()
+                        _refresh(live)
+
+                    elif action == 'resume':
+                        # Copy resume command to clipboard (y key)
+                        if not displayed:
+                            resume_feedback = (time.time(), "No instances")
+                        elif not (0 <= selected_index < len(displayed)):
+                            resume_feedback = (time.time(), "No instance selected")
+                        else:
+                            instance = displayed[selected_index]
+                            instance_id = instance.get("id", "")
+                            working_dir = instance.get("working_dir", "")
+                            instance_name = format_instance_name(instance)
+
+                            if not instance_id or not working_dir:
+                                resume_feedback = (time.time(), "Missing instance data")
+                            else:
+                                resume_cmd = f"cd {working_dir} && claude --resume {instance_id}"
+                                copied, msg = copy_to_clipboard(resume_cmd)
+                                if copied:
+                                    resume_feedback = (time.time(), f"Copied resume cmd for {instance_name}")
+                                else:
+                                    resume_feedback = (time.time(), msg)
+                        _refresh(live)
 
                 update_flag.clear()
 
                 if time.time() - last_refresh >= REFRESH_INTERVAL:
+                    old_count = len(instances_cache)
                     instances_cache = get_instances()
                     api_healthy, api_error_message = check_api_health()
-                    if instances_cache:
-                        selected_index = min(selected_index, len(instances_cache) - 1)
+
+                    # Auto-scroll to newest instance when new one appears
+                    current_ids = set(i.get("id") for i in instances_cache)
+                    new_ids = current_ids - prev_instance_ids
+                    if new_ids and len(instances_cache) > old_count:
+                        # Find the newest instance in the displayed (filtered) list
+                        displayed = _get_displayed()
+                        for idx, inst in enumerate(displayed):
+                            if inst.get("id") in new_ids:
+                                selected_index = idx
+                                break
+                    prev_instance_ids = current_ids
+
+                    _clamp_selection()
 
                     # Deploy auto-switch logic
                     now_active, now_log, now_meta = check_deploy_status()
@@ -2034,7 +2384,7 @@ def main():
                         deploy_metadata = {}
                     deploy_active = now_active
 
-                    live.update(get_dashboard(instances_cache, selected_index))
+                    _refresh(live)
                     last_refresh = time.time()
 
                 update_flag.wait(timeout=0.02)

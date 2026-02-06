@@ -26,6 +26,7 @@ import aiosqlite
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import subprocess
+import requests
 from pydantic import BaseModel, Field
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -404,12 +405,22 @@ class PreToolUseResponse(BaseModel):
 _post_tool_debounce: dict = {}  # session_id -> last_call_time
 
 
+# Database helper: connect with busy_timeout to prevent indefinite blocking
+async def get_db():
+    """Get a database connection with busy_timeout configured."""
+    db = await aiosqlite.connect(DB_PATH)
+    await db.execute("PRAGMA busy_timeout=5000")
+    return db
+
+
 # Database initialization
 async def init_db():
     """Initialize SQLite database with required tables."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     async with aiosqlite.connect(DB_PATH) as db:
+        # Set busy_timeout to prevent blocking on lock contention
+        await db.execute("PRAGMA busy_timeout=5000")
         # Create claude_instances table
         await db.execute("""
             CREATE TABLE IF NOT EXISTS claude_instances (
@@ -922,6 +933,9 @@ async def lifespan(app: FastAPI):
     # Start stale flag cleaner
     stale_flag_cleaner_task = asyncio.create_task(clear_stale_processing_flags())
     print("Stale flag cleaner started")
+    # Start stuck instance detector
+    stuck_detector_task = asyncio.create_task(detect_stuck_instances())
+    print("Stuck instance detector started")
     await run_overdue_tasks()
     yield
 
@@ -1190,8 +1204,9 @@ def is_pid_claude(pid: int) -> bool:
 async def kill_instance(instance_id: str):
     """Kill a frozen Claude instance process and mark it stopped.
 
-    Sends SIGTERM, waits, then SIGKILL if needed. Supports both
-    desktop (direct kill) and phone (SSH kill) instances.
+    Sends SIGINT twice (mimics double Ctrl+C for graceful exit),
+    then SIGKILL if needed. Supports both desktop (direct kill)
+    and phone (SSH kill) instances.
     """
     logger.info(f"Kill request for instance: {instance_id[:12]}...")
     now = datetime.now().isoformat()
@@ -1264,11 +1279,11 @@ async def kill_instance(instance_id: str):
                             details={"pid": pid, "status": "already_dead"})
             return {"status": "already_dead", "pid": pid, "signal": None}
 
-        # SIGTERM first
+        # SIGINT×2 (mimics double Ctrl+C: first cancels operation, second exits gracefully)
         try:
-            os.kill(pid, signal.SIGTERM)
-            kill_signal = "SIGTERM"
-            logger.info(f"Kill: sent SIGTERM to PID {pid}")
+            os.kill(pid, signal.SIGINT)
+            kill_signal = "SIGINT"
+            logger.info(f"Kill: sent first SIGINT to PID {pid}")
         except ProcessLookupError:
             # Already dead
             async with aiosqlite.connect(DB_PATH) as db:
@@ -1283,8 +1298,18 @@ async def kill_instance(instance_id: str):
         except PermissionError:
             raise HTTPException(status_code=500, detail=f"Permission denied killing PID {pid}")
 
-        # Wait for graceful shutdown
-        await asyncio.sleep(2)
+        # Wait 1s then send second SIGINT
+        await asyncio.sleep(1)
+        if is_pid_claude(pid):
+            try:
+                os.kill(pid, signal.SIGINT)
+                kill_signal = "SIGINT_x2"
+                logger.info(f"Kill: sent second SIGINT to PID {pid}")
+            except ProcessLookupError:
+                pass  # Died after first SIGINT
+
+        # Wait 3s for graceful shutdown
+        await asyncio.sleep(3)
 
         # Check if still alive, escalate to SIGKILL
         if is_pid_claude(pid):
@@ -1296,19 +1321,30 @@ async def kill_instance(instance_id: str):
                 pass  # Died between check and kill
 
     else:
-        # Phone/remote device - use sshp
+        # Phone/remote device - use sshp with SIGINT×2
         try:
             proc = await asyncio.create_subprocess_exec(
-                "sshp", f"kill -TERM {pid}",
+                "sshp", f"kill -INT {pid}",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
-            kill_signal = "SIGTERM"
-            logger.info(f"Kill: sent SIGTERM via SSH to PID {pid} on {device_id}")
+            await asyncio.wait_for(proc.communicate(), timeout=10)
+            kill_signal = "SIGINT"
+            logger.info(f"Kill: sent first SIGINT via SSH to PID {pid} on {device_id}")
 
-            # Wait then check/escalate
-            await asyncio.sleep(2)
+            # Wait 1s then send second SIGINT
+            await asyncio.sleep(1)
+            proc1b = await asyncio.create_subprocess_exec(
+                "sshp", f"kill -INT {pid}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await asyncio.wait_for(proc1b.communicate(), timeout=10)
+            kill_signal = "SIGINT_x2"
+            logger.info(f"Kill: sent second SIGINT via SSH to PID {pid} on {device_id}")
+
+            # Wait 3s then check/escalate
+            await asyncio.sleep(3)
 
             proc2 = await asyncio.create_subprocess_exec(
                 "sshp", f"kill -0 {pid}",
@@ -1349,6 +1385,366 @@ async def kill_instance(instance_id: str):
 
     logger.info(f"Kill: instance {instance_id[:12]}... killed (PID {pid}, {kill_signal})")
     return {"status": "killed", "pid": pid, "signal": kill_signal}
+
+
+@app.post("/api/instances/{instance_id}/unstick")
+async def unstick_instance(instance_id: str, level: int = 1):
+    """Nudge a stuck Claude instance back to life.
+
+    Level 1 (default): SIGWINCH - gentle window resize signal, interrupts blocking I/O
+    Level 2: SIGINT - like Ctrl+C, cancels current operation but keeps instance alive
+    Level 3: SIGKILL - nuclear option, kills process but preserves terminal for /resume
+
+    Levels 1-2 are non-destructive. Waits 4 seconds and checks if instance activity changed.
+    Level 3 kills immediately (use when deadlocked and L1/L2 don't work).
+    """
+    logger.info(f"Unstick request for instance: {instance_id[:12]}...")
+
+    # Look up instance
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM claude_instances WHERE id = ?",
+            (instance_id,)
+        )
+        row = await cursor.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Instance not found")
+
+    instance = dict(row)
+    pid = instance.get("pid")
+    device_id = instance.get("device_id", "desktop")
+    working_dir = instance.get("working_dir", "")
+    last_activity_before = instance.get("last_activity")
+
+    # PID discovery fallback
+    if not pid:
+        if device_id == "desktop":
+            pid = await find_claude_pid_by_workdir(working_dir)
+            if not pid:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No PID stored and could not discover process."
+                )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No PID stored for remote device '{device_id}'."
+            )
+
+    # Choose signal based on level
+    if level == 3:
+        sig = signal.SIGKILL
+        sig_name = "SIGKILL"
+        ssh_sig = "KILL"
+    elif level == 2:
+        sig = signal.SIGINT
+        sig_name = "SIGINT"
+        ssh_sig = "INT"
+    else:
+        sig = signal.SIGWINCH
+        sig_name = "SIGWINCH"
+        ssh_sig = "WINCH"
+
+    # Send the signal
+    diag_before = None
+    if device_id == "desktop":
+        # If stored PID is stale, try to rediscover by working directory
+        if not is_pid_claude(pid):
+            logger.info(f"Unstick: stored PID {pid} is stale, attempting rediscovery...")
+            new_pid = await find_claude_pid_by_workdir(working_dir)
+            if new_pid:
+                pid = new_pid
+                logger.info(f"Unstick: rediscovered PID {pid} for {working_dir}")
+                # Update the stored PID
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("UPDATE claude_instances SET pid = ? WHERE id = ?", (pid, instance_id))
+                    await db.commit()
+            else:
+                raise HTTPException(status_code=400, detail=f"PID {pid} is stale and no Claude process found in {working_dir}")
+
+        # Capture diagnostics BEFORE sending signal
+        diag_before = get_process_diagnostics(pid)
+        logger.info(f"Unstick L{level} BEFORE: PID {pid} state={diag_before.get('state', '?')} wchan={diag_before.get('wchan', '?')} children={len(diag_before.get('children', []))}")
+
+        try:
+            os.kill(pid, sig)
+            logger.info(f"Unstick L{level}: sent {sig_name} to PID {pid}")
+        except ProcessLookupError:
+            raise HTTPException(status_code=400, detail=f"PID {pid} no longer exists")
+        except PermissionError:
+            raise HTTPException(status_code=500, detail=f"Permission denied sending {sig_name} to PID {pid}")
+    else:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "sshp", f"kill -{ssh_sig} {pid}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=10)
+            logger.info(f"Unstick L{level}: sent {sig_name} via SSH to PID {pid} on {device_id}")
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail=f"SSH to {device_id} timed out")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"SSH unstick failed: {str(e)}")
+
+    # Wait and check for activity change
+    await asyncio.sleep(4)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT last_activity FROM claude_instances WHERE id = ?",
+            (instance_id,)
+        )
+        row = await cursor.fetchone()
+
+    last_activity_after = dict(row).get("last_activity") if row else None
+    activity_changed = last_activity_after != last_activity_before
+
+    status = "nudged" if activity_changed else "no_change"
+
+    # Capture diagnostics AFTER signal (desktop only)
+    diag_after = None
+    if device_id == "desktop" and is_pid_claude(pid):
+        diag_after = get_process_diagnostics(pid)
+        logger.info(f"Unstick L{level} AFTER: PID {pid} state={diag_after.get('state', '?')} wchan={diag_after.get('wchan', '?')}")
+
+    await log_event(
+        "instance_unstick",
+        instance_id=instance_id,
+        device_id=device_id,
+        details={
+            "pid": pid,
+            "signal": sig_name,
+            "level": level,
+            "activity_changed": activity_changed,
+            "state_before": diag_before.get("state") if diag_before else None,
+            "wchan_before": diag_before.get("wchan") if diag_before else None,
+            "state_after": diag_after.get("state") if diag_after else None,
+            "wchan_after": diag_after.get("wchan") if diag_after else None,
+        }
+    )
+
+    logger.info(f"Unstick L{level}: instance {instance_id[:12]}... {status} (PID {pid}, {sig_name}, activity_changed={activity_changed})")
+
+    response = {"status": status, "pid": pid, "signal": sig_name, "level": level, "activity_changed": activity_changed}
+    if diag_before:
+        response["diagnostics_before"] = {
+            "state": diag_before.get("state"),
+            "state_desc": diag_before.get("state_desc"),
+            "wchan": diag_before.get("wchan"),
+            "children": diag_before.get("children", []),
+        }
+    if diag_after:
+        response["diagnostics_after"] = {
+            "state": diag_after.get("state"),
+            "state_desc": diag_after.get("state_desc"),
+            "wchan": diag_after.get("wchan"),
+        }
+    return response
+
+
+def get_process_diagnostics(pid: int) -> dict:
+    """Get detailed diagnostics for a process. Returns dict with process info or error."""
+    diag = {"pid": pid, "exists": False}
+
+    try:
+        # Check if process exists
+        proc_dir = f"/proc/{pid}"
+        if not os.path.exists(proc_dir):
+            diag["error"] = "Process does not exist"
+            return diag
+
+        diag["exists"] = True
+
+        # Get comm (process name)
+        try:
+            with open(f"{proc_dir}/comm", "r") as f:
+                diag["comm"] = f.read().strip()
+        except Exception as e:
+            diag["comm_error"] = str(e)
+
+        # Get cmdline
+        try:
+            with open(f"{proc_dir}/cmdline", "r") as f:
+                cmdline = f.read().replace('\x00', ' ').strip()
+                diag["cmdline"] = cmdline[:200] if cmdline else "(empty)"
+        except Exception as e:
+            diag["cmdline_error"] = str(e)
+
+        # Get cwd
+        try:
+            diag["cwd"] = os.readlink(f"{proc_dir}/cwd")
+        except Exception as e:
+            diag["cwd_error"] = str(e)
+
+        # Get process state from stat
+        try:
+            with open(f"{proc_dir}/stat", "r") as f:
+                stat = f.read().split()
+                # State is field 3 (0-indexed 2)
+                state_char = stat[2] if len(stat) > 2 else "?"
+                state_map = {
+                    "R": "Running",
+                    "S": "Sleeping (interruptible)",
+                    "D": "Disk sleep (uninterruptible)",
+                    "Z": "Zombie",
+                    "T": "Stopped",
+                    "t": "Tracing stop",
+                    "X": "Dead",
+                    "I": "Idle",
+                }
+                diag["state"] = state_char
+                diag["state_desc"] = state_map.get(state_char, "Unknown")
+                # PPID is field 4 (0-indexed 3)
+                diag["ppid"] = int(stat[3]) if len(stat) > 3 else None
+        except Exception as e:
+            diag["stat_error"] = str(e)
+
+        # Get file descriptors (especially stdin/stdout/stderr)
+        try:
+            fd_dir = f"{proc_dir}/fd"
+            fds = {}
+            for fd in ["0", "1", "2"]:  # stdin, stdout, stderr
+                fd_path = f"{fd_dir}/{fd}"
+                if os.path.exists(fd_path):
+                    try:
+                        target = os.readlink(fd_path)
+                        fds[fd] = target
+                    except Exception:
+                        fds[fd] = "(unreadable)"
+            diag["fds"] = fds
+        except Exception as e:
+            diag["fd_error"] = str(e)
+
+        # Get wchan (what syscall it's waiting in)
+        try:
+            with open(f"{proc_dir}/wchan", "r") as f:
+                wchan = f.read().strip()
+                diag["wchan"] = wchan if wchan and wchan != "0" else "(not waiting)"
+        except Exception as e:
+            diag["wchan_error"] = str(e)
+
+        # Check for child processes
+        try:
+            children = []
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{entry}/stat", "r") as f:
+                        child_stat = f.read().split()
+                        if len(child_stat) > 3 and int(child_stat[3]) == pid:
+                            child_comm = "(unknown)"
+                            try:
+                                with open(f"/proc/{entry}/comm", "r") as cf:
+                                    child_comm = cf.read().strip()
+                            except Exception:
+                                pass
+                            children.append({"pid": int(entry), "comm": child_comm})
+                except Exception:
+                    continue
+            diag["children"] = children
+        except Exception as e:
+            diag["children_error"] = str(e)
+
+    except Exception as e:
+        diag["error"] = str(e)
+
+    return diag
+
+
+@app.get("/api/instances/{instance_id}/diagnose")
+async def diagnose_instance(instance_id: str):
+    """Get detailed diagnostics for an instance's process state.
+
+    Useful for debugging stuck instances. Returns process state,
+    what syscall it's waiting on, child processes, file descriptors, etc.
+    """
+    # Look up instance
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM claude_instances WHERE id = ?",
+            (instance_id,)
+        )
+        row = await cursor.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Instance not found")
+
+    instance = dict(row)
+    stored_pid = instance.get("pid")
+    device_id = instance.get("device_id", "desktop")
+    working_dir = instance.get("working_dir", "")
+    last_activity = instance.get("last_activity")
+    status = instance.get("status")
+
+    result = {
+        "instance_id": instance_id,
+        "device_id": device_id,
+        "working_dir": working_dir,
+        "db_status": status,
+        "last_activity": last_activity,
+        "stored_pid": stored_pid,
+    }
+
+    # Calculate time since last activity
+    if last_activity:
+        try:
+            from datetime import datetime
+            # Parse the timestamp (assuming it's in local time from SQLite)
+            last_dt = datetime.fromisoformat(last_activity.replace("Z", "+00:00")) if "T" in last_activity else datetime.strptime(last_activity, "%Y-%m-%d %H:%M:%S")
+            age_seconds = (datetime.now() - last_dt).total_seconds()
+            result["activity_age_seconds"] = int(age_seconds)
+            result["activity_age_human"] = f"{int(age_seconds // 60)}m {int(age_seconds % 60)}s ago"
+        except Exception as e:
+            result["activity_age_error"] = str(e)
+
+    if device_id != "desktop":
+        result["note"] = "Detailed diagnostics only available for desktop instances"
+        return result
+
+    # Check stored PID
+    if stored_pid:
+        result["stored_pid_diagnostics"] = get_process_diagnostics(stored_pid)
+        result["stored_pid_is_claude"] = is_pid_claude(stored_pid)
+
+    # Try to discover current PID by working dir
+    discovered_pid = await find_claude_pid_by_workdir(working_dir)
+    result["discovered_pid"] = discovered_pid
+
+    if discovered_pid and discovered_pid != stored_pid:
+        result["pid_mismatch"] = True
+        result["discovered_pid_diagnostics"] = get_process_diagnostics(discovered_pid)
+
+    # Check if there are ANY claude processes
+    try:
+        claude_processes = []
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/comm", "r") as f:
+                    if f.read().strip() == "claude":
+                        pid = int(entry)
+                        try:
+                            cwd = os.readlink(f"/proc/{entry}/cwd")
+                        except Exception:
+                            cwd = "(unknown)"
+                        claude_processes.append({"pid": pid, "cwd": cwd})
+            except Exception:
+                continue
+        result["all_claude_processes"] = claude_processes
+    except Exception as e:
+        result["claude_scan_error"] = str(e)
+
+    # Log the diagnosis
+    logger.info(f"Diagnose: instance {instance_id[:12]}... stored_pid={stored_pid}, discovered_pid={discovered_pid}, status={status}")
+
+    return result
 
 
 class RenameInstanceRequest(BaseModel):
@@ -1722,11 +2118,24 @@ DESKTOP_STATE = {
     "work_mode_changed_at": None,
 }
 
+# Phone HTTP server config (MacroDroid on phone via Tailscale)
+PHONE_CONFIG = {
+    "host": "100.102.92.24",
+    "port": 7777,
+    "timeout": 5,
+    # === TEST SHIM - REMOVE AFTER TESTING ===
+    # Set to True to bypass break time check and force blocking
+    "test_force_block": False,
+    # =========================================
+}
+
 # Phone activity state (tracks current app from MacroDroid)
 PHONE_STATE = {
     "current_app": None,  # Current distraction app or None
     "last_activity": None,
     "is_distracted": False,
+    "reachable": None,  # Last known reachability status
+    "last_reachable_check": None,
 }
 
 # App categories for phone distraction detection
@@ -1804,6 +2213,50 @@ def get_headless_state() -> dict:
         except (json.JSONDecodeError, Exception) as e:
             logger.warning(f"Failed to read headless state: {e}")
     return {"enabled": False, "last_changed": None, "hostname": None, "error": "state file not found"}
+
+
+async def poll_for_state_change(
+    get_state_fn: callable,
+    key: str,
+    original_value: any,
+    timeout: float = 5.0,
+    initial_interval: float = 0.1,
+    max_interval: float = 0.5,
+) -> tuple[bool, dict]:
+    """
+    Poll a state function until a key's value changes or timeout.
+
+    Uses exponential backoff starting at initial_interval, capped at max_interval.
+    This is a generic utility for waiting on async external operations that update
+    state files (e.g., Windows scheduled tasks).
+
+    Args:
+        get_state_fn: Function that returns current state dict
+        key: Key to monitor for changes
+        original_value: Original value to compare against
+        timeout: Max seconds to wait
+        initial_interval: Initial poll interval in seconds
+        max_interval: Maximum poll interval in seconds
+
+    Returns:
+        (changed: bool, final_state: dict)
+    """
+    elapsed = 0.0
+    interval = initial_interval
+
+    while elapsed < timeout:
+        await asyncio.sleep(interval)
+        elapsed += interval
+
+        state = get_state_fn()
+        if state.get(key) != original_value:
+            return True, state
+
+        # Exponential backoff
+        interval = min(interval * 1.5, max_interval)
+
+    # Timeout - return final state anyway
+    return False, get_state_fn()
 
 
 def trigger_headless_task(action: str = "toggle") -> tuple[bool, str]:
@@ -2145,26 +2598,59 @@ def close_distraction_windows() -> dict:
         return {"success": False, "error": str(e)}
 
 
-def trigger_obsidian_command(command_id: str) -> bool:
+def trigger_obsidian_command_async(command_id: str, no_focus: bool = False):
+    """Fire-and-forget Obsidian trigger that doesn't block the caller."""
+    import threading
+    thread = threading.Thread(
+        target=trigger_obsidian_command,
+        args=(command_id, no_focus),
+        daemon=True
+    )
+    thread.start()
+
+
+def trigger_obsidian_command(command_id: str, no_focus: bool = False) -> bool:
     """
     Trigger an Obsidian command via Advanced URI plugin.
     From WSL, uses PowerShell to launch the URI on Windows.
     Returns True if command was dispatched successfully.
+
+    Args:
+        command_id: The Obsidian command ID to trigger
+        no_focus: If True, attempt to trigger without stealing window focus
+                  (used for phone telemetry to avoid Obsidian jumping to foreground)
     """
     from urllib.parse import quote
     vault = quote(OBSIDIAN_CONFIG["vault_name"])
+
+    # Build URI - add silent=true to minimize UI disruption
     uri = f"obsidian://advanced-uri?vault={vault}&commandid={command_id}"
+    if no_focus:
+        uri += "&silent=true"
 
     try:
-        result = subprocess.run(
-            [POWERSHELL_PATH, "-Command", f'Start-Process "{uri}"'],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            cwd="/mnt/c"
-        )
+        if no_focus:
+            # Use PowerShell with -WindowStyle Hidden to avoid focus stealing
+            # cmd.exe start has quoting issues that mangle URIs from WSL
+            result = subprocess.run(
+                [POWERSHELL_PATH, "-WindowStyle", "Hidden", "-Command", f'Start-Process "{uri}"'],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                cwd="/mnt/c"
+            )
+        else:
+            # Normal PowerShell launch (brings window to front)
+            result = subprocess.run(
+                [POWERSHELL_PATH, "-Command", f'Start-Process "{uri}"'],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                cwd="/mnt/c"
+            )
         if result.returncode == 0:
-            print(f"OBSIDIAN: Triggered command '{command_id}'")
+            focus_mode = "no_focus" if no_focus else "normal"
+            print(f"OBSIDIAN: Triggered command '{command_id}' ({focus_mode})")
             return True
         else:
             print(f"OBSIDIAN: Failed to trigger '{command_id}': {result.stderr}")
@@ -2175,6 +2661,76 @@ def trigger_obsidian_command(command_id: str) -> bool:
     except Exception as e:
         print(f"OBSIDIAN: Error triggering '{command_id}': {e}")
         return False
+
+
+def enforce_phone_app(app_name: str, action: str = "disable") -> dict:
+    """
+    Send enforcement command to phone via MacroDroid HTTP server.
+
+    Args:
+        app_name: App to enable/disable (twitter, youtube, etc.)
+        action: "disable" or "enable"
+
+    Returns:
+        dict with success status and details
+    """
+    host = PHONE_CONFIG["host"]
+    port = PHONE_CONFIG["port"]
+    timeout = PHONE_CONFIG["timeout"]
+
+    url = f"http://{host}:{port}/enforce"
+    params = {"action": action, "app": app_name}
+
+    try:
+        response = requests.get(url, params=params, timeout=timeout)
+        PHONE_STATE["reachable"] = True
+        PHONE_STATE["last_reachable_check"] = datetime.now().isoformat()
+
+        print(f"PHONE: Enforce {action} {app_name} -> {response.status_code}")
+        return {
+            "success": response.status_code == 200,
+            "status_code": response.status_code,
+            "response": response.text[:200] if response.text else None
+        }
+    except requests.exceptions.Timeout:
+        PHONE_STATE["reachable"] = False
+        PHONE_STATE["last_reachable_check"] = datetime.now().isoformat()
+        print(f"PHONE: Timeout enforcing {action} {app_name}")
+        return {"success": False, "error": "timeout"}
+    except requests.exceptions.ConnectionError:
+        PHONE_STATE["reachable"] = False
+        PHONE_STATE["last_reachable_check"] = datetime.now().isoformat()
+        print(f"PHONE: Connection refused enforcing {action} {app_name}")
+        return {"success": False, "error": "connection_refused"}
+    except Exception as e:
+        PHONE_STATE["reachable"] = False
+        PHONE_STATE["last_reachable_check"] = datetime.now().isoformat()
+        print(f"PHONE: Error enforcing {action} {app_name}: {e}")
+        return {"success": False, "error": str(e)}
+
+
+def check_phone_reachable() -> dict:
+    """
+    Check if phone is reachable via heartbeat endpoint.
+
+    Returns:
+        dict with reachable status
+    """
+    host = PHONE_CONFIG["host"]
+    port = PHONE_CONFIG["port"]
+    timeout = PHONE_CONFIG["timeout"]
+
+    url = f"http://{host}:{port}/heartbeat"
+
+    try:
+        response = requests.get(url, timeout=timeout)
+        PHONE_STATE["reachable"] = True
+        PHONE_STATE["last_reachable_check"] = datetime.now().isoformat()
+        return {"reachable": True, "status_code": response.status_code}
+    except Exception:
+        PHONE_STATE["reachable"] = False
+        PHONE_STATE["last_reachable_check"] = datetime.now().isoformat()
+        return {"reachable": False}
 
 
 @app.post("/api/window/enforce", response_model=WindowEnforceResponse)
@@ -2439,15 +2995,17 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         PHONE_STATE["is_distracted"] = False
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
 
-        # Switch Obsidian timer to silence when distraction app closes
+        # Switch Obsidian timer to silence when distraction app closes (async to not block response)
         obsidian_triggered = False
         if old_app:  # Only trigger if we were tracking an app
             DESKTOP_STATE["current_mode"] = "silence"
             DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
-            obsidian_triggered = trigger_obsidian_command(
-                OBSIDIAN_CONFIG["mode_commands"]["silence"]
+            trigger_obsidian_command_async(
+                OBSIDIAN_CONFIG["mode_commands"]["silence"],
+                no_focus=True
             )
-            print(f"    Phone close -> silence | obsidian={obsidian_triggered}")
+            obsidian_triggered = True  # Dispatched (async)
+            print(f"    Phone close -> silence | obsidian=dispatched")
 
         await log_event(
             "phone_app_closed",
@@ -2487,15 +3045,17 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         PHONE_STATE["is_distracted"] = True
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
 
-        # Sync Obsidian timer to phone distraction mode
+        # Sync Obsidian timer to phone distraction mode (async to not block response)
         obsidian_triggered = False
         if distraction_mode in OBSIDIAN_CONFIG["mode_commands"]:
             DESKTOP_STATE["current_mode"] = distraction_mode
             DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
-            obsidian_triggered = trigger_obsidian_command(
-                OBSIDIAN_CONFIG["mode_commands"][distraction_mode]
+            trigger_obsidian_command_async(
+                OBSIDIAN_CONFIG["mode_commands"][distraction_mode],
+                no_focus=True
             )
-            print(f"    Phone open -> {distraction_mode} | obsidian={obsidian_triggered}")
+            obsidian_triggered = True  # Dispatched (async)
+            print(f"    Phone open -> {distraction_mode} | obsidian=dispatched")
 
         await log_event(
             "phone_distraction_allowed",
@@ -2526,6 +3086,14 @@ async def handle_phone_activity(request: PhoneActivityRequest):
 
     productivity_active = active_count > 0
 
+    # === TEST SHIM - bypasses break/productivity checks ===
+    test_force_block = PHONE_CONFIG.get("test_force_block", False)
+    if test_force_block:
+        print(f"    TEST MODE: Forcing block (ignoring break={break_secs}s, productivity={productivity_active})")
+        break_secs = 0
+        productivity_active = False
+    # ======================================================
+
     # Decision logic (same as desktop)
     if break_secs > 0:
         # Has break time - allow
@@ -2533,15 +3101,17 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         PHONE_STATE["is_distracted"] = True
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
 
-        # Sync Obsidian timer to phone distraction mode
+        # Sync Obsidian timer to phone distraction mode (async to not block response)
         obsidian_triggered = False
         if distraction_mode in OBSIDIAN_CONFIG["mode_commands"]:
             DESKTOP_STATE["current_mode"] = distraction_mode
             DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
-            obsidian_triggered = trigger_obsidian_command(
-                OBSIDIAN_CONFIG["mode_commands"][distraction_mode]
+            trigger_obsidian_command_async(
+                OBSIDIAN_CONFIG["mode_commands"][distraction_mode],
+                no_focus=True
             )
-            print(f"    Phone open -> {distraction_mode} | obsidian={obsidian_triggered}")
+            obsidian_triggered = True  # Dispatched (async)
+            print(f"    Phone open -> {distraction_mode} | obsidian=dispatched")
 
         await log_event(
             "phone_distraction_allowed",
@@ -2567,15 +3137,17 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         PHONE_STATE["is_distracted"] = True
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
 
-        # Sync Obsidian timer to phone distraction mode
+        # Sync Obsidian timer to phone distraction mode (async to not block response)
         obsidian_triggered = False
         if distraction_mode in OBSIDIAN_CONFIG["mode_commands"]:
             DESKTOP_STATE["current_mode"] = distraction_mode
             DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
-            obsidian_triggered = trigger_obsidian_command(
-                OBSIDIAN_CONFIG["mode_commands"][distraction_mode]
+            trigger_obsidian_command_async(
+                OBSIDIAN_CONFIG["mode_commands"][distraction_mode],
+                no_focus=True
             )
-            print(f"    Phone open -> {distraction_mode} | obsidian={obsidian_triggered}")
+            obsidian_triggered = True  # Dispatched (async)
+            print(f"    Phone open -> {distraction_mode} | obsidian=dispatched")
 
         await log_event(
             "phone_distraction_allowed",
@@ -2596,16 +3168,21 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         )
 
     else:
-        # No break, no productivity - block
+        # No break, no productivity - block and enforce
+        print(f"    BLOCKED: no break time, no productivity")
+
+        # Send enforcement command to phone to disable the app
+        enforce_result = enforce_phone_app(app_name, action="disable")
+
         await log_event(
             "phone_distraction_blocked",
             details={
                 "app": app_name,
-                "reason": "no_break_no_productivity"
+                "reason": "no_break_no_productivity",
+                "enforcement": enforce_result
             }
         )
 
-        print(f"    BLOCKED: no break time, no productivity")
         return PhoneActivityResponse(
             allowed=False,
             reason="blocked",
@@ -2624,7 +3201,64 @@ async def get_phone_state():
         "last_activity": PHONE_STATE.get("last_activity"),
         "break_seconds": timer_state.get("breakAvailableSeconds", 0),
         "work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
+        "reachable": PHONE_STATE.get("reachable"),
+        "last_reachable_check": PHONE_STATE.get("last_reachable_check"),
     }
+
+
+@app.get("/phone/ping")
+async def ping_phone():
+    """Check if phone is reachable."""
+    result = check_phone_reachable()
+    return result
+
+
+@app.post("/phone/enforce")
+async def manual_enforce_phone(app: str, action: str = "disable"):
+    """Manually trigger phone enforcement (for testing)."""
+    result = enforce_phone_app(app, action)
+    return result
+
+
+@app.post("/api/timer/break-exhausted")
+async def handle_break_exhausted():
+    """
+    Called by Obsidian when break time hits 0.
+    Instantly enforces phone app closure if a distraction app is active.
+    This replaces the 5-second polling approach with push-based enforcement.
+    """
+    current_app = PHONE_STATE.get("current_app")
+    if not current_app:
+        return {"enforced": False, "reason": "no_active_app"}
+
+    # Map app name to enforcement target
+    enforce_app = current_app
+    if current_app in ("x", "twitter", "com.twitter.android"):
+        enforce_app = "twitter"
+    elif current_app in ("youtube", "com.google.android.youtube", "app.revanced.android.youtube"):
+        enforce_app = "youtube"
+    elif current_app in PHONE_DISTRACTION_APPS:
+        mode = PHONE_DISTRACTION_APPS.get(current_app)
+        if mode == "gaming":
+            enforce_app = "game"
+
+    print(f"BREAK-EXHAUSTED: Enforcing disable on {current_app} (mapped to {enforce_app})")
+    result = enforce_phone_app(enforce_app, action="disable")
+
+    # Clear phone state since we're enforcing closure
+    PHONE_STATE["current_app"] = None
+    PHONE_STATE["is_distracted"] = False
+
+    await log_event(
+        "break_exhausted_enforcement",
+        details={
+            "app": current_app,
+            "enforce_app": enforce_app,
+            "result": result
+        }
+    )
+
+    return {"enforced": True, "app": current_app, "result": result}
 
 
 # ============ Work Mode / Geofence Endpoints ============
@@ -2930,11 +3564,18 @@ async def headless_control(request: HeadlessControlRequest):
             message=f"{message}. Hint: Run Setup-HeadlessTask.ps1 as Administrator first."
         )
 
-    # Wait briefly for state file to update
-    time.sleep(0.5)
+    # Poll for state file update (state file is written at end of PowerShell script)
+    # We detect change by monitoring the lastChanged timestamp
+    original_timestamp = before_state.get("last_changed")
+    changed, after_state = await poll_for_state_change(
+        get_state_fn=get_headless_state,
+        key="last_changed",
+        original_value=original_timestamp,
+        timeout=5.0,  # Windows scheduled task typically takes 2-4 seconds
+    )
 
-    # Get state after action
-    after_state = get_headless_state()
+    if not changed:
+        message += " (state update pending - poll /api/headless for final state)"
 
     return HeadlessControlResponse(
         success=True,
@@ -3725,6 +4366,86 @@ async def clear_stale_processing_flags():
         except Exception as e:
             logger.error(f"Error clearing stale flags: {e}")
             await asyncio.sleep(60)
+
+
+async def detect_stuck_instances():
+    """Background worker that detects potentially stuck instances and logs diagnostics.
+
+    An instance is considered potentially stuck if:
+    - Status is 'processing' or 'idle' (not stopped)
+    - Last activity was > 10 minutes ago
+    - The stored PID doesn't match any running claude process
+
+    Runs every 5 minutes. Logs warnings but doesn't take action.
+    """
+    await asyncio.sleep(120)  # Wait 2 min after startup before first check
+
+    while True:
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute("""
+                    SELECT id, tab_name, working_dir, pid, status, device_id, last_activity
+                    FROM claude_instances
+                    WHERE status IN ('processing', 'idle')
+                      AND device_id = 'desktop'
+                      AND datetime(last_activity) < datetime('now', 'localtime', '-10 minutes')
+                """)
+                stale_instances = await cursor.fetchall()
+
+            for row in stale_instances:
+                instance = dict(row)
+                instance_id = instance["id"]
+                tab_name = instance.get("tab_name", instance_id[:8])
+                stored_pid = instance.get("pid")
+                working_dir = instance.get("working_dir", "")
+                last_activity = instance.get("last_activity")
+
+                # Check if stored PID is still a claude process
+                pid_valid = stored_pid and is_pid_claude(stored_pid)
+
+                # Try to discover actual PID
+                discovered_pid = await find_claude_pid_by_workdir(working_dir) if working_dir else None
+
+                if not pid_valid and not discovered_pid:
+                    # Ghost instance: no process found
+                    logger.warning(
+                        f"STUCK DETECTION: Ghost instance '{tab_name}' ({instance_id[:8]}...) - "
+                        f"stored_pid={stored_pid} invalid, no process found in {working_dir}, "
+                        f"last_activity={last_activity}"
+                    )
+                elif not pid_valid and discovered_pid:
+                    # PID mismatch: process exists but DB has wrong PID
+                    logger.warning(
+                        f"STUCK DETECTION: PID mismatch '{tab_name}' ({instance_id[:8]}...) - "
+                        f"stored_pid={stored_pid} invalid, discovered_pid={discovered_pid}, "
+                        f"last_activity={last_activity}"
+                    )
+                elif pid_valid:
+                    # Process exists but inactive for >10 min - might be stuck
+                    diag = get_process_diagnostics(stored_pid)
+                    state = diag.get("state", "?")
+                    wchan = diag.get("wchan", "?")
+                    children = len(diag.get("children", []))
+
+                    # Log if in uninterruptible sleep (D) or has been in same state
+                    if state == "D":
+                        logger.warning(
+                            f"STUCK DETECTION: Uninterruptible sleep '{tab_name}' ({instance_id[:8]}...) - "
+                            f"PID {stored_pid} state=D wchan={wchan}, last_activity={last_activity}"
+                        )
+                    else:
+                        logger.info(
+                            f"STUCK CHECK: '{tab_name}' ({instance_id[:8]}...) - "
+                            f"PID {stored_pid} state={state} wchan={wchan} children={children}, "
+                            f"last_activity={last_activity} (>10min stale but process alive)"
+                        )
+
+            await asyncio.sleep(300)  # Run every 5 minutes
+
+        except Exception as e:
+            logger.error(f"Error in stuck detection: {e}")
+            await asyncio.sleep(300)
 
 
 async def queue_tts(instance_id: str, message: str) -> dict:

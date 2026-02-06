@@ -52,6 +52,8 @@ POST   /api/instances/register          # Register new instance
 DELETE /api/instances/{id}              # Stop instance
 PATCH  /api/instances/{id}/rename       # Rename (sets tab_name)
 POST   /api/instances/{id}/activity     # Update processing state
+POST   /api/instances/{id}/unstick     # Nudge stuck instance (?level=1 SIGWINCH, ?level=2 SIGINT)
+GET    /api/instances/{id}/diagnose    # Get detailed process diagnostics
 GET    /api/instances                   # List all instances
 GET    /api/instances/{id}/todos        # Get instance task list
 ```
@@ -94,6 +96,10 @@ h / l    - Switch info panel (Events ↔ Logs)
 r        - Rename selected
 s        - Stop selected
 d        - Delete (with confirm)
+y        - Copy resume command to clipboard (yank)
+U        - Unstick frozen instance (SIGWINCH, gentle nudge)
+I        - Interrupt frozen instance (SIGINT, cancel current op)
+K        - Kill frozen instance (SIGKILL, auto-copies resume cmd)
 c        - Clear all stopped
 o        - Change sort order
 x        - Skip current TTS
@@ -155,7 +161,7 @@ curl -s http://localhost:7777/api/notify/test | jq .
 | `notify-test` | Send test notifications |
 | `tts-skip` | Skip current TTS (--all to clear queue) |
 | `instance-name` | Rename current session |
-| `instance-stop` | Stop instance by name (fuzzy match) |
+| `instance-stop` | Stop/unstick/kill instance by name (fuzzy match) |
 | `instances-clear` | Bulk clear stopped instances |
 
 ### General (also useful here)
@@ -176,8 +182,12 @@ token-restart                    # Restart via systemd
 token-restart --watch            # Restart and tail logs
 token-restart --status           # Check status only
 
-# Stop/clear instances
+# Stop/unstick/kill instances
 instance-stop "auth-refactor"    # Stop by name
+instance-stop --unstick "auth"   # Nudge stuck instance (L1, SIGWINCH)
+instance-stop --unstick=2 "auth" # Interrupt stuck instance (L2, SIGINT)
+instance-stop --kill "auth"      # Kill frozen instance (SIGKILL, shows resume cmd)
+instance-stop --diagnose "auth"  # Show process state, wchan, children, FDs
 instance-stop --list             # List active instances
 instances-clear                  # Preview stopped instances
 instances-clear --confirm        # Delete stopped instances
