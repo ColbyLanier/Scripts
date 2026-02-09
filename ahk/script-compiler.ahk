@@ -86,6 +86,10 @@ global tvConnected := false
 }
 
 
+Media_Stop:: {  ; Skip current TTS
+    PostToTokenApi("/api/tts/skip", "")
+}
+
 ^!w:: {                       ; Ctrl+Alt+W
 
     Run "ms-settings:mobile-devices"

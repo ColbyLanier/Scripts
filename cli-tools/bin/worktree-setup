@@ -266,6 +266,11 @@ if [[ ${#FILES_TO_COPY[@]} -gt 0 ]]; then
     done
 fi
 
+# Create config directory (required by Dockerfile but git-ignored)
+log_info "Creating config directory..."
+mkdir -p "$WORKTREE_DIR/config"
+log_success "Created config/ directory"
+
 # Sync dependencies
 if [[ -n "$PKG_MANAGER" ]] && [[ "$SKIP_SYNC" == "false" ]]; then
     log_info "Syncing dependencies..."

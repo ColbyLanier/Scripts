@@ -102,8 +102,6 @@ I        - Interrupt frozen instance (SIGINT, cancel current op)
 K        - Kill frozen instance (SIGKILL, auto-copies resume cmd)
 c        - Clear all stopped
 o        - Change sort order
-x        - Skip current TTS
-X        - Skip TTS and clear queue
 R        - Restart server
 q        - Quit
 ```

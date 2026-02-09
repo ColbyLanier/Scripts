@@ -61,8 +61,6 @@ DB_PATH = Path.home() / ".claude" / "agents.db"
 REFRESH_INTERVAL = 2  # seconds
 TIMER_STATE_PATH = Path("/mnt/c/Users/colby/Documents/Obsidian/Token-ENV/Scripts/timer-state.json")
 
-# TTS skip feedback state
-tts_skip_feedback: Optional[tuple[float, str]] = None  # (timestamp, message)
 
 # Resume copy feedback state
 resume_feedback: Optional[tuple[float, str]] = None  # (timestamp, message)
@@ -975,19 +973,8 @@ def create_mobile_events_panel(events: list) -> Panel:
 
 def create_tts_queue_panel(queue_status: dict) -> Panel:
     """Create a compact one-row TTS queue panel showing instance names in order."""
-    global tts_skip_feedback
-
     current = queue_status.get("current")
     queue = queue_status.get("queue", [])
-
-    # Check for recent skip feedback (show for 2 seconds)
-    skip_msg = None
-    if tts_skip_feedback:
-        skip_time, skip_text = tts_skip_feedback
-        if time.time() - skip_time < 2.0:
-            skip_msg = skip_text
-        else:
-            tts_skip_feedback = None
 
     # Build compact queue string
     queue_items = []
@@ -1007,9 +994,7 @@ def create_tts_queue_panel(queue_status: dict) -> Panel:
     if len(queue) > 5:
         queue_items.append(f"[dim]+{len(queue) - 5} more[/dim]")
 
-    if skip_msg:
-        content = f"[bold red]{skip_msg}[/bold red]"
-    elif queue_items:
+    if queue_items:
         content = "Queue: " + " → ".join(queue_items)
     else:
         content = "[dim]Queue: (empty)[/dim]"
@@ -1789,17 +1774,9 @@ def main():
                         with action_lock:
                             action_queue.append('page_next')
                         update_flag.set()
-                    elif key == 'x':
-                        with action_lock:
-                            action_queue.append('tts_skip')
-                        update_flag.set()
                     elif key == 'y':
                         with action_lock:
                             action_queue.append('resume')
-                        update_flag.set()
-                    elif key == 'X':
-                        with action_lock:
-                            action_queue.append('tts_skip_all')
                         update_flag.set()
                     elif key == 'v':
                         with action_lock:
@@ -2278,48 +2255,6 @@ def main():
                         # If user manually navigates away from Deploy during active deploy, disable auto-switch-back
                         if deploy_active and deploy_auto_switched and panel_page != 2:
                             deploy_auto_switched = False
-                        _refresh(live)
-
-                    elif action == 'tts_skip':
-                        # Skip current TTS (x key)
-                        global tts_skip_feedback
-                        try:
-                            req = urllib.request.Request(
-                                f"{API_URL}/api/tts/skip",
-                                method="POST",
-                                data=b""
-                            )
-                            with urllib.request.urlopen(req, timeout=2) as resp:
-                                result = json.loads(resp.read().decode())
-                                if result.get("skipped"):
-                                    tts_skip_feedback = (time.time(), "Skipped!")
-                                else:
-                                    tts_skip_feedback = (time.time(), "Nothing playing")
-                        except Exception as e:
-                            tts_skip_feedback = (time.time(), f"Skip failed: {str(e)[:20]}")
-                        _refresh(live)
-
-                    elif action == 'tts_skip_all':
-                        # Skip current TTS and clear queue (X key)
-                        try:
-                            req = urllib.request.Request(
-                                f"{API_URL}/api/tts/skip?clear_queue=true",
-                                method="POST",
-                                data=b""
-                            )
-                            with urllib.request.urlopen(req, timeout=2) as resp:
-                                result = json.loads(resp.read().decode())
-                                msg_parts = []
-                                if result.get("skipped"):
-                                    msg_parts.append("Skipped")
-                                if result.get("cleared", 0) > 0:
-                                    msg_parts.append(f"cleared {result['cleared']}")
-                                if msg_parts:
-                                    tts_skip_feedback = (time.time(), ", ".join(msg_parts) + "!")
-                                else:
-                                    tts_skip_feedback = (time.time(), "Nothing to skip/clear")
-                        except Exception as e:
-                            tts_skip_feedback = (time.time(), f"Skip failed: {str(e)[:20]}")
                         _refresh(live)
 
                     elif action == 'resume':
