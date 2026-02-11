@@ -18,6 +18,7 @@ subagent = "cli_tools.subagents.main:main"
 time-convert = "cli_tools.timezone.cli:main"
 google-chat-message = "cli_tools.google_chat.cli:main"
 db-query = "cli_tools.db_query.cli:main"
+db-migrate = "cli_tools.db_migrate.cli:main"
 cloud-logs = "cli_tools.cloud_logs.cli:main"
 
 [build-system]
