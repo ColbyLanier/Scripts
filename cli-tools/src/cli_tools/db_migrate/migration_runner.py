@@ -19,6 +19,15 @@ try:
 except ImportError:
     asyncpg = None  # type: ignore[assignment]
 
+try:
+    from google.cloud.sql.connector import Connector, IPTypes
+
+    CLOUD_SQL_CONNECTOR_AVAILABLE = True
+except ImportError:
+    CLOUD_SQL_CONNECTOR_AVAILABLE = False
+    Connector = None  # type: ignore[assignment, misc]
+    IPTypes = None  # type: ignore[assignment, misc]
+
 from cli_tools.db_query.query_runner import get_env_config, get_password, normalize_env
 
 
@@ -156,44 +165,56 @@ def _sql_has_transaction_control(sql: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-async def run_migration(
-    env_config: dict[str, Any],
-    sql_content: str,
-    password: str | None,
-    dry_run: bool = False,
-) -> MigrationResult:
-    """Execute a migration against the database.
+async def _connect_direct(
+    env_config: dict[str, Any], password: str | None
+) -> Any:
+    """Connect via direct TCP (for prod after IP is opened)."""
+    return await asyncio.wait_for(
+        asyncpg.connect(
+            host=env_config["host"],
+            port=env_config["port"],
+            database=env_config["database"],
+            user=env_config["user"],
+            password=password,
+            timeout=30,
+        ),
+        timeout=30,
+    )
 
-    For dry_run, wraps in a transaction and rolls back.
-    Otherwise wraps in a transaction and commits (unless SQL already has transaction control).
+
+async def _connect_connector(
+    env_config: dict[str, Any], password: str | None
+) -> tuple[Any, Any]:
+    """Connect via Cloud SQL Python Connector (for dev/staging).
+
+    Returns (connection, connector) — caller must close both.
     """
-    if asyncpg is None:
-        return MigrationResult(
-            success=False,
-            error="asyncpg is required. Install with: pip install asyncpg",
-        )
+    loop = asyncio.get_running_loop()
+    connector = Connector(loop=loop)
 
+    conn = await connector.connect_async(
+        env_config["instance"],
+        "asyncpg",
+        user=env_config["user"],
+        password=password,
+        db=env_config["database"],
+        ip_type=IPTypes.PUBLIC,
+    )
+    return conn, connector
+
+
+async def _execute_migration(
+    conn: Any,
+    sql_content: str,
+    dry_run: bool,
+) -> MigrationResult:
+    """Run migration SQL on an already-established connection."""
     start = time.monotonic()
-    conn = None
+    has_txn = _sql_has_transaction_control(sql_content)
+    messages: list[str] = []
 
     try:
-        conn = await asyncio.wait_for(
-            asyncpg.connect(
-                host=env_config["host"],
-                port=env_config["port"],
-                database=env_config["database"],
-                user=env_config["user"],
-                password=password,
-                timeout=30,
-            ),
-            timeout=30,
-        )
-
-        has_txn = _sql_has_transaction_control(sql_content)
-        messages: list[str] = []
-
         if dry_run:
-            # Wrap everything in a transaction that we roll back
             await conn.execute("BEGIN")
             messages.append("DRY RUN: Transaction started")
             try:
@@ -205,20 +226,15 @@ async def run_migration(
                 messages.append("DRY RUN: Rolled back")
                 elapsed = (time.monotonic() - start) * 1000
                 return MigrationResult(
-                    success=False,
-                    error=str(e),
-                    duration_ms=elapsed,
-                    messages=messages,
+                    success=False, error=str(e), duration_ms=elapsed, messages=messages
                 )
             await conn.execute("ROLLBACK")
             messages.append("DRY RUN: Rolled back (no changes applied)")
         elif has_txn:
-            # SQL has its own transaction control, execute as-is
             messages.append("SQL contains transaction control, executing as-is")
             result = await conn.execute(sql_content)
             messages.append(f"Result: {result}")
         else:
-            # Wrap in a transaction
             await conn.execute("BEGIN")
             messages.append("Transaction started")
             try:
@@ -231,37 +247,70 @@ async def run_migration(
                 messages.append(f"Transaction rolled back due to error: {e}")
                 elapsed = (time.monotonic() - start) * 1000
                 return MigrationResult(
-                    success=False,
-                    error=str(e),
-                    duration_ms=elapsed,
-                    messages=messages,
+                    success=False, error=str(e), duration_ms=elapsed, messages=messages
                 )
 
         elapsed = (time.monotonic() - start) * 1000
         return MigrationResult(
-            success=True,
-            statements_executed=1,
-            duration_ms=elapsed,
-            messages=messages,
-        )
-
-    except asyncio.TimeoutError:
-        elapsed = (time.monotonic() - start) * 1000
-        return MigrationResult(
-            success=False,
-            error="Connection timed out after 30s",
-            duration_ms=elapsed,
+            success=True, statements_executed=1, duration_ms=elapsed, messages=messages
         )
     except Exception as e:
         elapsed = (time.monotonic() - start) * 1000
         return MigrationResult(
+            success=False, error=str(e), duration_ms=elapsed, messages=messages
+        )
+
+
+async def run_migration(
+    env_config: dict[str, Any],
+    sql_content: str,
+    password: str | None,
+    dry_run: bool = False,
+    use_connector: bool = False,
+) -> MigrationResult:
+    """Execute a migration against the database.
+
+    use_connector=True uses the Cloud SQL Python Connector (for dev/staging).
+    use_connector=False uses direct TCP (for prod after IP is opened).
+    """
+    if asyncpg is None:
+        return MigrationResult(
             success=False,
-            error=str(e),
-            duration_ms=elapsed,
+            error="asyncpg is required. Install with: pip install asyncpg",
+        )
+
+    start = time.monotonic()
+    conn = None
+    connector = None
+
+    try:
+        if use_connector:
+            if not CLOUD_SQL_CONNECTOR_AVAILABLE:
+                return MigrationResult(
+                    success=False,
+                    error="Cloud SQL Connector not available. Install with: pip install cloud-sql-python-connector[asyncpg]",
+                )
+            conn, connector = await _connect_connector(env_config, password)
+        else:
+            conn = await _connect_direct(env_config, password)
+
+        return await _execute_migration(conn, sql_content, dry_run)
+
+    except asyncio.TimeoutError:
+        elapsed = (time.monotonic() - start) * 1000
+        return MigrationResult(
+            success=False, error="Connection timed out after 30s", duration_ms=elapsed
+        )
+    except Exception as e:
+        elapsed = (time.monotonic() - start) * 1000
+        return MigrationResult(
+            success=False, error=str(e), duration_ms=elapsed
         )
     finally:
         if conn:
             await conn.close()
+        if connector:
+            await connector.close_async()
 
 
 def run_prod_migration(

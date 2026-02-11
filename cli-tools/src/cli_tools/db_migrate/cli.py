@@ -113,11 +113,10 @@ def cmd_apply(args: argparse.Namespace) -> int:
     if is_prod:
         result = run_prod_migration(env_config, sql_content, password, args.dry_run)
     else:
-        # Dev/staging: use direct connection via public IP
-        public_ip = env_config.get("public_ip")
-        if public_ip:
-            env_config["host"] = public_ip
-        result = asyncio.run(run_migration(env_config, sql_content, password, args.dry_run))
+        # Dev/staging: use Cloud SQL connector (IAM auth, no public IP needed)
+        result = asyncio.run(
+            run_migration(env_config, sql_content, password, args.dry_run, use_connector=True)
+        )
 
     _print_result(result)
     return 0 if result.success else 1
