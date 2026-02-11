@@ -1,7 +1,7 @@
 """Core migration execution logic.
 
-Handles running SQL migrations against dev/staging (direct) and production
-(open IP -> run -> close IP lifecycle).
+All connections use the Cloud SQL Python Connector with the active gcloud
+account token. No proxy binary or public IP management needed.
 """
 
 from __future__ import annotations
@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import re
 import subprocess
-import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -28,8 +27,6 @@ except ImportError:
     Connector = None  # type: ignore[assignment, misc]
     IPTypes = None  # type: ignore[assignment, misc]
 
-from cli_tools.db_query.query_runner import get_env_config, get_password, normalize_env
-
 
 @dataclass
 class MigrationResult:
@@ -40,113 +37,6 @@ class MigrationResult:
     error: str | None = None
     duration_ms: float = 0
     messages: list[str] = field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
-# gcloud IP management (production only)
-# ---------------------------------------------------------------------------
-
-
-def get_public_ip() -> str:
-    """Get our public IP address."""
-    result = subprocess.run(
-        ["curl", "-s", "ifconfig.me"],
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    ip = result.stdout.strip()
-    if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
-        raise RuntimeError(f"Could not determine public IP (got: {ip!r})")
-    return ip
-
-
-def _parse_instance_connection(instance_conn: str) -> tuple[str, str]:
-    """Parse 'project:region:instance' into (project, instance)."""
-    parts = instance_conn.split(":")
-    if len(parts) != 3:
-        raise ValueError(
-            f"Invalid INSTANCE_CONNECTION_NAME format: {instance_conn!r}. "
-            "Expected 'project:region:instance'."
-        )
-    return parts[0], parts[2]
-
-
-def open_public_ip(project: str, instance: str, ip: str) -> None:
-    """Add our IP to the Cloud SQL authorized networks."""
-    print(f"  Opening authorized network: {ip}/32 on {instance}...")
-    result = subprocess.run(
-        [
-            "gcloud",
-            "sql",
-            "instances",
-            "patch",
-            instance,
-            f"--project={project}",
-            f"--authorized-networks={ip}/32",
-            "--quiet",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Failed to open authorized network:\n{result.stderr.strip()}"
-        )
-
-
-def close_public_ip(project: str, instance: str) -> None:
-    """Clear all authorized networks on the Cloud SQL instance."""
-    print("  Closing authorized networks...")
-    result = subprocess.run(
-        [
-            "gcloud",
-            "sql",
-            "instances",
-            "patch",
-            instance,
-            f"--project={project}",
-            "--clear-authorized-networks",
-            "--quiet",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    if result.returncode != 0:
-        print(
-            f"  WARNING: Failed to close authorized networks: {result.stderr.strip()}",
-            file=sys.stderr,
-        )
-    else:
-        print("  Authorized networks cleared.")
-
-
-def wait_for_instance(project: str, instance: str, timeout_s: int = 120) -> None:
-    """Poll until the Cloud SQL instance is RUNNABLE."""
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        result = subprocess.run(
-            [
-                "gcloud",
-                "sql",
-                "instances",
-                "describe",
-                instance,
-                f"--project={project}",
-                "--format=value(state)",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        state = result.stdout.strip()
-        if state == "RUNNABLE":
-            return
-        print(f"  Instance state: {state}, waiting...")
-        time.sleep(5)
-    raise RuntimeError(f"Instance {instance} did not become RUNNABLE within {timeout_s}s")
 
 
 # ---------------------------------------------------------------------------
@@ -161,36 +51,47 @@ def _sql_has_transaction_control(sql: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Migration execution
+# Connection
 # ---------------------------------------------------------------------------
 
 
-async def _connect_direct(
-    env_config: dict[str, Any], password: str | None
-) -> Any:
-    """Connect via direct TCP (for prod after IP is opened)."""
-    return await asyncio.wait_for(
-        asyncpg.connect(
-            host=env_config["host"],
-            port=env_config["port"],
-            database=env_config["database"],
-            user=env_config["user"],
-            password=password,
-            timeout=30,
-        ),
-        timeout=30,
+def _get_gcloud_credentials() -> Any:
+    """Get credentials from the active gcloud account.
+
+    Uses `gcloud auth print-access-token` which has broader permissions than
+    Application Default Credentials (ADC). ADC uses a restricted OAuth client
+    that may lack Cloud SQL scopes on cross-project instances.
+    """
+    import google.oauth2.credentials
+
+    result = subprocess.run(
+        ["gcloud", "auth", "print-access-token"],
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
+    token = result.stdout.strip()
+    if not token or result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to get gcloud access token: {result.stderr.strip()}"
+        )
+    return google.oauth2.credentials.Credentials(token=token)
 
 
 async def _connect_connector(
     env_config: dict[str, Any], password: str | None
 ) -> tuple[Any, Any]:
-    """Connect via Cloud SQL Python Connector (for dev/staging).
+    """Connect via Cloud SQL Python Connector.
+
+    Uses the active gcloud account token (not ADC) for cross-project
+    compatibility.
 
     Returns (connection, connector) — caller must close both.
     """
+    creds = _get_gcloud_credentials()
+
     loop = asyncio.get_running_loop()
-    connector = Connector(loop=loop)
+    connector = Connector(loop=loop, credentials=creds, quota_project="")
 
     conn = await connector.connect_async(
         env_config["instance"],
@@ -201,6 +102,11 @@ async def _connect_connector(
         ip_type=IPTypes.PUBLIC,
     )
     return conn, connector
+
+
+# ---------------------------------------------------------------------------
+# Migration execution
+# ---------------------------------------------------------------------------
 
 
 async def _execute_migration(
@@ -266,17 +172,18 @@ async def run_migration(
     sql_content: str,
     password: str | None,
     dry_run: bool = False,
-    use_connector: bool = False,
+    use_connector: bool = True,
 ) -> MigrationResult:
-    """Execute a migration against the database.
-
-    use_connector=True uses the Cloud SQL Python Connector (for dev/staging).
-    use_connector=False uses direct TCP (for prod after IP is opened).
-    """
+    """Execute a migration against the database via Cloud SQL connector."""
     if asyncpg is None:
         return MigrationResult(
             success=False,
             error="asyncpg is required. Install with: pip install asyncpg",
+        )
+    if not CLOUD_SQL_CONNECTOR_AVAILABLE:
+        return MigrationResult(
+            success=False,
+            error="Cloud SQL Connector not available. Install with: pip install cloud-sql-python-connector[asyncpg]",
         )
 
     start = time.monotonic()
@@ -284,16 +191,7 @@ async def run_migration(
     connector = None
 
     try:
-        if use_connector:
-            if not CLOUD_SQL_CONNECTOR_AVAILABLE:
-                return MigrationResult(
-                    success=False,
-                    error="Cloud SQL Connector not available. Install with: pip install cloud-sql-python-connector[asyncpg]",
-                )
-            conn, connector = await _connect_connector(env_config, password)
-        else:
-            conn = await _connect_direct(env_config, password)
-
+        conn, connector = await _connect_connector(env_config, password)
         return await _execute_migration(conn, sql_content, dry_run)
 
     except asyncio.TimeoutError:
@@ -317,7 +215,7 @@ async def run_verify_query(
     env_config: dict[str, Any],
     verify_sql: str,
     password: str | None,
-    use_connector: bool = False,
+    use_connector: bool = True,
 ) -> list[dict[str, Any]]:
     """Run a verification SELECT query and return rows as dicts."""
     if asyncpg is None:
@@ -326,11 +224,7 @@ async def run_verify_query(
     conn = None
     connector = None
     try:
-        if use_connector:
-            conn, connector = await _connect_connector(env_config, password)
-        else:
-            conn = await _connect_direct(env_config, password)
-
+        conn, connector = await _connect_connector(env_config, password)
         rows = await conn.fetch(verify_sql)
         return [dict(row) for row in rows]
     except Exception as e:
@@ -341,110 +235,3 @@ async def run_verify_query(
             await conn.close()
         if connector:
             await connector.close_async()
-
-
-def run_prod_migration(
-    env_config: dict[str, Any],
-    sql_content: str,
-    password: str | None,
-    dry_run: bool = False,
-    verify_sql: str | None = None,
-) -> MigrationResult:
-    """Run a migration against production with the open/run/close lifecycle.
-
-    1. Get public IP
-    2. Open authorized network on Cloud SQL
-    3. Wait for instance RUNNABLE
-    4. Run migration
-    5. Optionally run verification query
-    6. Close authorized network (always, via finally)
-    """
-    instance_conn = env_config.get("instance", "")
-    project, instance = _parse_instance_connection(instance_conn)
-
-    ip = get_public_ip()
-    print(f"\n  Our public IP: {ip}")
-
-    migration_result = None
-    try:
-        open_public_ip(project, instance, ip)
-        wait_for_instance(project, instance)
-
-        # Get the public IP of the Cloud SQL instance for direct connection
-        result = subprocess.run(
-            [
-                "gcloud",
-                "sql",
-                "instances",
-                "describe",
-                instance,
-                f"--project={project}",
-                "--format=value(ipAddresses[0].ipAddress)",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        db_public_ip = result.stdout.strip()
-        if not db_public_ip:
-            return MigrationResult(
-                success=False,
-                error="Could not determine Cloud SQL public IP address",
-            )
-
-        print(f"  Cloud SQL public IP: {db_public_ip}")
-
-        # Override host to use the public IP
-        prod_config = env_config.copy()
-        prod_config["host"] = db_public_ip
-
-        print("  Running migration...\n")
-        migration_result = asyncio.run(
-            run_migration(prod_config, sql_content, password, dry_run)
-        )
-
-        # Run verification query if provided and migration succeeded
-        if verify_sql and migration_result.success and not dry_run:
-            print("\n  Running verification query...")
-            rows = asyncio.run(
-                run_verify_query(prod_config, verify_sql, password)
-            )
-            if rows:
-                migration_result.messages.append(f"Verification: {len(rows)} row(s) found")
-                for row in rows:
-                    migration_result.messages.append(f"  {row}")
-            else:
-                migration_result.messages.append("Verification: no rows returned")
-
-        return migration_result
-
-    except Exception as e:
-        if migration_result:
-            return migration_result
-        return MigrationResult(success=False, error=str(e))
-
-    finally:
-        print()  # blank line before close output
-        close_public_ip(project, instance)
-        # Verify the close actually worked
-        check = subprocess.run(
-            [
-                "gcloud",
-                "sql",
-                "instances",
-                "describe",
-                instance,
-                f"--project={project}",
-                "--format=value(settings.ipConfiguration.authorizedNetworks)",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if check.stdout.strip():
-            print(
-                f"  WARNING: Authorized networks still present: {check.stdout.strip()}",
-                file=sys.stderr,
-            )
-        else:
-            print("  Verified: authorized networks empty.")

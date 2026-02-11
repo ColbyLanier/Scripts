@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Database migration CLI tool.
 
-Run SQL migrations against Cloud SQL environments with automatic IP lifecycle
-management for production.
+Run SQL migrations against Cloud SQL environments via the Cloud SQL Python
+Connector. No proxy, no public IP management — just direct secure connections.
 
 Usage:
     db-migrate apply migration.sql --env dev
@@ -26,12 +26,7 @@ from cli_tools.db_query.query_runner import (
     normalize_env,
 )
 
-from .migration_runner import (
-    MigrationResult,
-    run_migration,
-    run_prod_migration,
-    run_verify_query,
-)
+from .migration_runner import MigrationResult, run_migration, run_verify_query
 
 
 def _read_sql_file(path: str) -> str:
@@ -114,30 +109,25 @@ def cmd_apply(args: argparse.Namespace) -> int:
         print("Error: DB_PASSWORD required. Set in environment or .env file.")
         return 1
 
-    # Run migration
+    # Run migration via Cloud SQL connector (all environments)
     verify_sql = getattr(args, "verify", None)
 
-    if is_prod:
-        result = run_prod_migration(
-            env_config, sql_content, password, args.dry_run, verify_sql=verify_sql
+    result = asyncio.run(
+        run_migration(env_config, sql_content, password, args.dry_run, use_connector=True)
+    )
+
+    # Run verification if requested and migration succeeded
+    if verify_sql and result.success and not args.dry_run:
+        print("\n  Running verification query...")
+        rows = asyncio.run(
+            run_verify_query(env_config, verify_sql, password, use_connector=True)
         )
-    else:
-        # Dev/staging: use Cloud SQL connector (IAM auth, no public IP needed)
-        result = asyncio.run(
-            run_migration(env_config, sql_content, password, args.dry_run, use_connector=True)
-        )
-        # Run verification on dev/staging if requested
-        if verify_sql and result.success and not args.dry_run:
-            print("\n  Running verification query...")
-            rows = asyncio.run(
-                run_verify_query(env_config, verify_sql, password, use_connector=True)
-            )
-            if rows:
-                result.messages.append(f"Verification: {len(rows)} row(s) found")
-                for row in rows:
-                    result.messages.append(f"  {row}")
-            else:
-                result.messages.append("Verification: no rows returned")
+        if rows:
+            result.messages.append(f"Verification: {len(rows)} row(s) found")
+            for row in rows:
+                result.messages.append(f"  {row}")
+        else:
+            result.messages.append("Verification: no rows returned")
 
     _print_result(result)
     return 0 if result.success else 1
@@ -156,11 +146,10 @@ Examples:
   db-migrate apply migration.sql --env dev --dry-run
   db-migrate apply migration.sql --env prod
 
-Production migrations:
-  - Automatically opens your IP in Cloud SQL authorized networks
-  - Runs the migration in a transaction
-  - Closes authorized networks (always, even on failure)
-  - Requires typing YES to confirm
+All connections use the Cloud SQL Python Connector with the active
+gcloud account. No proxy or public IP management needed.
+
+Production migrations require typing YES to confirm.
         """,
     )
 
