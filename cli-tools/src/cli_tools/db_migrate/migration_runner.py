@@ -313,11 +313,42 @@ async def run_migration(
             await connector.close_async()
 
 
+async def run_verify_query(
+    env_config: dict[str, Any],
+    verify_sql: str,
+    password: str | None,
+    use_connector: bool = False,
+) -> list[dict[str, Any]]:
+    """Run a verification SELECT query and return rows as dicts."""
+    if asyncpg is None:
+        return []
+
+    conn = None
+    connector = None
+    try:
+        if use_connector:
+            conn, connector = await _connect_connector(env_config, password)
+        else:
+            conn = await _connect_direct(env_config, password)
+
+        rows = await conn.fetch(verify_sql)
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"  Verification query failed: {e}")
+        return []
+    finally:
+        if conn:
+            await conn.close()
+        if connector:
+            await connector.close_async()
+
+
 def run_prod_migration(
     env_config: dict[str, Any],
     sql_content: str,
     password: str | None,
     dry_run: bool = False,
+    verify_sql: str | None = None,
 ) -> MigrationResult:
     """Run a migration against production with the open/run/close lifecycle.
 
@@ -325,7 +356,8 @@ def run_prod_migration(
     2. Open authorized network on Cloud SQL
     3. Wait for instance RUNNABLE
     4. Run migration
-    5. Close authorized network (always, via finally)
+    5. Optionally run verification query
+    6. Close authorized network (always, via finally)
     """
     instance_conn = env_config.get("instance", "")
     project, instance = _parse_instance_connection(instance_conn)
@@ -333,6 +365,7 @@ def run_prod_migration(
     ip = get_public_ip()
     print(f"\n  Our public IP: {ip}")
 
+    migration_result = None
     try:
         open_public_ip(project, instance, ip)
         wait_for_instance(project, instance)
@@ -366,7 +399,52 @@ def run_prod_migration(
         prod_config["host"] = db_public_ip
 
         print("  Running migration...\n")
-        return asyncio.run(run_migration(prod_config, sql_content, password, dry_run))
+        migration_result = asyncio.run(
+            run_migration(prod_config, sql_content, password, dry_run)
+        )
+
+        # Run verification query if provided and migration succeeded
+        if verify_sql and migration_result.success and not dry_run:
+            print("\n  Running verification query...")
+            rows = asyncio.run(
+                run_verify_query(prod_config, verify_sql, password)
+            )
+            if rows:
+                migration_result.messages.append(f"Verification: {len(rows)} row(s) found")
+                for row in rows:
+                    migration_result.messages.append(f"  {row}")
+            else:
+                migration_result.messages.append("Verification: no rows returned")
+
+        return migration_result
+
+    except Exception as e:
+        if migration_result:
+            return migration_result
+        return MigrationResult(success=False, error=str(e))
 
     finally:
+        print()  # blank line before close output
         close_public_ip(project, instance)
+        # Verify the close actually worked
+        check = subprocess.run(
+            [
+                "gcloud",
+                "sql",
+                "instances",
+                "describe",
+                instance,
+                f"--project={project}",
+                "--format=value(settings.ipConfiguration.authorizedNetworks)",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if check.stdout.strip():
+            print(
+                f"  WARNING: Authorized networks still present: {check.stdout.strip()}",
+                file=sys.stderr,
+            )
+        else:
+            print("  Verified: authorized networks empty.")

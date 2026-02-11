@@ -26,7 +26,12 @@ from cli_tools.db_query.query_runner import (
     normalize_env,
 )
 
-from .migration_runner import MigrationResult, run_migration, run_prod_migration
+from .migration_runner import (
+    MigrationResult,
+    run_migration,
+    run_prod_migration,
+    run_verify_query,
+)
 
 
 def _read_sql_file(path: str) -> str:
@@ -110,13 +115,29 @@ def cmd_apply(args: argparse.Namespace) -> int:
         return 1
 
     # Run migration
+    verify_sql = getattr(args, "verify", None)
+
     if is_prod:
-        result = run_prod_migration(env_config, sql_content, password, args.dry_run)
+        result = run_prod_migration(
+            env_config, sql_content, password, args.dry_run, verify_sql=verify_sql
+        )
     else:
         # Dev/staging: use Cloud SQL connector (IAM auth, no public IP needed)
         result = asyncio.run(
             run_migration(env_config, sql_content, password, args.dry_run, use_connector=True)
         )
+        # Run verification on dev/staging if requested
+        if verify_sql and result.success and not args.dry_run:
+            print("\n  Running verification query...")
+            rows = asyncio.run(
+                run_verify_query(env_config, verify_sql, password, use_connector=True)
+            )
+            if rows:
+                result.messages.append(f"Verification: {len(rows)} row(s) found")
+                for row in rows:
+                    result.messages.append(f"  {row}")
+            else:
+                result.messages.append("Verification: no rows returned")
 
     _print_result(result)
     return 0 if result.success else 1
@@ -170,6 +191,12 @@ Production migrations:
         "--dry-run",
         action="store_true",
         help="Run migration in a transaction then rollback (no changes applied)",
+    )
+    apply_parser.add_argument(
+        "--verify",
+        type=str,
+        default=None,
+        help="SQL SELECT to run after migration to verify results",
     )
     apply_parser.set_defaults(func=cmd_apply)
 
