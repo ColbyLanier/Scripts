@@ -53,6 +53,8 @@ Options:
   -b, --blocking      Wait for completion, monitor errors
   -p, --skip-build    Use last built image (skip docker build)
   -y, --skip-push     Use last pushed image (skip build + push)
+  -ft                 Run user cleanup (cmlanier) async during deploy
+  -pro [email]        Upgrade account to professional tier (default: cmlanier@civicinitiatives.com)
 
 Request Options (for local deployments):
   --request-endpoint <path>     Endpoint to call after health check
@@ -96,6 +98,14 @@ Examples:
   deploy proxies                # Both proxies to dev
   deploy proxies prod           # Both proxies to prod
 
+  # User cleanup (runs async during build)
+  deploy -ft                    # Cleanup + dev deploy
+  deploy -ft prod               # Cleanup + prod deploy
+
+  # Subscription management
+  deploy -pro                   # Upgrade cmlanier@civicinitiatives.com to professional
+  deploy -pro user@example.com  # Upgrade specific account to professional
+
   # Testing
   deploy local -b --google-chat-message "hello"
   deploy local -b --one-shot --google-chat-message "test"
@@ -128,12 +138,59 @@ if [[ ! -f "$DEPLOY_DIR/trigger-deploy.js" ]]; then
     exit 1
 fi
 
-# Parse service type from first argument
+# Upgrade account to professional tier
+upgrade_to_professional() {
+    local email="${1:-cmlanier@civicinitiatives.com}"
+    local domain="${email#*@}"
+
+    echo "Upgrading @$domain to professional tier..."
+
+    local sql="UPDATE partners
+SET subscription_tier = 'professional',
+    subscription_status = CASE
+        WHEN subscription_status IN ('pending', 'trial') THEN 'active'
+        ELSE subscription_status
+    END
+WHERE partner_email LIKE '%@$domain';"
+
+    db-query --env dev query --write "$sql"
+
+    echo "✓ Upgrade complete"
+
+    # Verify the update
+    local verify_sql="SELECT partner_id, partner_email, subscription_tier, subscription_status FROM partners WHERE partner_email LIKE '%@$domain';"
+    echo ""
+    echo "Verification:"
+    db-query --env dev query "$verify_sql"
+}
+
+# Parse service type and flags from arguments
 SERVICE=""
 ARGS=()
 FIRST_ARG_PROCESSED=false
+RUN_FT=false
+RUN_PRO=false
+PRO_EMAIL=""
 
 for arg in "$@"; do
+    # Intercept -ft flag (don't pass to deploy-runner)
+    if [[ "$arg" == "-ft" ]]; then
+        RUN_FT=true
+        continue
+    fi
+
+    # Intercept -pro flag and optional email argument
+    if [[ "$arg" == "-pro" ]]; then
+        RUN_PRO=true
+        continue
+    fi
+
+    # If previous arg was -pro and this looks like an email, capture it
+    if [[ "$RUN_PRO" == "true" && "$arg" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+        PRO_EMAIL="$arg"
+        continue
+    fi
+
     if [[ "$FIRST_ARG_PROCESSED" == "false" && ! "$arg" =~ ^- ]]; then
         case "$arg" in
             web|frontend)
@@ -169,6 +226,16 @@ done
 # Execute from the project directory
 cd "$PROJECT_DIR"
 
+# Handle -pro flag if set
+if [[ "$RUN_PRO" == "true" ]]; then
+    if [[ -n "$PRO_EMAIL" ]]; then
+        upgrade_to_professional "$PRO_EMAIL"
+    else
+        upgrade_to_professional
+    fi
+    exit 0
+fi
+
 # Determine environment from remaining args
 ENV="development"
 for arg in "${ARGS[@]}"; do
@@ -188,6 +255,37 @@ for arg in "${ARGS[@]}"; do
         --verify) VERIFY_MODE=true ;;
     esac
 done
+
+# Launch user cleanup in background if -ft flag was set
+FT_PID=""
+FT_LOG=""
+if [[ "$RUN_FT" == "true" ]]; then
+    # Map environment to short form for the new CLI
+    FT_ENV="dev"
+    [[ "$ENV" == "production" ]] && FT_ENV="prod"
+    FT_LOG="$PROJECT_DIR/.ft-cleanup.log"
+
+    echo "Starting user cleanup (async, env=$FT_ENV)..."
+    UV_NO_SYNC=1 uv run scripts/user_cleanup.py cmlanier@civicinitiatives.com --env "$FT_ENV" \
+        > "$FT_LOG" 2>&1 &
+    FT_PID=$!
+fi
+
+# Helper: wait for -ft cleanup and report result
+wait_for_ft() {
+    if [[ -n "$FT_PID" ]]; then
+        if wait "$FT_PID" 2>/dev/null; then
+            echo ""
+            echo "User cleanup completed:"
+            cat "$FT_LOG"
+        else
+            echo ""
+            echo "WARNING: User cleanup failed (exit $?):"
+            cat "$FT_LOG"
+        fi
+        rm -f "$FT_LOG"
+    fi
+}
 
 # Handle different service types
 case "$SERVICE" in
@@ -381,6 +479,14 @@ PY
         ;;
     *)
         # Default: backend deployment via trigger-deploy.js
-        exec node "$DEPLOY_DIR/trigger-deploy.js" "${ARGS[@]}"
+        if [[ -n "$FT_PID" ]]; then
+            # Can't exec — need to wait for cleanup after deploy finishes
+            node "$DEPLOY_DIR/trigger-deploy.js" "${ARGS[@]}"
+            DEPLOY_EXIT=$?
+            wait_for_ft
+            exit $DEPLOY_EXIT
+        else
+            exec node "$DEPLOY_DIR/trigger-deploy.js" "${ARGS[@]}"
+        fi
         ;;
 esac
