@@ -67,7 +67,6 @@ CRON_WORKER_LOG_PATH = OPENCLAW_WORKSPACE / "memory" / "cron_worker_log.md"
 SECURITY_LOG_PATH = OPENCLAW_WORKSPACE / "memory" / "security_log.md"
 CRON_RUNS_DIR = Path.home() / ".openclaw" / "cron" / "runs"
 REFRESH_INTERVAL = 2  # seconds
-TIMER_STATE_PATH = Path("/mnt/c/Users/colby/Documents/Obsidian/Token-ENV/Scripts/timer-state.json")
 
 
 # Resume copy feedback state
@@ -79,12 +78,12 @@ unstick_feedback: Optional[tuple[float, str]] = None  # (timestamp, message)
 # Restart feedback state
 restart_feedback: Optional[tuple[float, str]] = None  # (timestamp, message)
 
-# Timer/mode display cache
-timer_display_cache = {
-    "break_seconds": 0,
-    "mode": "silence",
+# Timer display cache (for when API is unreachable)
+_timer_cache = {
+    "break_secs": 0,
+    "backlog_secs": 0,
+    "mode": "work_silence",
     "work_mode": "clocked_in",
-    "last_fetch": 0
 }
 
 # Layout detection thresholds
@@ -116,6 +115,8 @@ deploy_metadata = {}
 deploy_previous_page = 0
 deploy_auto_switched = False
 DEPLOY_SCAN_DIR = Path.home() / "ProcAgentDir"
+TUI_SIGNAL_DIR = Path.home() / ".claude"
+TUI_SLOTS = ("desktop", "mobile")  # Two monitor slots
 console = Console()
 
 
@@ -186,6 +187,22 @@ def check_deploy_status() -> tuple[bool, Path | None, dict]:
     except Exception:
         pass
     return False, None, {}
+
+
+def check_tui_restart_signal(slot: str) -> dict | None:
+    """Check for a TUI restart signal file for the given slot."""
+    signal_file = TUI_SIGNAL_DIR / f"tui-restart-{slot}.signal"
+    try:
+        if signal_file.exists():
+            try:
+                metadata = json.loads(signal_file.read_text())
+            except Exception:
+                metadata = {"reason": "unknown"}
+            signal_file.unlink(missing_ok=True)
+            return metadata
+    except Exception:
+        pass
+    return None
 
 
 def check_api_health() -> tuple[bool, str | None]:
@@ -592,50 +609,45 @@ def get_tts_queue_status():
         return {"current": None, "queue": [], "queue_length": 0}
 
 
-def get_timer_state() -> dict:
-    """Read Obsidian timer-state.json for break availability."""
+def _read_timer() -> dict:
+    """Read live timer state from the in-memory timer via API.
+    Falls back to cached values if API is unreachable."""
+    global _timer_cache
     try:
-        if TIMER_STATE_PATH.exists():
-            with open(TIMER_STATE_PATH, 'r') as f:
-                return json.load(f)
+        req = urllib.request.Request(f"{API_URL}/api/timer")
+        with urllib.request.urlopen(req, timeout=1) as resp:
+            data = json.loads(resp.read().decode())
+        _timer_cache = {
+            "break_secs": round(data.get("accumulated_break_ms", 0) / 1000),
+            "backlog_secs": round(data.get("break_backlog_ms", 0) / 1000),
+            "mode": data.get("current_mode", "work_silence"),
+            "work_mode": data.get("work_mode", "clocked_in"),
+        }
     except Exception:
         pass
-    return {"breakAvailableSeconds": 0, "currentMode": "work_silence"}
-
-
-def get_desktop_mode() -> dict:
-    """Fetch current desktop/work mode from API."""
-    try:
-        req = urllib.request.Request(f"{API_URL}/api/work-mode")
-        with urllib.request.urlopen(req, timeout=1) as response:
-            return json.loads(response.read().decode())
-    except Exception:
-        return {"work_mode": "clocked_in", "current_timer_mode": "silence"}
+    return _timer_cache
 
 
 def format_break_time(seconds: int) -> str:
     """Format break time as HH:MM:SS or MM:SS."""
-    if seconds <= 0:
+    abs_secs = abs(seconds) if seconds else 0
+    if abs_secs == 0:
         return "00:00"
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-    secs = seconds % 60
+    hours = abs_secs // 3600
+    minutes = (abs_secs % 3600) // 60
+    secs = abs_secs % 60
     if hours > 0:
         return f"{hours}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
 
 
 def get_timer_header_text() -> Text:
-    """Generate timer/mode display for header."""
-    global timer_display_cache
-
-    # Fetch fresh data
-    timer_state = get_timer_state()
-    desktop_mode = get_desktop_mode()
-
-    break_secs = timer_state.get("breakAvailableSeconds", 0)
-    obsidian_mode = timer_state.get("currentMode", "work_silence")
-    work_mode = desktop_mode.get("work_mode", "clocked_in")
+    """Generate timer/mode display for header. Reads directly from in-memory timer via API."""
+    state = _read_timer()
+    break_secs = state["break_secs"]
+    backlog_secs = state["backlog_secs"]
+    obsidian_mode = state["mode"]
+    work_mode = state["work_mode"]
 
     # Mode icons
     mode_icons = {
@@ -650,15 +662,21 @@ def get_timer_header_text() -> Text:
     icon = mode_icons.get(obsidian_mode, "❓")
     mode_name = obsidian_mode.replace("work_", "").replace("_", " ").title()
 
-    # Break time color based on amount
-    if break_secs > 1800:  # > 30 min
-        break_color = "green"
-    elif break_secs > 300:  # > 5 min
-        break_color = "yellow"
+    # Break time color: green >1hr, yellow >30min, red >15min, purple ≤15min, magenta backlog
+    is_backlog = backlog_secs > 0
+    if is_backlog:
+        break_color = "magenta"
+        break_str = format_break_time(backlog_secs)
     else:
-        break_color = "red"
-
-    break_str = format_break_time(break_secs)
+        break_str = format_break_time(break_secs)
+        if break_secs > 3600:
+            break_color = "green"
+        elif break_secs > 1800:
+            break_color = "yellow"
+        elif break_secs > 900:
+            break_color = "red"
+        else:
+            break_color = "purple"
 
     # Work mode indicator
     if work_mode == "clocked_out":
@@ -674,6 +692,8 @@ def get_timer_header_text() -> Text:
     text.append(f"{mode_name}", style="bold white")
     text.append("  ", style="dim")
     text.append("⏱ ", style="dim")
+    if is_backlog:
+        text.append("BACKLOG ", style=f"bold {break_color}")
     text.append(break_str, style=f"bold {break_color}")
     if work_indicator:
         text.append(f"  {work_indicator}")
@@ -1270,6 +1290,9 @@ def create_events_panel(events: list) -> Panel:
         "tts_completed": ("blue", "v", "TTS done"),
         "notification_sent": ("magenta", "*", "notified"),
         "sound_played": ("yellow", "~", "sound"),
+        "phone_app_closed": ("blue", "📱", "closed"),
+        "phone_distraction_allowed": ("yellow", "📱", "allowed"),
+        "phone_distraction_blocked": ("red", "📱", "blocked"),
     }
 
     for event in events:
@@ -1300,6 +1323,12 @@ def create_events_panel(events: list) -> Panel:
                 msg = f"[{color}]{icon}[/{color}] [bold]{display_name}[/bold]: [{color}]{action}[/{color}]"
                 if voice and event_type == "tts_playing":
                     msg += f" [dim]({voice})[/dim]"
+            elif event_type in ("phone_app_closed", "phone_distraction_allowed", "phone_distraction_blocked"):
+                app_display = details.get("display_name") or details.get("app", "?")
+                reason = details.get("reason", "")
+                msg = f"[{color}]{icon}[/{color}] [bold]{app_display}[/bold]: [{color}]{action}[/{color}]"
+                if reason and event_type != "phone_app_closed":
+                    msg += f" [dim]({reason})[/dim]"
             else:
                 msg = f"[{color}]{icon}[/{color}] [bold]{display_name}[/bold]: [{color}]{action}[/{color}]"
 
@@ -1326,6 +1355,9 @@ def create_mobile_events_panel(events: list) -> Panel:
         "instance_renamed": "[yellow]~[/yellow]",
         "tts_playing": "[cyan]>[/cyan]",
         "notification_sent": "[magenta]*[/magenta]",
+        "phone_app_closed": "[blue]📱[/blue]",
+        "phone_distraction_allowed": "[yellow]📱[/yellow]",
+        "phone_distraction_blocked": "[red]📱[/red]",
     }
 
     for event in events[:4]:
@@ -1334,10 +1366,15 @@ def create_mobile_events_panel(events: list) -> Panel:
             time_str = created.split(" ")[1][:5] if " " in created else "??:??"
 
             event_type = event.get("event_type", "unknown")
+            details = event.get("details", {}) if isinstance(event.get("details"), dict) else {}
             icon = EVENT_ICONS.get(event_type, "[dim].[/dim]")
 
-            # Get human-readable name using the helper function
-            display_name = format_event_instance_name(event, max_len=12)
+            # Phone events: show app display name instead of instance name
+            if event_type in ("phone_app_closed", "phone_distraction_allowed", "phone_distraction_blocked"):
+                display_name = details.get("display_name") or details.get("app", "?")
+            else:
+                # Get human-readable name using the helper function
+                display_name = format_event_instance_name(event, max_len=12)
 
             lines.append(f"[dim]{time_str}[/dim] {icon} {display_name}")
         except Exception:
@@ -2067,7 +2104,35 @@ def create_mobile_status_bar(instances: list, selected_idx: int) -> Text:
     table_tag = "C" if table_mode == "cron" else "I"
 
     text = Text()
-    text.append(f"[{table_tag}] ", style="yellow" if table_mode == "cron" else "cyan")
+
+    # Timer state (condensed)
+    state = _read_timer()
+    mode_icons = {
+        "work_silence": "🔇", "work_music": "🎵", "work_video": "📺",
+        "work_gaming": "🎮", "gym": "🏋️",
+    }
+    icon = mode_icons.get(state["mode"], "❓")
+    is_backlog = state["backlog_secs"] > 0
+    if is_backlog:
+        break_str = format_break_time(state["backlog_secs"])
+        text.append(f"{icon} ", style="bold")
+        text.append("BL ", style="bold magenta")
+        text.append(break_str, style="bold magenta")
+    else:
+        break_secs = state["break_secs"]
+        break_str = format_break_time(break_secs)
+        if break_secs > 3600:
+            break_color = "green"
+        elif break_secs > 1800:
+            break_color = "yellow"
+        elif break_secs > 900:
+            break_color = "red"
+        else:
+            break_color = "purple"
+        text.append(f"{icon} ", style="bold")
+        text.append(break_str, style=f"bold {break_color}")
+    text.append("  ", style="dim")
+
     text.append(f"{active_count}/{total_count} ", style="white")
     if active_count > 0:
         text.append("*", style="green")
@@ -2434,6 +2499,18 @@ def main():
 
     console.print("[dim]Controls: jk=nav, gG=top/btm, []=table, h/l=page, Enter=open, r=rename, f=filter, s=stop, d=del, R=restart, q=quit[/dim]\n")
 
+    # Record startup time for smart restart detection; clean stale signals
+    tui_slot = "mobile" if layout_mode == "mobile" else "desktop"
+    try:
+        (TUI_SIGNAL_DIR / f"tui-started-{tui_slot}.timestamp").write_text(str(int(time.time())))
+        signal_file = TUI_SIGNAL_DIR / f"tui-restart-{tui_slot}.signal"
+        if signal_file.exists():
+            age = time.time() - signal_file.stat().st_mtime
+            if age > 30:
+                signal_file.unlink(missing_ok=True)
+    except Exception:
+        pass
+
     quit_flag = threading.Event()
     input_mode = threading.Event()
     update_flag = threading.Event()
@@ -2603,6 +2680,7 @@ def main():
     try:
         with Live(get_dashboard(_get_displayed(), selected_index), console=console, refresh_per_second=10, screen=True) as live:
             last_refresh = time.time()
+            last_timer_refresh = last_refresh
 
             while not quit_flag.is_set():
                 actions_to_process = []
@@ -3060,7 +3138,22 @@ def main():
 
                 update_flag.clear()
 
-                if time.time() - last_refresh >= REFRESH_INTERVAL:
+                now_t = time.time()
+
+                # Full refresh every REFRESH_INTERVAL: re-fetch instances, health, deploy
+                if now_t - last_refresh >= REFRESH_INTERVAL:
+                    # Check for remote TUI restart signal
+                    tui_signal = check_tui_restart_signal(tui_slot)
+                    if tui_signal:
+                        live.stop()
+                        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, original_terminal_settings)
+                        reason = tui_signal.get("reason", "unknown")
+                        console.print(f"\n[cyan bold]Remote restart signal received ({reason}). Re-launching TUI...[/cyan bold]")
+                        time.sleep(0.5)
+                        quit_flag.set()
+                        listener_thread.join(timeout=0.5)
+                        os.execv(sys.executable, [sys.executable] + sys.argv)
+
                     old_count = len(instances_cache)
                     instances_cache = get_instances()
                     api_healthy, api_error_message = check_api_health()
@@ -3098,7 +3191,13 @@ def main():
                     deploy_active = now_active
 
                     _refresh(live)
-                    last_refresh = time.time()
+                    last_refresh = now_t
+                    last_timer_refresh = now_t
+
+                # Lightweight timer-only refresh every 1s (re-renders with predicted timer)
+                elif now_t - last_timer_refresh >= 1.0:
+                    _refresh(live)
+                    last_timer_refresh = now_t
 
                 update_flag.wait(timeout=0.02)
 

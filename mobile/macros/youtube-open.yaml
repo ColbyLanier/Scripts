@@ -1,6 +1,8 @@
-# YouTube Open Tracker with Fallback
+# YouTube Open Tracker with Fallback and Reconnection
 # Reports to /phone when YouTube is opened
-# If server unreachable, triggers local enforcement
+# Clears background flag, sends open event
+# If server unreachable: triggers local enforcement
+# If server reconnected: disables local fallback
 
 name: "YouTube Open"
 category: "Telemetry"
@@ -10,7 +12,12 @@ enabled: true
 variables:
   - name: response_code
     type: integer
-    value: 0
+    value: 200
+
+global_variables:
+  - name: yt_bg
+    type: boolean
+    value: false
 
 triggers:
   - type: app_launched
@@ -19,6 +26,14 @@ triggers:
     launched: true
 
 actions:
+  # Clear background flag — YouTube is now in foreground
+  - type: set_variable
+    name: yt_bg
+    var_type: boolean
+    value: false
+    local: false
+
+  # Report open to server
   - type: http_request
     url: "http://100.95.109.23:7777/phone"
     method: POST
@@ -38,12 +53,20 @@ actions:
         value: 200
         local_var: true
 
-  # Force run local management for this app
-  - type: run_macro
-    macro_name: "Youtube management"
-
-  # Enable all local fallbacks for future events
   - type: run_macro
     macro_name: "Enable Local Fallback"
+
+  # Else if server just came back (Connection global matches response_code)
+  - type: else_if
+    conditions:
+      - type: variable
+        variable: "Connection"
+        var_type: boolean
+        comparison: equals
+        value: false
+        local_var: false
+
+  - type: run_macro
+    macro_name: "Disable Local Fallback"
 
   - type: end_if

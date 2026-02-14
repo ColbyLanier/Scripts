@@ -8,12 +8,18 @@
 
 # Extra keys toolbar (always visible) - 7x2 with popups
 # Notes:
-#   - SHIFT key explicit (mobile keyboard shift doesn't send proper shift input)
-#   - HOME/END on hold for | and PASTE (arrow key hold sends repeats, not useful)
-#   - && on ~ key (double-tap tilde popup for actual ~)
+#   - Top row: ESC + modifiers + HOME/UP/END nav cluster
+#   - Bottom row: | + common chars (&&, /, -) + LEFT/DOWN/RIGHT arrows
+#   - Hold ESC → Shift+Tab x3 (reverse-tab through completions)
+#   - Hold SHIFT → Shift+Tab
+#   - Hold ALT → TAB
+#   - Hold CTRL → Ctrl+C x2 (double interrupt, may coalesce to one)
+#   - Hold HOME → DRAWER, hold END → PASTE
+#   - Hold UP → types 'claude' + Enter, hold DOWN → types 'exit' + Enter
+#   - Hold | → types 'ls' + Enter
 extra-keys = [ \
-  ['ESC', {key: '&&', popup: '~'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, {key: '|', popup: 'HOME'}, 'UP', {key: 'PASTE', popup: 'END'}], \
-  ['TAB', 'SHIFT', 'CTRL', 'ALT', 'LEFT', 'DOWN', 'RIGHT'] \
+  [{key: 'ESC'}, {key: 'SHIFT', popup: {macro: "\u001b[Z", display: '⇧Tab'}}, {key: 'ALT', popup: 'TAB'}, {key: 'CTRL', popup: {macro: "\u0003", display: '^C'}}, {key: 'HOME', popup: 'DRAWER'}, {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'END', popup: 'PASTE'}], \
+  [{key: '|', popup: {macro: "ls\n", display: 'ls↩'}}, {key: '&&', popup: '~'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, 'LEFT', {key: 'DOWN', popup: {macro: "exit\n", display: 'exit↩'}}, 'RIGHT'] \
 ]
 
 # Better text handling

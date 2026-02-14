@@ -226,6 +226,103 @@ def build_wifi_state_trigger(config):
     }
 
 
+@trigger_builder("music_playing")
+def build_music_playing_trigger(config):
+    """Music Playing trigger - when music starts or stops."""
+    started = config.get("started", True)
+    return {
+        "option": 0 if started else 1,  # 0 = started, 1 = stopped
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "MusicPlayingTrigger",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@trigger_builder("regular_interval")
+def build_regular_interval_trigger(config):
+    """Regular Interval trigger - fires at fixed time intervals."""
+    # Convert to seconds
+    unit = config.get("unit", "seconds")
+    interval = config.get("interval", 600)
+    if unit == "minutes":
+        seconds = interval * 60
+    elif unit == "hours":
+        seconds = interval * 3600
+    else:
+        seconds = interval
+
+    return {
+        "m_ignoreReferenceStartTime": config.get("ignore_reference", True),
+        "m_minutes": 0,
+        "m_seconds": seconds,
+        "m_startHour": config.get("start_hour", 0),
+        "m_startMinute": config.get("start_minute", 0),
+        "m_useAlarm": config.get("use_alarm", False),
+        "m_useIntervalVariable": False,
+        "m_useReferenceTimeVariable": False,
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "RegularIntervalTrigger",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@trigger_builder("swipe")
+def build_swipe_trigger(config):
+    """Swipe trigger - screen swipe gesture detection."""
+    area_map = {"top_right": 0, "top_left": 1, "bottom_right": 2, "bottom_left": 3}
+    motion_map = {"across": 0, "down": 1, "up": 2}
+    return {
+        "m_cleared": config.get("cleared", True),
+        "m_swipeMotion": motion_map.get(config.get("motion", "across"), 0),
+        "m_swipeStartArea": area_map.get(config.get("area", "top_right"), 0),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "SwipeTrigger",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@trigger_builder("media_button")
+def build_media_button_trigger(config):
+    """Media Button Pressed trigger."""
+    return {
+        "m_cancelPress": config.get("cancel_press", True),
+        "m_option": config.get("option", "Single Press"),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "MediaButtonPressedTrigger",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@trigger_builder("bluetooth")
+def build_bluetooth_trigger(config):
+    """Bluetooth device trigger - device connect/disconnect."""
+    return {
+        "m_anyDevice": config.get("any_device", False),
+        "m_btState": config.get("state", 2),  # 0=off, 1=on, 2=connected, 3=disconnected
+        "m_deviceAddress": config.get("address", ""),
+        "m_deviceAlias": config.get("alias", config.get("device", "")),
+        "m_deviceName": config.get("device", ""),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "BluetoothTrigger",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
 # =============================================================================
 # ACTION BUILDERS
 # =============================================================================
@@ -433,10 +530,53 @@ def build_launch_app_action(config):
 def build_set_variable_action(config):
     """Set Variable action."""
     var_type_map = {"boolean": 0, "integer": 1, "string": 2, "decimal": 3}
+    vtype = var_type_map.get(config.get("var_type", config.get("type", "string")), 2)
+    is_local = config.get("local", True)
+    value = config.get("value", "")
+
     return {
-        "m_variableName": config.get("name", ""),
-        "m_value": config.get("value", ""),
-        "m_variableType": var_type_map.get(config.get("type", "string"), 2),
+        "dictionaryKeys": [],
+        "dictionaryOrArrayType": -1,
+        "existingManualKeyType": 0,
+        "m_booleanInvert": False,
+        "m_darkMode": -1,
+        "m_doubleRandomMax": 0.0,
+        "m_doubleRandomMin": 0.0,
+        "m_falseLabel": "False",
+        "m_intExpression": False,
+        "m_intRandom": False,
+        "m_intRandomMax": 0,
+        "m_intRandomMin": 0,
+        "m_intValueDecrement": False,
+        "m_intValueIncrement": False,
+        "m_newBooleanValue": bool(value) if vtype == 0 else False,
+        "m_newDoubleValue": float(value) if vtype == 3 else 0.0,
+        "m_newIntValue": int(value) if vtype == 1 else 0,
+        "m_trueLabel": "True",
+        "m_userPrompt": False,
+        "m_userPromptEmptyAtStart": False,
+        "m_userPromptPassword": False,
+        "m_userPromptShowCancel": True,
+        "m_userPromptStopAfterCancel": True,
+        "m_variable": {
+            "dictionary": {
+                "entries": [],
+                "isArray": False,
+                "variableType": 4,
+                "type": "Dictionary"
+            },
+            "isActionBlockWorkingVar": not is_local,
+            "isLocalVar": is_local,
+            "isSecure": False,
+            "m_booleanValue": False,
+            "m_decimalValue": 0.0,
+            "m_intValue": 0,
+            "m_name": config.get("name", ""),
+            "m_stringValue": "",
+            "m_type": vtype,
+            "supportsInput": False,
+            "supportsOutput": True
+        },
         "disableLogging": config.get("disable_logging", False),
         "m_SIGUID": generate_guid(),
         "m_classType": "SetVariableAction",
@@ -501,6 +641,197 @@ def build_shell_action(config):
         "disableLogging": config.get("disable_logging", False),
         "m_SIGUID": generate_guid(),
         "m_classType": "ShellCommandAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+def _build_termux_tasker_bundle(executable, arguments=None, workdir=None, stdin=None,
+                                 terminal=False, wait_for_result=True, version_code=1002):
+    """Generate Termux:Tasker serialized Java bundle as list of signed bytes.
+
+    This constructs the mSerializedBundle for LocalePluginAction, matching
+    the exact format MacroDroid expects for Termux:Tasker plugin actions.
+    """
+    import struct as _struct
+    import io as _io
+
+    stream = _io.BytesIO()
+    handles = []
+
+    def w_short(v): stream.write(_struct.pack('>H', v))
+    def w_int(v): stream.write(_struct.pack('>I', v))
+    def w_byte(v): stream.write(bytes([v]))
+    def w_utf(s):
+        enc = s.encode('utf-8')
+        w_short(len(enc))
+        stream.write(enc)
+    def w_string(s):
+        w_byte(0x74)  # TC_STRING
+        w_utf(s)
+        handles.append(s)
+    def w_null():
+        w_byte(0x70)  # TC_NULL
+
+    def w_boolean(value):
+        bool_idx = next((i for i, h in enumerate(handles) if h == '_cls_Boolean'), None)
+        w_byte(0x73)  # TC_OBJECT
+        if bool_idx is None:
+            # Write Boolean class descriptor
+            w_byte(0x72)  # TC_CLASSDESC
+            w_utf("java.lang.Boolean")
+            stream.write(_struct.pack('>q', -3665804199014368530))
+            handles.append('_cls_Boolean')
+            w_byte(0x02); w_short(1)
+            w_byte(ord('Z')); w_utf("value")
+            w_byte(0x78); w_null()  # TC_ENDBLOCKDATA + TC_NULL
+        else:
+            w_byte(0x71)  # TC_REFERENCE
+            w_int(0x7e0000 + bool_idx)
+        w_byte(1 if value else 0)
+        handles.append(('_bool', value))
+
+    def w_integer(value):
+        int_idx = next((i for i, h in enumerate(handles) if h == '_cls_Integer'), None)
+        w_byte(0x73)  # TC_OBJECT
+        if int_idx is None:
+            w_byte(0x72)  # TC_CLASSDESC
+            w_utf("java.lang.Integer")
+            stream.write(_struct.pack('>q', 1360826667806852920))
+            handles.append('_cls_Integer')
+            w_byte(0x02); w_short(1)
+            w_byte(ord('I')); w_utf("value")
+            w_byte(0x78)  # TC_ENDBLOCKDATA
+            # Superclass: java.lang.Number
+            w_byte(0x72)  # TC_CLASSDESC
+            w_utf("java.lang.Number")
+            stream.write(_struct.pack('>q', -8742448824652078965))
+            handles.append('_cls_Number')
+            w_byte(0x02); w_short(0)
+            w_byte(0x78); w_null()  # TC_ENDBLOCKDATA + TC_NULL
+        else:
+            w_byte(0x71)  # TC_REFERENCE
+            w_int(0x7e0000 + int_idx)
+        stream.write(_struct.pack('>i', value))
+        handles.append(('_int', value))
+
+    # Entries in fixed order (matching Termux:Tasker convention)
+    entries = [
+        ("com.termux.execute.arguments", arguments),
+        ("com.termux.tasker.extra.BACKGROUND_CUSTOM_LOG_LEVEL", None),
+        ("com.termux.tasker.extra.EXECUTABLE", executable),
+        ("com.termux.tasker.extra.SESSION_ACTION", None),
+        ("com.termux.tasker.extra.STDIN", stdin),
+        ("com.termux.tasker.extra.TERMINAL", terminal),
+        ("com.termux.tasker.extra.VERSION_CODE", version_code),
+        ("com.termux.tasker.extra.WAIT_FOR_RESULT", wait_for_result),
+        ("com.termux.tasker.extra.WORKDIR", workdir),
+        ("net.dinglisch.android.tasker.extras.VARIABLE_REPLACE_KEYS",
+         "com.termux.tasker.extra.EXECUTABLE com.termux.execute.arguments "
+         "com.termux.tasker.extra.WORKDIR com.termux.tasker.extra.STDIN "
+         "com.termux.tasker.extra.SESSION_ACTION "
+         "com.termux.tasker.extra.BACKGROUND_CUSTOM_LOG_LEVEL"),
+    ]
+
+    # Stream header
+    w_short(0xACED); w_short(0x0005)
+    # Bundle header
+    w_byte(0x77); w_byte(12)
+    w_int(1); w_int(1); w_int(0)
+
+    for i, (key, value) in enumerate(entries):
+        if i > 0:
+            # Entry wrapper (value_type=1 for data entries, 0 for VARIABLE_REPLACE_KEYS)
+            w_byte(0x77); w_byte(8)
+            w_int(1)
+            w_int(0)
+        w_string(key)
+        if value is None:
+            w_null()
+        elif isinstance(value, bool):
+            w_boolean(value)
+        elif isinstance(value, int):
+            w_integer(value)
+        elif isinstance(value, str):
+            w_string(value)
+
+    # Trailer
+    w_byte(0x77); w_byte(4); w_int(0)
+
+    return [b if b < 128 else b - 256 for b in stream.getvalue()]
+
+
+@action_builder("termux_tasker")
+def build_termux_tasker_action(config):
+    """Termux:Tasker plugin action - run scripts in Termux environment."""
+    executable = config.get("executable", "")
+    arguments = config.get("arguments", None)
+    workdir = config.get("workdir", None)
+    stdin = config.get("stdin", None)
+    terminal = config.get("terminal", False)
+    wait_for_result = config.get("wait_for_result", True)
+    version_code = config.get("version_code", 1002)
+
+    bundle = _build_termux_tasker_bundle(
+        executable=executable,
+        arguments=arguments,
+        workdir=workdir,
+        stdin=stdin,
+        terminal=terminal,
+        wait_for_result=wait_for_result,
+        version_code=version_code,
+    )
+
+    # Build blurb (human-readable summary shown in MacroDroid UI)
+    parts = [executable]
+    if arguments:
+        parts[0] += f" {arguments}"
+    parts.append("")
+    parts.append(f"Working Directory {'✓' if workdir else '✕'}")
+    parts.append(f"Stdin {'✓' if stdin else '✕'}")
+    parts.append("Custom Log Level null")
+    parts.append(f"Terminal Session {'✓' if terminal else '✕'}")
+    parts.append(f"Wait For Result {'✓' if wait_for_result else '✕'}")
+    blurb = "\n".join(parts)
+
+    # Build variable map for output capture
+    variable_map = {}
+    output_var = config.get("output_var", "")
+    if output_var:
+        variable_map["%stdout"] = output_var
+        variable_map["%stderr"] = config.get("stderr_var", output_var)
+
+    return {
+        "arrayHandlingOption": 1,
+        "blockActions": False,
+        "m_plugin": {
+            "mActivityClassName": "com.termux.tasker.EditConfigurationActivity",
+            "mConfiguration": {
+                "mAlternatives": [],
+                "mIsBackwardsCompatibilityEnabled": False,
+                "mIsBlacklisted": False,
+                "mIsBuggy": False,
+                "mIsDisruptsConnectivity": False,
+                "mIsDrainsBattery": False,
+                "mIsRequiresConnectivity": False
+            },
+            "mPackageName": "com.termux.tasker",
+            "mReceiverClassName": "com.termux.tasker.FireReceiver",
+            "mRegistryName": "com.termux.tasker:com.termux.tasker.EditConfigurationActivity",
+            "mType": "SETTING",
+            "mVersionCode": version_code
+        },
+        "m_pluginInstanceData": {
+            "mBlurb": blurb,
+            "mRegistryName": "com.termux.tasker:com.termux.tasker.EditConfigurationActivity",
+            "mSerializedBundle": bundle,
+            "mType": "SETTING"
+        },
+        "m_variableMap": variable_map,
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "LocalePluginAction",
         "m_constraintList": [],
         "m_isDisabled": config.get("disabled", False),
         "m_isOrCondition": False
@@ -777,6 +1108,116 @@ def build_end_if_action(config):
     }
 
 
+@action_builder("else_if")
+def build_else_if_action(config):
+    """Else If Condition action - alternative conditional branch."""
+    constraints = []
+    for cond in config.get("conditions", []):
+        constraint = build_if_constraint(cond)
+        if constraint:
+            constraints.append(constraint)
+
+    return {
+        "dontLogIfConditionIsFalse": config.get("dont_log_false", False),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "ElseIfConditionAction",
+        "m_constraintList": constraints,
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": config.get("or_conditions", False)
+    }
+
+
+@action_builder("wait_until")
+def build_wait_until_action(config):
+    """Wait Until Trigger action - pauses until a trigger condition is met."""
+    # Build embedded triggers from the triggers list
+    triggers_to_wait = []
+    for trigger_spec in config.get("triggers", []):
+        trigger_type = trigger_spec.get("type")
+        if trigger_type in TRIGGER_BUILDERS:
+            triggers_to_wait.append(TRIGGER_BUILDERS[trigger_type](trigger_spec))
+
+    timeout_secs = config.get("timeout", 0)
+
+    return {
+        "continueOnTimeout": config.get("continue_on_timeout", False),
+        "timeoutEnabled": timeout_secs > 0,
+        "timeoutSeconds": timeout_secs,
+        "triggersToWaitFor": triggers_to_wait,
+        "useAlarm": config.get("use_alarm", False),
+        "useVariableTimeout": False,
+        "variableTimeoutUnit": 0,
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "WaitUntilTriggerAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@action_builder("export_macros")
+def build_export_macros_action(config):
+    """Export Macros action - exports all macros to .mdr file."""
+    return {
+        "encryptOutput": config.get("encrypt", False),
+        "encryptionPassword": config.get("password", ""),
+        "m_displayPath": config.get("display_path", "home/macros"),
+        "m_fileName": config.get("filename", "EXPORT"),
+        "m_filePath": config.get("file_path", "home/macros"),
+        "m_pathUri": config.get("path_uri",
+            "content://com.termux.documents/tree/%2Fdata%2Fdata%2Fcom.termux%2Ffiles%2Fhome%2Fmacros"),
+        "needsFileReconfiguration": False,
+        "option": 0,
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "ExportMacrosAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@action_builder("locale_plugin")
+def build_locale_plugin_action(config):
+    """Locale Plugin action - generic plugin action (use termux_tasker for Termux)."""
+    return {
+        "arrayHandlingOption": 1,
+        "blockActions": False,
+        "m_plugin": {
+            "mActivityClassName": config.get("activity_class", ""),
+            "mConfiguration": {
+                "mAlternatives": [],
+                "mIsBackwardsCompatibilityEnabled": False,
+                "mIsBlacklisted": False,
+                "mIsBuggy": False,
+                "mIsDisruptsConnectivity": False,
+                "mIsDrainsBattery": False,
+                "mIsRequiresConnectivity": False
+            },
+            "mPackageName": config.get("package", ""),
+            "mReceiverClassName": config.get("receiver_class", ""),
+            "mRegistryName": config.get("registry_name", ""),
+            "mType": "SETTING",
+            "mVersionCode": config.get("version_code", 1)
+        },
+        "m_pluginInstanceData": {
+            "mBlurb": config.get("blurb", ""),
+            "mRegistryName": config.get("registry_name", ""),
+            "mSerializedBundle": config.get("serialized_bundle", []),
+            "mType": "SETTING"
+        },
+        "m_variableMap": config.get("variable_map", {}),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "LocalePluginAction",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
 # =============================================================================
 # CONSTRAINT BUILDERS
 # =============================================================================
@@ -872,6 +1313,57 @@ def build_battery_constraint(config):
     }
 
 
+@constraint_builder("variable")
+def build_macro_variable_constraint(config):
+    """MacroDroid variable constraint - check variable value."""
+    return build_variable_constraint(config)
+
+
+@constraint_builder("bluetooth")
+def build_bluetooth_constraint(config):
+    """Bluetooth constraint - check device connection state."""
+    return {
+        "m_anyDevice": config.get("any_device", False),
+        "m_btState": config.get("state", 2),  # 0=off, 1=on, 2=connected, 3=disconnected
+        "m_deviceAlias": config.get("alias", config.get("device", "")),
+        "m_deviceName": config.get("device", ""),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "BluetoothConstraint",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@constraint_builder("device_locked")
+def build_device_locked_constraint(config):
+    """Device locked constraint."""
+    return {
+        "m_locked": config.get("locked", True),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "DeviceLockedConstraint",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
+@constraint_builder("music_active")
+def build_music_active_constraint(config):
+    """Music active constraint - check if music is playing."""
+    return {
+        "m_musicActive": config.get("playing", True),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "MusicActiveConstraint",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
 # =============================================================================
 # VARIABLE BUILDER
 # =============================================================================
@@ -898,6 +1390,32 @@ def build_local_variable(config):
         "m_stringValue": str(config.get("value", "")) if vtype == 2 else "",
         "m_type": vtype,
         "supportsInput": config.get("input", False),
+        "supportsOutput": config.get("output", True)
+    }
+
+
+def build_global_variable(config):
+    """Build a global variable definition for the macro export."""
+    var_type_map = {"boolean": 0, "integer": 1, "string": 2, "decimal": 3, "dictionary": 4}
+    vtype = var_type_map.get(config.get("type", "string"), 2)
+
+    return {
+        "dictionary": {
+            "entries": [],
+            "isArray": False,
+            "variableType": 4,
+            "type": "Dictionary"
+        },
+        "isActionBlockWorkingVar": False,
+        "isLocalVar": False,
+        "isSecure": config.get("secure", False),
+        "m_booleanValue": config.get("value", False) if vtype == 0 else False,
+        "m_decimalValue": float(config.get("value", 0.0)) if vtype == 3 else 0.0,
+        "m_intValue": int(config.get("value", 0)) if vtype == 1 else 0,
+        "m_name": config.get("name", ""),
+        "m_stringValue": str(config.get("value", "")) if vtype == 2 else "",
+        "m_type": vtype,
+        "supportsInput": config.get("input", True),
         "supportsOutput": config.get("output", True)
     }
 
@@ -942,6 +1460,11 @@ def build_macro(spec):
     for var_spec in spec.get("variables", []):
         local_vars.append(build_local_variable(var_spec))
 
+    # Build global variables
+    global_vars = []
+    for var_spec in spec.get("global_variables", []):
+        global_vars.append(build_global_variable(var_spec))
+
     macro = {
         "breakpoints": [],
         "disabledTimestamp": 0,
@@ -968,7 +1491,7 @@ def build_macro(spec):
     }
 
     return {
-        "globalVariables": [],
+        "globalVariables": global_vars,
         "macro": macro,
         "macroExportVersion": 1
     }

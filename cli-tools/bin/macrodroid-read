@@ -99,6 +99,7 @@ TRIGGER_NAMES = {
     "ApplicationLaunchedTrigger": "App Launched",
     "TimerTrigger": "Timer",
     "DeviceBootTrigger": "Device Boot",
+    "BootTrigger": "Device Boot",
     "BatteryLevelTrigger": "Battery Level",
     "NotificationTrigger": "Notification",
     "ShakeDeviceTrigger": "Shake",
@@ -109,6 +110,7 @@ TRIGGER_NAMES = {
     "PowerButtonTrigger": "Power Button",
     "HeadphonesPluggedTrigger": "Headphones",
     "BluetoothDeviceTrigger": "Bluetooth",
+    "BluetoothTrigger": "Bluetooth",
     "SmsTrigger": "SMS",
     "CallTrigger": "Call",
     "LocationTrigger": "Location",
@@ -118,6 +120,9 @@ TRIGGER_NAMES = {
     "ShortcutTrigger": "Shortcut",
     "CalendarTrigger": "Calendar",
     "ExternalEventApiTrigger": "External API",
+    "MusicPlayingTrigger": "Music Playing",
+    "RegularIntervalTrigger": "Regular Interval",
+    "MediaButtonPressedTrigger": "Media Button",
 }
 
 ACTION_NAMES = {
@@ -135,9 +140,11 @@ ACTION_NAMES = {
     "PauseAction": "Wait",
     "ShellCommandAction": "Shell",
     "ForceRunMacroAction": "Run Macro",
+    "ForceMacroRunAction": "Run Macro",
     "DisableAppAction": "Enable/Disable App",
     "ControlMediaAction": "Media Control",
-    "IfConditionAction": "If Condition",
+    "IfConditionAction": "If",
+    "ElseIfConditionAction": "Else If",
     "ElseAction": "Else",
     "EndIfAction": "End If",
     "LoopAction": "Loop",
@@ -153,6 +160,22 @@ ACTION_NAMES = {
     "SetBluetoothAction": "Bluetooth",
     "SendSmsAction": "Send SMS",
     "ShareLocationAction": "Share Location",
+    "ExportMacrosAction": "Export Macros",
+    "LocalePluginAction": "Plugin",
+    "SetMacroEnabledAction": "Enable/Disable Macro",
+}
+
+CONSTRAINT_NAMES = {
+    "MacroDroidVariableConstraint": "Variable",
+    "GeofenceConstraint": "Geofence",
+    "DayOfWeekConstraint": "Day of Week",
+    "TimeOfDayConstraint": "Time of Day",
+    "WifiConstraint": "WiFi",
+    "BatteryLevelConstraint": "Battery",
+    "BluetoothConstraint": "Bluetooth",
+    "DeviceLockedConstraint": "Device Locked",
+    "MusicActiveConstraint": "Music Active",
+    "TriggerThatInvokedConstraint": "Trigger That Invoked",
 }
 
 
@@ -190,9 +213,29 @@ def get_trigger_details(trigger):
         details["sunrise"] = trigger.get("m_sunrise", True)
         details["offset_mins"] = trigger.get("m_offsetMinutes", 0)
     elif class_type == "SwipeTrigger":
-        directions = ["Up", "Down", "Left", "Right"]
-        details["direction"] = directions[trigger.get("m_swipeDirection", 0)] if trigger.get("m_swipeDirection", 0) < 4 else "Unknown"
-        details["screen_state"] = trigger.get("m_screenState", 0)
+        areas = ["Top-Right", "Top-Left", "Bottom-Right", "Bottom-Left"]
+        motions = ["Across", "Down", "Up"]
+        area = trigger.get("m_swipeStartArea", 0)
+        motion = trigger.get("m_swipeMotion", 0)
+        details["area"] = areas[area] if area < len(areas) else f"area={area}"
+        details["motion"] = motions[motion] if motion < len(motions) else f"motion={motion}"
+    elif class_type == "MusicPlayingTrigger":
+        option = trigger.get("option", 0)
+        details["state"] = "started" if option == 0 else "stopped"
+    elif class_type == "RegularIntervalTrigger":
+        secs = trigger.get("m_seconds", 0)
+        mins = trigger.get("m_minutes", 0)
+        total = secs + mins * 60
+        if total >= 60:
+            details["interval"] = f"{total // 60}m"
+        else:
+            details["interval"] = f"{total}s"
+    elif class_type == "MediaButtonPressedTrigger":
+        details["option"] = trigger.get("m_option", "")
+    elif class_type in ("BluetoothTrigger", "BluetoothDeviceTrigger"):
+        details["device"] = trigger.get("m_deviceName", trigger.get("m_deviceAlias", ""))
+        states = {0: "off", 1: "on", 2: "connected", 3: "disconnected"}
+        details["state"] = states.get(trigger.get("m_btState", 0), "")
 
     return details
 
@@ -210,32 +253,146 @@ def get_action_details(action):
         details["url"] = config.get("urlToOpen", "")[:60]
         methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"]
         details["method"] = methods[config.get("requestType", 0)]
+        body = config.get("contentBodyText", "")
+        if body:
+            details["body"] = body[:50]
     elif class_type == "HttpServerResponseAction":
         details["code"] = action.get("responseCode", "")
-        details["text"] = action.get("text", "")[:30]
+        details["text"] = action.get("text", "")[:50]
     elif class_type == "SpeakTextAction":
         details["text"] = action.get("m_textToSpeak", "")[:50]
     elif class_type == "LaunchApplicationAction":
         details["app"] = action.get("m_appName", "")
     elif class_type == "LaunchActivityAction":
-        details["app"] = action.get("m_appName", "")
+        details["app"] = action.get("m_applicationName", action.get("m_appName", ""))
     elif class_type == "DisableAppAction":
         details["apps"] = action.get("m_applicationNameList", [])
         details["disable"] = action.get("m_option", 0) == 1
     elif class_type == "ControlMediaAction":
-        controls = ["Play/Pause", "Next", "Previous", "Stop", "Play", "Pause"]
-        opt = action.get("m_option", 0)
-        if isinstance(opt, int) and opt < len(controls):
-            details["action"] = controls[opt]
+        opt = action.get("m_option", "")
+        if isinstance(opt, str):
+            details["action"] = opt
         else:
-            details["action"] = str(opt)
+            controls = ["Play/Pause", "Next", "Previous", "Stop", "Play", "Pause"]
+            details["action"] = controls[opt] if opt < len(controls) else str(opt)
+    elif class_type in ("ForceMacroRunAction", "ForceRunMacroAction"):
+        details["macro"] = action.get("m_macroName", "")
+        if action.get("m_ignoreConstraints"):
+            details["ignore_constraints"] = True
+    elif class_type == "SetVariableAction":
+        var = action.get("m_variable", {})
+        var_name = var.get("m_name", action.get("m_variableName", ""))
+        is_local = var.get("isLocalVar", True)
+        var_type = var.get("m_type", 2)
+        scope = "local" if is_local else "global"
+        # Get the new value based on type
+        if var_type == 0:  # boolean
+            val = action.get("m_newBooleanValue", False)
+        elif var_type == 1:  # integer
+            val = action.get("m_newIntValue", 0)
+        elif var_type == 3:  # decimal
+            val = action.get("m_newDoubleValue", 0.0)
+        else:  # string
+            val = action.get("m_value", action.get("m_newStringValue", ""))
+        details["var"] = f"{var_name}={val} ({scope})"
+    elif class_type in ("IfConditionAction", "ElseIfConditionAction"):
+        constraints = action.get("m_constraintList", [])
+        cond_parts = []
+        for c in constraints:
+            cond_parts.append(_format_constraint_brief(c))
+        joiner = " OR " if action.get("m_isOrCondition") else " AND "
+        details["conditions"] = joiner.join(cond_parts) if cond_parts else "none"
     elif class_type == "WaitUntilTriggerAction":
-        details["timeout_secs"] = action.get("m_timeoutSeconds", 0)
+        triggers = action.get("triggersToWaitFor", [])
+        trigger_parts = []
+        for t in triggers:
+            tname = get_trigger_name(t)
+            tdetails = get_trigger_details(t)
+            if tdetails:
+                tname += f" ({', '.join(f'{k}={v}' for k, v in tdetails.items() if v)})"
+            trigger_parts.append(tname)
+        details["triggers"] = ", ".join(trigger_parts) if trigger_parts else "none"
+        timeout = action.get("timeoutSeconds", 0)
+        if action.get("timeoutEnabled") and timeout:
+            details["timeout"] = f"{timeout}s"
+    elif class_type == "SetMacroEnabledAction":
+        details["macro"] = action.get("m_macroName", "")
+        details["enable"] = action.get("m_enable", True)
+    elif class_type == "ExportMacrosAction":
+        details["file"] = action.get("m_fileName", "")
+    elif class_type == "LocalePluginAction":
+        blurb = action.get("m_pluginInstanceData", {}).get("mBlurb", "")
+        if blurb:
+            details["plugin"] = blurb.split("\n")[0][:50]
     elif class_type == "PauseAction":
-        details["seconds"] = action.get("m_seconds", 0)
-        details["ms"] = action.get("m_milliseconds", 0)
+        secs = action.get("m_delayInSeconds", action.get("m_seconds", 0))
+        ms = action.get("m_delayInMilliSeconds", action.get("m_milliseconds", 0))
+        if secs:
+            details["delay"] = f"{secs}s"
+        elif ms:
+            details["delay"] = f"{ms}ms"
 
     return details
+
+
+def _format_constraint_brief(constraint):
+    """Format a constraint for inline display in if/else_if conditions."""
+    class_type = constraint.get("m_classType", "")
+
+    if class_type == "MacroDroidVariableConstraint":
+        var = constraint.get("m_variable", {})
+        var_name = var.get("m_name", "")
+        var_type = var.get("m_type", 2)
+        scope = "" if var.get("isLocalVar", True) else " (global)"
+
+        # Check if comparing to another variable
+        other = constraint.get("m_otherValueToCompare")
+        if other and other.get("m_name"):
+            other_name = other.get("m_name", "?")
+            return f"{var_name}=={other_name}{scope}"
+
+        # Determine comparison and value
+        if var_type == 0:  # boolean
+            val = constraint.get("m_booleanValue", False)
+            return f"{var_name}=={'true' if val else 'false'}{scope}"
+        elif var_type == 1:  # integer
+            val = constraint.get("m_intValue", 0)
+            if constraint.get("m_intNotEqual"):
+                return f"{var_name}!={val}{scope}"
+            elif constraint.get("m_intGreaterThan"):
+                return f"{var_name}>{val}{scope}"
+            elif constraint.get("m_intLessThan"):
+                return f"{var_name}<{val}{scope}"
+            else:
+                return f"{var_name}=={val}{scope}"
+        elif var_type == 2:  # string
+            val = constraint.get("m_stringValue", "")
+            eq = "==" if constraint.get("m_stringEqual") else "!="
+            return f'{var_name}{eq}"{val}"{scope}'
+        else:
+            return f"{var_name}{scope}"
+    elif class_type == "MusicActiveConstraint":
+        playing = constraint.get("m_musicActive", True)
+        return f"music_{'playing' if playing else 'not_playing'}"
+    elif class_type == "DeviceLockedConstraint":
+        locked = constraint.get("m_locked", True)
+        return f"device_{'locked' if locked else 'unlocked'}"
+    elif class_type == "BluetoothConstraint":
+        device = constraint.get("m_deviceName", constraint.get("m_deviceAlias", ""))
+        states = {0: "off", 1: "on", 2: "connected", 3: "disconnected"}
+        state = states.get(constraint.get("m_btState", 0), "")
+        return f"bt:{device}={state}" if device else f"bt={state}"
+    elif class_type == "TriggerThatInvokedConstraint":
+        name = constraint.get("m_triggerName", "")
+        return f"trigger={name[:30]}" if name else "trigger_invoked"
+
+    cname = CONSTRAINT_NAMES.get(class_type, class_type.replace("Constraint", ""))
+    return cname
+
+
+def get_constraint_details(constraint):
+    """Extract key details from a macro-level constraint."""
+    return {"info": _format_constraint_brief(constraint)}
 
 
 def print_macro_summary(macro, verbose=False):
@@ -255,22 +412,34 @@ def print_macro_summary(macro, verbose=False):
     triggers = macro.get("m_triggerList", [])
     print(f"  Triggers ({len(triggers)}):")
     for t in triggers:
-        name = get_trigger_name(t)
+        tname = get_trigger_name(t)
         details = get_trigger_details(t)
         detail_str = ", ".join(f"{k}={v}" for k, v in details.items() if v) if details else ""
-        print(f"    - {name}" + (f" ({detail_str})" if detail_str else ""))
+        print(f"    - {tname}" + (f" ({detail_str})" if detail_str else ""))
 
     # Actions
     actions = macro.get("m_actionList", [])
     print(f"  Actions ({len(actions)}):")
     for a in actions:
-        name = get_action_name(a)
+        aname = get_action_name(a)
         if verbose:
             details = get_action_details(a)
             detail_str = ", ".join(f"{k}={v}" for k, v in details.items() if v) if details else ""
-            print(f"    - {name}" + (f" ({detail_str})" if detail_str else ""))
+            print(f"    - {aname}" + (f" ({detail_str})" if detail_str else ""))
         else:
-            print(f"    - {name}")
+            print(f"    - {aname}")
+
+    # Constraints (macro-level)
+    constraints = macro.get("m_constraintList", [])
+    if constraints:
+        print(f"  Constraints ({len(constraints)}):")
+        for c in constraints:
+            cname = CONSTRAINT_NAMES.get(c.get("m_classType", ""), c.get("m_classType", ""))
+            if verbose:
+                info = _format_constraint_brief(c)
+                print(f"    - {info}")
+            else:
+                print(f"    - {cname}")
 
     # Local variables
     local_vars = macro.get("localVariables", [])
@@ -444,22 +613,9 @@ def main():
         print(yaml.dump(specs, default_flow_style=False, sort_keys=False))
         return 0
 
-    # JSON output
+    # JSON output - raw data from .mdr file
     if args.json:
-        output = {
-            "macro_count": len(macros),
-            "macros": [
-                {
-                    "name": m.get("m_name", ""),
-                    "enabled": m.get("m_enabled", False),
-                    "category": m.get("m_category", ""),
-                    "triggers": [get_trigger_name(t) for t in m.get("m_triggerList", [])],
-                    "actions": [get_action_name(a) for a in m.get("m_actionList", [])],
-                }
-                for m in macros
-            ]
-        }
-        print(json.dumps(output, indent=2))
+        print(json.dumps(data, indent=2))
         return 0
 
     # Default: summary view

@@ -33,6 +33,25 @@ warn() { echo -e "${YELLOW}[pr-create]${NC} $1"; }
 error() { echo -e "${RED}[pr-create]${NC} $1" >&2; }
 success() { echo -e "${GREEN}[pr-create]${NC} $1"; }
 
+merge_comments_json() {
+    local inline_json="$1"
+    local issue_json="$2"
+
+    jq -s '
+        def ensure_array:
+            if . == null then []
+            elif type == "array" then .
+            else [] end;
+        def annotate($kind):
+            map(if type == "object" then . + {comment_type: $kind} else . end);
+        (.[0] | ensure_array | annotate("inline"))
+        +
+        (.[1] | ensure_array | annotate("issue"))
+    ' \
+        <(printf "%s" "$inline_json") \
+        <(printf "%s" "$issue_json")
+}
+
 # Show help
 if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
     cat << 'EOF'
@@ -53,12 +72,16 @@ Options (passed to gh pr create):
 Additional options:
   --no-wait           Create PR but don't wait for reviews
   --timeout <mins>    Max wait time in minutes (default: 15)
+  --merge             Merge current branch into base via worktree-safe squash
+  --base <branch>     Base branch for --merge (default: auto-detect or main)
   -h, --help          Show this help
 
 Examples:
   pr-create --title "feat: add auth" --body "Added OAuth support"
   pr-create -t "fix: login bug" -b "Fixed null check" --no-wait
   pr-create -t "refactor: cleanup" -b "Code cleanup" --timeout 10
+  pr-create --merge                  # Merge current branch after PR review
+  pr-create --merge --base develop   # Merge into specific base branch
 
 Output:
   Returns the automated review comments formatted for easy reading.
@@ -69,7 +92,9 @@ fi
 
 # Parse our custom options
 NO_WAIT=false
+MERGE_MODE=false
 TIMEOUT_MINS=15
+BASE_BRANCH=""
 GH_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -83,6 +108,14 @@ while [[ $# -gt 0 ]]; do
             MAX_WAIT_TIME=$((TIMEOUT_MINS * 60))
             shift 2
             ;;
+        --merge)
+            MERGE_MODE=true
+            shift
+            ;;
+        --base)
+            BASE_BRANCH="$2"
+            shift 2
+            ;;
         *)
             GH_ARGS+=("$1")
             shift
@@ -90,10 +123,132 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Worktree-safe merge+cleanup
+do_merge() {
+    local branch
+    branch=$(git branch --show-current)
+    if [[ -z "$branch" ]]; then
+        error "Cannot determine current branch (detached HEAD?)"
+        exit 1
+    fi
+
+    # Determine base branch
+    local base="$BASE_BRANCH"
+    if [[ -z "$base" ]]; then
+        # Try to detect from PR
+        local repo_slug
+        repo_slug=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null || true)
+        if [[ -n "$repo_slug" ]]; then
+            base=$(gh pr view "$branch" --repo "$repo_slug" --json baseRefName -q '.baseRefName' 2>/dev/null || true)
+        fi
+        if [[ -z "$base" ]]; then
+            # Fall back to default branch
+            base=$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p')
+            base="${base:-main}"
+        fi
+    fi
+
+    log "Merging '$branch' into '$base'..."
+
+    # Detect if running from a worktree
+    local git_common_dir
+    git_common_dir=$(git rev-parse --git-common-dir 2>/dev/null)
+    local git_dir
+    git_dir=$(git rev-parse --git-dir 2>/dev/null)
+
+    local main_worktree=""
+    local is_worktree=false
+
+    if [[ "$git_common_dir" != "$git_dir" ]]; then
+        is_worktree=true
+        # Main worktree is the parent of .git common dir
+        main_worktree=$(git worktree list --porcelain | head -1 | sed 's/^worktree //')
+        log "Detected worktree. Main worktree: $main_worktree"
+    else
+        main_worktree=$(git rev-parse --show-toplevel)
+    fi
+
+    # Fetch latest from origin
+    git -C "$main_worktree" fetch origin "$base" || {
+        error "Failed to fetch origin/$base"
+        exit 1
+    }
+
+    # Get PR title for commit message
+    local pr_title=""
+    local repo_slug
+    repo_slug=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null || true)
+    if [[ -n "$repo_slug" ]]; then
+        pr_title=$(gh pr view "$branch" --repo "$repo_slug" --json title -q '.title' 2>/dev/null || true)
+    fi
+    if [[ -z "$pr_title" ]]; then
+        pr_title="Merge branch '$branch'"
+    fi
+
+    # Switch to base branch in main worktree and squash-merge
+    log "Switching to '$base' in main worktree..."
+    git -C "$main_worktree" checkout "$base" || {
+        error "Failed to checkout '$base' in main worktree"
+        exit 1
+    }
+
+    git -C "$main_worktree" pull --ff-only origin "$base" || {
+        error "Failed to pull latest '$base'"
+        exit 1
+    }
+
+    log "Squash-merging '$branch'..."
+    git -C "$main_worktree" merge --squash "$branch" || {
+        error "Squash merge failed. Resolve conflicts in: $main_worktree"
+        exit 1
+    }
+
+    git -C "$main_worktree" commit -m "$pr_title" || {
+        error "Commit failed"
+        exit 1
+    }
+
+    log "Pushing '$base' to origin..."
+    git -C "$main_worktree" push origin "$base" || {
+        error "Failed to push '$base' to origin"
+        exit 1
+    }
+
+    success "Merged and pushed '$base'"
+
+    # Delete remote branch
+    log "Deleting remote branch '$branch'..."
+    git push origin --delete "$branch" 2>/dev/null && \
+        success "Deleted remote branch '$branch'" || \
+        warn "Could not delete remote branch '$branch' (may already be deleted)"
+
+    if [[ "$is_worktree" == "true" ]]; then
+        # Prune from main worktree — do NOT remove current directory
+        git -C "$main_worktree" worktree prune
+        echo ""
+        success "Done! The worktree for '$branch' is now dangling."
+        echo ""
+        echo "  >>> Exit this shell session now. <<<"
+        echo "  The worktree directory will be cleaned up on prune."
+        echo ""
+    else
+        # Not a worktree, just delete the local branch
+        git branch -D "$branch" 2>/dev/null && \
+            success "Deleted local branch '$branch'" || \
+            warn "Could not delete local branch (you may be on it)"
+    fi
+}
+
 # Verify we're in a git repo
 if ! git rev-parse --show-toplevel &>/dev/null; then
     error "Must be run from within a git repository"
     exit 1
+fi
+
+# Handle --merge mode
+if [[ "$MERGE_MODE" == "true" ]]; then
+    do_merge
+    exit 0
 fi
 
 # Get repo info
@@ -103,6 +258,17 @@ REPO=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null) || {
 }
 
 log "Creating PR in $REPO..."
+
+# Auto-push if branch has no remote tracking branch
+if ! git rev-parse --abbrev-ref '@{upstream}' &>/dev/null; then
+    CURRENT_BRANCH=$(git branch --show-current)
+    log "Pushing branch to origin..."
+    git push -u origin "$CURRENT_BRANCH" || {
+        error "Failed to push branch '$CURRENT_BRANCH' to origin"
+        exit 1
+    }
+    success "Pushed '$CURRENT_BRANCH' to origin"
+fi
 
 # Create the PR and capture URL
 PR_URL=$(gh pr create "${GH_ARGS[@]}" 2>&1) || {
@@ -140,30 +306,38 @@ while true; do
         break
     fi
 
-    # Fetch PR comments
+    # Fetch PR comments (inline) and issue comments (general)
     COMMENTS=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" 2>/dev/null || echo "[]")
-
-    # Also fetch issue comments (some bots post there)
     ISSUE_COMMENTS=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null || echo "[]")
+    ALL_COMMENTS=$(merge_comments_json "$COMMENTS" "$ISSUE_COMMENTS")
 
-    # Check for review comments from our reviewers
-    REVIEW_COUNT=0
-    for reviewer in "${REVIEWERS[@]}"; do
-        # Check PR review comments
-        COUNT=$(echo "$COMMENTS" | jq --arg r "$reviewer" '[.[] | select(.user.login | ascii_downcase | contains($r | ascii_downcase))] | length')
-        REVIEW_COUNT=$((REVIEW_COUNT + COUNT))
+    # Check for bot/reviewer comments across all endpoints
+    REVIEWERS_JSON=$(printf '%s\n' "${REVIEWERS[@]}" | jq -R . | jq -sc .)
 
-        # Check issue comments
-        COUNT=$(echo "$ISSUE_COMMENTS" | jq --arg r "$reviewer" '[.[] | select(.user.login | ascii_downcase | contains($r | ascii_downcase))] | length')
-        REVIEW_COUNT=$((REVIEW_COUNT + COUNT))
-    done
+    COMMENT_COUNT=$(printf "%s" "$ALL_COMMENTS" | jq -r --argjson reviewers "$REVIEWERS_JSON" '
+        if type != "array" then 0
+        else
+            [ .[] | select(
+                (.user.type == "Bot") or
+                (try ((.user.login | ascii_downcase) as $login |
+                    any($reviewers[]; . as $r | $login | contains($r | ascii_downcase))) catch false)
+            ) ] | length
+        end
+    ')
 
-    # Also check for reviews (not just comments)
+    # Also check reviews (not just comments)
     REVIEWS=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" 2>/dev/null || echo "[]")
-    for reviewer in "${REVIEWERS[@]}"; do
-        COUNT=$(echo "$REVIEWS" | jq --arg r "$reviewer" '[.[] | select(.user.login | ascii_downcase | contains($r | ascii_downcase))] | length')
-        REVIEW_COUNT=$((REVIEW_COUNT + COUNT))
-    done
+    REVIEW_API_COUNT=$(printf "%s" "$REVIEWS" | jq -r --argjson reviewers "$REVIEWERS_JSON" '
+        if type != "array" then 0
+        else
+            [ .[] | select(
+                (.user.type == "Bot") or
+                (try ((.user.login | ascii_downcase) as $login |
+                    any($reviewers[]; . as $r | $login | contains($r | ascii_downcase))) catch false)
+            ) ] | length
+        end
+    ')
+    REVIEW_COUNT=$((COMMENT_COUNT + REVIEW_API_COUNT))
 
     if [[ $REVIEW_COUNT -gt 0 ]]; then
         FOUND_REVIEWS=true
@@ -185,6 +359,7 @@ log "Fetching review comments..."
 
 COMMENTS=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" 2>/dev/null || echo "[]")
 ISSUE_COMMENTS=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null || echo "[]")
+ALL_COMMENTS=$(merge_comments_json "$COMMENTS" "$ISSUE_COMMENTS")
 REVIEWS=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" 2>/dev/null || echo "[]")
 
 # Output the reviews in a readable format
@@ -195,46 +370,49 @@ echo "=============================================="
 echo ""
 
 OUTPUT_COUNT=0
+REVIEWERS_JSON=$(printf '%s\n' "${REVIEWERS[@]}" | jq -R . | jq -sc .)
 
-# Process PR review comments (inline comments)
-for reviewer in "${REVIEWERS[@]}"; do
-    REVIEWER_COMMENTS=$(echo "$COMMENTS" | jq -r --arg r "$reviewer" '
-        .[] | select(.user.login | ascii_downcase | contains($r | ascii_downcase)) |
-        "### \(.user.login) - \(.path):\(.line // .original_line // "N/A")\n\(.body)\n"
-    ')
+# Process PR and issue comments together (bot users + known reviewers)
+REVIEWER_COMMENTS=$(printf "%s" "$ALL_COMMENTS" | jq -r --argjson reviewers "$REVIEWERS_JSON" '
+    if type != "array" then empty
+    else
+        def is_bot:
+            (.user.type == "Bot") or
+            (try ((.user.login | ascii_downcase) as $login |
+                any($reviewers[]; . as $r | $login | contains($r | ascii_downcase))) catch false);
+        def format_comment:
+            if (.comment_type // "") == "inline" then
+                "### \(.user.login) - \(.path // "General"):\(.line // .original_line // "N/A")\n\((.body // "") | gsub("\r\n"; "\n"))\n"
+            else
+                "### \(.user.login) (General Comment)\n\((.body // "") | gsub("\r\n"; "\n"))\n"
+            end;
+        .[] | select(is_bot) | format_comment
+    end
+')
 
-    if [[ -n "$REVIEWER_COMMENTS" ]]; then
-        echo "$REVIEWER_COMMENTS"
-        OUTPUT_COUNT=$((OUTPUT_COUNT + 1))
-    fi
-done
+if [[ -n "$REVIEWER_COMMENTS" ]]; then
+    echo "$REVIEWER_COMMENTS"
+    OUTPUT_COUNT=$((OUTPUT_COUNT + 1))
+fi
 
-# Process issue comments (general comments)
-for reviewer in "${REVIEWERS[@]}"; do
-    REVIEWER_COMMENTS=$(echo "$ISSUE_COMMENTS" | jq -r --arg r "$reviewer" '
-        .[] | select(.user.login | ascii_downcase | contains($r | ascii_downcase)) |
-        "### \(.user.login) (General Comment)\n\(.body)\n"
-    ')
+# Process reviews (bot users + known reviewers)
+REVIEWER_REVIEWS=$(printf "%s" "$REVIEWS" | jq -r --argjson reviewers "$REVIEWERS_JSON" '
+    if type != "array" then empty
+    else
+        .[]
+        | select(
+            (.user.type == "Bot") or
+            (try ((.user.login | ascii_downcase) as $login |
+                any($reviewers[]; . as $r | $login | contains($r | ascii_downcase))) catch false))
+        | select(.body != null and .body != "")
+        | "### \(.user.login) - Review (\(.state))\n\((.body // "") | gsub("\r\n"; "\n"))\n"
+    end
+')
 
-    if [[ -n "$REVIEWER_COMMENTS" ]]; then
-        echo "$REVIEWER_COMMENTS"
-        OUTPUT_COUNT=$((OUTPUT_COUNT + 1))
-    fi
-done
-
-# Process reviews
-for reviewer in "${REVIEWERS[@]}"; do
-    REVIEWER_REVIEWS=$(echo "$REVIEWS" | jq -r --arg r "$reviewer" '
-        .[] | select(.user.login | ascii_downcase | contains($r | ascii_downcase)) |
-        select(.body != null and .body != "") |
-        "### \(.user.login) - Review (\(.state))\n\(.body)\n"
-    ')
-
-    if [[ -n "$REVIEWER_REVIEWS" ]]; then
-        echo "$REVIEWER_REVIEWS"
-        OUTPUT_COUNT=$((OUTPUT_COUNT + 1))
-    fi
-done
+if [[ -n "$REVIEWER_REVIEWS" ]]; then
+    echo "$REVIEWER_REVIEWS"
+    OUTPUT_COUNT=$((OUTPUT_COUNT + 1))
+fi
 
 if [[ $OUTPUT_COUNT -eq 0 ]]; then
     warn "No automated review comments found."

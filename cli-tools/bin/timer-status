@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Quick timer status display.
+
+Usage:
+    timer-status              # One-line status
+    timer-status --watch      # Continuous monitoring (1s refresh)
+    timer-status --json       # Raw JSON from API
+"""
+
+import sys
+import json
+import time
+import urllib.request
+
+API_URL = "http://localhost:7777"
+
+MODE_ICONS = {
+    "work_silence": "\U0001f507",  # 🔇
+    "work_music": "\U0001f3b5",    # 🎵
+    "work_video": "\U0001f4fa",    # 📺
+    "work_gaming": "\U0001f3ae",   # 🎮
+    "work_gym": "\U0001f3cb",      # 🏋
+    "gym": "\U0001f3cb",           # 🏋
+    "break": "\u2615",             # ☕
+    "pause": "\u23f8",             # ⏸
+}
+
+
+def get_timer():
+    try:
+        req = urllib.request.Request(f"{API_URL}/api/timer", method="GET")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as e:
+        return None
+
+
+def fmt_time(seconds):
+    """Format seconds as HH:MM:SS or MM:SS."""
+    if seconds <= 0:
+        return "00:00"
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def fmt_ms_hm(ms):
+    """Format milliseconds as Xh Ym."""
+    h = ms // (1000 * 60 * 60)
+    m = (ms % (1000 * 60 * 60)) // (1000 * 60)
+    return f"{h}h {m:02d}m"
+
+
+def color(text, code):
+    """ANSI color wrapper."""
+    return f"\033[{code}m{text}\033[0m"
+
+
+def display(data):
+    mode = data["current_mode"]
+    icon = MODE_ICONS.get(mode, "?")
+    mode_name = mode.replace("work_", "").title()
+
+    break_s = data.get("accumulated_break_seconds", 0)
+    break_str = fmt_time(break_s)
+    work_str = fmt_ms_hm(data.get("total_work_time_ms", 0))
+
+    # Color break time
+    if break_s > 1800:
+        break_colored = color(break_str, "32")  # green
+    elif break_s > 300:
+        break_colored = color(break_str, "33")  # yellow
+    else:
+        break_colored = color(break_str, "31")  # red
+
+    # Backlog indicator
+    backlog = ""
+    if data.get("is_in_backlog"):
+        bl_s = round(data.get("break_backlog_ms", 0) / 1000)
+        backlog = color(f"  Backlog: {fmt_time(bl_s)}", "31")
+
+    # Lock indicator
+    lock = ""
+    if data.get("manual_mode_lock"):
+        lock = color("  [locked]", "33")
+
+    # Work mode
+    wm = data.get("work_mode", "clocked_in")
+    wm_str = ""
+    if wm == "clocked_out":
+        wm_str = color("  OFF", "90")
+    elif wm == "gym":
+        wm_str = color("  GYM", "35")
+
+    print(f"{icon}  {mode_name}  Break: {break_colored}  Work: {work_str}{backlog}{lock}{wm_str}")
+
+
+def main():
+    args = sys.argv[1:]
+
+    if "--help" in args or "-h" in args:
+        print(__doc__.strip())
+        return
+
+    if "--json" in args:
+        data = get_timer()
+        if data:
+            print(json.dumps(data, indent=2))
+        else:
+            print("Error: Could not reach Token-API", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if "--watch" in args:
+        try:
+            while True:
+                print("\033[2J\033[H", end="")  # clear screen
+                data = get_timer()
+                if data:
+                    display(data)
+                else:
+                    print(color("Server unreachable", "31"))
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+        return
+
+    data = get_timer()
+    if data:
+        display(data)
+    else:
+        print(color("Server unreachable", "31"), file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

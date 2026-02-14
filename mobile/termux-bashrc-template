@@ -304,5 +304,9 @@ shutdown-mini() {
 # ====================================================
 # AUTO-SSH TO DESKTOP ON STARTUP
 # ====================================================
-# Start in SSH session by default. Use 'exit' to access local phone.
-ssh-desktop
+# Only auto-connect when opening Termux directly on the phone.
+# Skip when: SSH'd in from PC, or bashrc is being re-sourced.
+if [[ -z "$SSH_CLIENT" && -z "$SSH_CONNECTION" && -z "$__SSHPC_DONE" ]]; then
+    export __SSHPC_DONE=1
+    ssh-desktop
+fi

@@ -11,6 +11,7 @@ dependencies = [
     "rich>=13.9.0",
     "apscheduler>=3.10.0",
     "requests>=2.32.5",
+    "python-dotenv>=1.0.0",
 ]
 
 [dependency-groups]

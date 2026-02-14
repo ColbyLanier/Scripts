@@ -11,6 +11,7 @@
 #   pr-review-loop 42                 # Specific PR number
 #   pr-review-loop --message "Fixed auth bug and added tests"
 #   pr-review-loop --no-push          # Skip git push (already pushed)
+#   pr-review-loop --read             # Just poll for existing review results
 #   pr-review-loop --timeout 10       # Wait max 10 minutes
 #
 # The tool will:
@@ -54,6 +55,7 @@ Arguments:
 Options:
   --message MSG       Description of fixes applied (included in PR comment)
   --no-push           Skip git push step (if already pushed)
+  --read              Read-only: skip push and comment, just poll for results
   --timeout MINS      Max wait time in minutes (default: 15)
   -h, --help          Show this help
 
@@ -62,6 +64,7 @@ Examples:
   pr-review-loop 42
   pr-review-loop --message "Fixed auth bug and added tests"
   pr-review-loop --no-push --timeout 10
+  pr-review-loop --read              # Just wait for existing review
 
 Workflow:
   1. Push current branch to remote (unless --no-push)
@@ -77,6 +80,7 @@ fi
 PR_NUMBER=""
 MESSAGE=""
 NO_PUSH=false
+READ_ONLY=false
 TIMEOUT_MINS=15
 
 while [[ $# -gt 0 ]]; do
@@ -86,6 +90,11 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --no-push)
+            NO_PUSH=true
+            shift
+            ;;
+        --read)
+            READ_ONLY=true
             NO_PUSH=true
             shift
             ;;
@@ -146,18 +155,6 @@ else
     log "Skipping push (--no-push specified)"
 fi
 
-# Step 2: Post re-review request comment
-log "📝 Posting re-review request on PR #$PR_NUMBER..."
-
-# Build comment body
-COMMENT_BODY="## Fixes Applied"
-if [[ -n "$MESSAGE" ]]; then
-    COMMENT_BODY="${COMMENT_BODY}\n\n${MESSAGE}"
-else
-    COMMENT_BODY="${COMMENT_BODY}\n\nAddressed review feedback."
-fi
-COMMENT_BODY="${COMMENT_BODY}\n\n@greptileai please re-review"
-
 # Get baseline comment counts and timestamps before posting
 BASELINE_REVIEW_COMMENTS=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" 2>/dev/null | \
     jq --arg bot "$GREPTILE_BOT" '[.[] | select(.user.login == $bot)] | length')
@@ -168,12 +165,27 @@ BASELINE_ISSUE_COMMENTS=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>
 BASELINE_OVERVIEW_TIMESTAMP=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
     jq --arg user "$GREPTILE_USER" -r '[.[] | select(.user.login == $user)] | sort_by(.updated_at) | .[-1].updated_at // ""')
 
-# Post the comment
-gh pr comment "$PR_NUMBER" --body "$(echo -e "$COMMENT_BODY")" || {
-    error "Failed to post PR comment"
-    exit 1
-}
-success "Posted re-review request"
+# Step 2: Post re-review request comment (skip in --read mode)
+if [[ "$READ_ONLY" == "false" ]]; then
+    log "📝 Posting re-review request on PR #$PR_NUMBER..."
+
+    # Build comment body
+    COMMENT_BODY="## Fixes Applied"
+    if [[ -n "$MESSAGE" ]]; then
+        COMMENT_BODY="${COMMENT_BODY}\n\n${MESSAGE}"
+    else
+        COMMENT_BODY="${COMMENT_BODY}\n\nAddressed review feedback."
+    fi
+    COMMENT_BODY="${COMMENT_BODY}\n\n@greptileai please re-review"
+
+    gh pr comment "$PR_NUMBER" --body "$(echo -e "$COMMENT_BODY")" || {
+        error "Failed to post PR comment"
+        exit 1
+    }
+    success "Posted re-review request"
+else
+    log "👀 Read-only mode: polling for existing review on PR #$PR_NUMBER..."
+fi
 
 # Step 3: Poll for new review comments
 log "⏳ Waiting for Greptile re-review (timeout: ${TIMEOUT_MINS}m)..."

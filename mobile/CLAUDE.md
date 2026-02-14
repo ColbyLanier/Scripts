@@ -165,6 +165,12 @@ variables:
     type: string
     value: ""
 
+# Global variables (optional, for cross-macro state)
+global_variables:
+  - name: yt_bg
+    type: boolean
+    value: false
+
 # Triggers - what starts the macro
 triggers:
   - type: http_server
@@ -198,6 +204,11 @@ constraints:
 | `shake` | Device shake | `sensitivity` |
 | `screen_on` | Screen on/off | `screen_on` |
 | `wifi_state` | WiFi changes | `state`, `ssids` |
+| `music_playing` | Music starts/stops | `started` (bool) |
+| `regular_interval` | Periodic timer | `interval`, `unit` |
+| `swipe` | Screen swipe gesture | `area`, `motion` |
+| `media_button` | Media button press | `option` |
+| `bluetooth` | BT device event | `device`, `state` |
 
 ### Available Actions
 
@@ -210,7 +221,7 @@ constraints:
 | `toast` | Show toast message | `text`, `duration` |
 | `speak` | Text-to-speech | `text`, `speed`, `pitch` |
 | `launch_app` | Launch application | `app`, `package` |
-| `set_variable` | Set variable value | `name`, `value`, `type` |
+| `set_variable` | Set variable value | `name`, `value`, `var_type`, `local` |
 | `wifi` | Enable/disable WiFi | `enable` |
 | `torch` | Flashlight control | `state` (0=off, 1=on, 2=toggle) |
 | `wait` | Pause execution | `seconds`, `milliseconds` |
@@ -220,8 +231,12 @@ constraints:
 | `media_control` | Play/pause/next/prev | `option`, `app`, `package` |
 | `launch_activity` | Launch app (reliable) | `app`, `package` |
 | `if` | Start conditional block | `conditions`, `or_conditions` |
+| `else_if` | Alternative conditional | `conditions` (same as `if`) |
 | `else` | Alternative branch | - |
 | `end_if` | Close if/else block | - |
+| `wait_until` | Wait for trigger | `triggers` (embedded), `timeout` |
+| `export_macros` | Export .mdr file | `filename`, `file_path` |
+| `locale_plugin` | Plugin action | `package`, `blurb` |
 
 ### Available Constraints
 
@@ -232,6 +247,10 @@ constraints:
 | `time_of_day` | Time range | `start_hour`, `end_hour` |
 | `wifi` | WiFi state | `state`, `ssids` |
 | `battery` | Battery level | `level`, `greater_than` |
+| `variable` | Check variable value | `variable`, `var_type`, `comparison`, `value`, `local_var` |
+| `bluetooth` | BT device state | `device`, `state` |
+| `device_locked` | Screen lock state | `locked` (bool) |
+| `music_active` | Music playing check | `playing` (bool) |
 
 ### File Locations
 
@@ -253,9 +272,7 @@ To import in MacroDroid:
 4. Verify with `macrodroid-state --list`
 5. Delete: `rm name.macro` (local) and `sshp "rm ~/macros/name.macro"` (phone)
 
-**Naming convention for pending imports:**
-- `IMPORT-*.macro` - Files waiting to be imported into MacroDroid
-- Once imported, delete the file
+**After importing**, delete the `.macro` file from the phone — it's just a staging file.
 
 **The `.mdr` file is the source of truth** - it contains all imported macros. Use `macrodroid-read --refresh` to see current state.
 

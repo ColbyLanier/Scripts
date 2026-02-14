@@ -22,7 +22,7 @@ PragmaOnce(A_ScriptFullPath, A_ScriptHwnd)
 
 ; ============== CONFIGURATION ==============
 RING_DEVICE_ID := 0  ; Auto-detected below (set manually to override)
-MINIMUM_RING_ID := 15  ; IDs below this are assumed to be built-in devices (trackpad, etc.)
+MINIMUM_RING_ID := 14  ; IDs below this are assumed to be built-in devices (trackpad, etc.)
 TAP_THRESHOLD_MS := 200  ; Mod-tap threshold for right button
 LEFT_TAP_THRESHOLD_MS := 200  ; Mod-tap threshold for left button
 DOUBLE_TAP_MS := 500  ; Double-tap window for Enter

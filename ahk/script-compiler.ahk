@@ -86,6 +86,30 @@ global tvConnected := false
 }
 
 
+global mClickCount := 0
+global mClickTimer := 0
+
+MButton:: {
+    global mClickCount, mClickTimer
+    if (A_TickCount - mClickTimer > 2000) {
+        mClickCount := 0
+    }
+    mClickCount++
+    if (mClickCount == 1) {
+        mClickTimer := A_TickCount
+        Send("{MButton}")
+    }
+    ToolTip("click (" mClickCount "/3)")
+    SetTimer(() => ToolTip(), -1500)
+    if (mClickCount >= 3) {
+        mClickCount := 0
+        mClickTimer := 0
+        ToolTip("ring!")
+        SetTimer(() => ToolTip(), -1500)
+        Run('schtasks /Run /TN "ahk_admin"',, "Hide")
+    }
+}
+
 Media_Stop:: {  ; Skip current TTS
     PostToTokenApi("/api/tts/skip", "")
 }

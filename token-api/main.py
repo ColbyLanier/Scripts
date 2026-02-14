@@ -22,6 +22,9 @@ from pathlib import Path
 from typing import Optional, List
 from contextlib import asynccontextmanager
 
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent / ".env")
+
 import aiosqlite
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,6 +34,7 @@ from pydantic import BaseModel, Field
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
+from timer import TimerEngine, TimerMode, TimerEvent, format_timer_time
 
 # Configure logging for TUI capture
 logger = logging.getLogger("token_api")
@@ -324,7 +328,7 @@ class DesktopDetectionResponse(BaseModel):
     old_mode: Optional[str] = None
     new_mode: Optional[str] = None
     reason: str
-    obsidian_triggered: bool = False
+    timer_updated: bool = False
     productivity_active: bool
     active_instance_count: int
 
@@ -354,11 +358,13 @@ class HeadlessStatusResponse(BaseModel):
     last_changed: Optional[str] = None
     hostname: Optional[str] = None
     error: Optional[str] = None
+    auto_disable_at: Optional[str] = None  # ISO timestamp when headless will auto-disable
 
 
 class HeadlessControlRequest(BaseModel):
     """Request to control headless mode."""
     action: str = "toggle"  # "toggle" | "enable" | "disable"
+    duration_hours: Optional[float] = None  # Auto-disable after N hours
 
 
 class HeadlessControlResponse(BaseModel):
@@ -552,6 +558,15 @@ async def init_db():
                 last_disconnect_time TEXT,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 CHECK (id = 1)
+            )
+        """)
+
+        # Create timer_state table (single-row, stores timer engine state as JSON)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS timer_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                state_json TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -844,6 +859,36 @@ async def load_tasks_from_db():
             print(f"Failed to register task {task_id}: {e}")
 
 
+async def restore_desktop_state():
+    """Restore DESKTOP_STATE from last known event on startup.
+
+    Prevents state desync when the server restarts while AHK is still running.
+    AHK tracks its own internal mode and only sends changes, so if the server
+    resets to 'silence' but AHK thinks it's in 'video', no detection is sent
+    until the next mode *transition* on the AHK side.
+
+    Timer state is restored separately via timer_load_from_db() before this.
+    """
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Restore current_mode from the last desktop_mode_change event
+            cursor = await db.execute(
+                "SELECT details FROM events WHERE event_type = 'desktop_mode_change' ORDER BY id DESC LIMIT 1"
+            )
+            row = await cursor.fetchone()
+            if row:
+                details = json.loads(row[0])
+                restored_mode = details.get("new_mode")
+                if restored_mode and restored_mode in VALID_DETECTION_MODES:
+                    DESKTOP_STATE["current_mode"] = restored_mode
+                    DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
+                    print(f"Restored desktop mode: {restored_mode} (from last event)")
+                    return
+        print("No previous desktop mode found, defaulting to silence")
+    except Exception as e:
+        print(f"Failed to restore desktop state: {e}")
+
+
 async def run_overdue_tasks():
     """Check for tasks that haven't run recently and execute them on startup."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -919,7 +964,7 @@ async def run_overdue_tasks():
 # Lifespan context manager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global tts_worker_task, stale_flag_cleaner_task
+    global tts_worker_task, stale_flag_cleaner_task, timer_worker_task
 
     # Install asyncio exception handler for this loop
     loop = asyncio.get_running_loop()
@@ -936,6 +981,15 @@ async def lifespan(app: FastAPI):
     # Startup
     await init_db()
     await load_tasks_from_db()
+    timer_load_from_db()
+    await restore_desktop_state()
+    # Sync timer mode with restored desktop mode
+    desktop_mode = DESKTOP_STATE.get("current_mode", "silence")
+    expected_timer_mode = TimerMode("work_" + desktop_mode)
+    now_ms = int(time.monotonic() * 1000)
+    if timer_engine.current_mode != expected_timer_mode and timer_engine.current_mode.value.startswith("work_"):
+        print(f"TIMER: Syncing timer mode {timer_engine.current_mode.value} -> {expected_timer_mode.value} (from desktop state)")
+        timer_engine.set_mode(expected_timer_mode, is_automatic=False, now_mono_ms=now_ms)
     scheduler.start()
     print("Scheduler started")
     # Start TTS queue worker
@@ -947,6 +1001,9 @@ async def lifespan(app: FastAPI):
     # Start stuck instance detector
     stuck_detector_task = asyncio.create_task(detect_stuck_instances())
     print("Stuck instance detector started")
+    # Start timer engine worker
+    timer_worker_task = asyncio.create_task(timer_worker())
+    print("Timer engine started")
     await run_overdue_tasks()
     yield
 
@@ -969,6 +1026,12 @@ async def lifespan(app: FastAPI):
         stale_flag_cleaner_task.cancel()
         try:
             await stale_flag_cleaner_task
+        except asyncio.CancelledError:
+            pass
+    if timer_worker_task:
+        timer_worker_task.cancel()
+        try:
+            await timer_worker_task
         except asyncio.CancelledError:
             pass
     scheduler.shutdown(wait=True)
@@ -2105,21 +2168,6 @@ DISTRACTION_PATTERNS = [
     "Reddit",
 ]
 
-# Obsidian Timer Integration Config
-OBSIDIAN_CONFIG = {
-    "vault_name": "Token-ENV",
-    # Map detected modes to Obsidian timer commands
-    "mode_commands": {
-        "silence": "timer-auto-work-silence",
-        "music": "timer-auto-work-music",
-        "video": "timer-auto-work-video",
-        "gaming": "timer-auto-work-gaming",
-        # Gym modes (triggered via geofence/MacroDroid)
-        "gym": "timer-auto-gym",
-        "work_gym": "timer-auto-work-gym",
-    },
-}
-
 # Desktop mode state (tracks current mode from AHK detection)
 DESKTOP_STATE = {
     "current_mode": "silence",
@@ -2128,6 +2176,35 @@ DESKTOP_STATE = {
     "work_mode": "clocked_in",
     "work_mode_changed_at": None,
 }
+
+# Valid desktop detection modes (replaces OBSIDIAN_CONFIG["mode_commands"].keys())
+VALID_DETECTION_MODES = ["silence", "music", "video", "gaming", "gym", "work_gym"]
+
+# ============ Timer Engine ============
+timer_engine = TimerEngine(now_mono_ms=int(time.monotonic() * 1000))
+
+# Paths for Obsidian vault (write-only consumer for daily notes)
+OBSIDIAN_VAULT_PATH = Path("/mnt/c/Users/colby/Documents/Obsidian/Token-ENV")
+OBSIDIAN_DAILY_PATH = OBSIDIAN_VAULT_PATH / "Journal" / "Daily"
+
+
+def _write_productivity_score(date_str: str, score: int):
+    """Write productivity_score to a daily note's front matter."""
+    try:
+        note_path = OBSIDIAN_DAILY_PATH / f"{date_str}.md"
+        if not note_path.exists():
+            print(f"TIMER: No daily note for {date_str}, skipping score write")
+            return
+
+        content = note_path.read_text(encoding="utf-8")
+        updated = _merge_frontmatter(content, {
+            "productivity_score": score,
+            "timer_completed": True,
+        })
+        note_path.write_text(updated, encoding="utf-8")
+        print(f"TIMER: Wrote productivity score {score} to {date_str}")
+    except Exception as e:
+        print(f"TIMER: Failed to write productivity score: {e}")
 
 # Phone HTTP server config (MacroDroid on phone via Tailscale)
 PHONE_CONFIG = {
@@ -2164,12 +2241,231 @@ PHONE_DISTRACTION_APPS = {
     "com.mojang.minecraftpe": "gaming",
 }
 
-# ============ Timer State ============
-# Timer is now built into Token API itself; no external file dependency.
+# Human-readable display names for phone apps (key = lowercased app name or package)
+PHONE_APP_DISPLAY_NAMES = {
+    "twitter": "Twitter/X",
+    "x": "Twitter/X",
+    "com.twitter.android": "Twitter/X",
+    "youtube": "YouTube",
+    "com.google.android.youtube": "YouTube",
+    "game": "Game",
+    "minecraft": "Minecraft",
+    "com.mojang.minecraftpe": "Minecraft",
+}
 
-def get_obsidian_timer_state() -> dict:
-    """Return timer state stub — timer is integrated into Token API now."""
-    return {"breakAvailableSeconds": 0, "isInBacklog": False}
+
+def get_phone_app_display_name(app_name: str, package: str = None) -> str:
+    """Get human-readable display name for a phone app.
+
+    Checks app_name first, then package name, falls back to title-cased app_name.
+    """
+    if app_name in PHONE_APP_DISPLAY_NAMES:
+        return PHONE_APP_DISPLAY_NAMES[app_name]
+    if package and package in PHONE_APP_DISPLAY_NAMES:
+        return PHONE_APP_DISPLAY_NAMES[package]
+    # Fallback: title-case the app name, strip common package prefixes
+    if "." in app_name:
+        # Package name like com.foo.bar -> use last segment, title-cased
+        return app_name.split(".")[-1].title()
+    return app_name.title()
+
+# ============ Pavlok Shock Watch ============
+PAVLOK_CONFIG = {
+    "api_url": "https://api.pavlok.com/api/v5/stimulus/send",
+    "token": os.getenv("PAVLOK_API_TOKEN"),
+    "enabled": True,
+    "cooldown_seconds": 45,
+    "default_zap_value": 50,
+}
+
+PAVLOK_STATE = {
+    "last_stimulus_at": None,
+}
+
+
+def send_pavlok_stimulus(
+    stimulus_type: str = "zap",
+    value: int | None = None,
+    reason: str = "manual",
+    respect_cooldown: bool = True,
+) -> dict:
+    """Send a stimulus (zap/beep/vibe) to the Pavlok watch."""
+    if not PAVLOK_CONFIG["enabled"] or not PAVLOK_CONFIG["token"]:
+        return {"skipped": True, "reason": "disabled"}
+
+    now = datetime.now()
+    if respect_cooldown and PAVLOK_STATE["last_stimulus_at"]:
+        last = datetime.fromisoformat(PAVLOK_STATE["last_stimulus_at"])
+        elapsed = (now - last).total_seconds()
+        if elapsed < PAVLOK_CONFIG["cooldown_seconds"]:
+            return {"skipped": True, "reason": "cooldown", "remaining": round(PAVLOK_CONFIG["cooldown_seconds"] - elapsed)}
+
+    if value is None:
+        value = PAVLOK_CONFIG["default_zap_value"]
+
+    try:
+        response = requests.post(
+            PAVLOK_CONFIG["api_url"],
+            headers={"Authorization": PAVLOK_CONFIG["token"]},
+            json={"stimulus": {"stimulusType": stimulus_type, "stimulusValue": value}},
+            timeout=10,
+        )
+        PAVLOK_STATE["last_stimulus_at"] = now.isoformat()
+        print(f"PAVLOK: {stimulus_type} value={value} reason={reason} -> {response.status_code}")
+        return {
+            "success": response.status_code == 200,
+            "type": stimulus_type,
+            "value": value,
+            "reason": reason,
+            "status_code": response.status_code,
+        }
+    except requests.exceptions.Timeout:
+        print(f"PAVLOK: Timeout sending {stimulus_type}")
+        return {"success": False, "error": "timeout", "reason": reason}
+    except requests.exceptions.ConnectionError:
+        print(f"PAVLOK: Connection error sending {stimulus_type}")
+        return {"success": False, "error": "connection_error", "reason": reason}
+    except Exception as e:
+        print(f"PAVLOK: Error sending {stimulus_type}: {e}")
+        return {"success": False, "error": str(e), "reason": reason}
+
+
+# ============ Timer I/O Functions ============
+
+
+def _merge_frontmatter(content: str, updates: dict) -> str:
+    """Merge key-value pairs into a markdown file's YAML front matter."""
+    lines = content.split("\n")
+
+    # Find existing front matter boundaries
+    fm_start = -1
+    fm_end = -1
+    for i, line in enumerate(lines):
+        if line.strip() == "---":
+            if fm_start == -1:
+                fm_start = i
+            else:
+                fm_end = i
+                break
+
+    if fm_start == -1 or fm_end == -1:
+        # No front matter - create it
+        fm_lines = ["---"]
+        for key, value in updates.items():
+            fm_lines.append(f"{key}: {_format_yaml_value(value)}")
+        fm_lines.append("---")
+        return "\n".join(fm_lines) + "\n" + content
+
+    # Parse existing front matter
+    existing = {}
+    for i in range(fm_start + 1, fm_end):
+        line = lines[i]
+        if ": " in line:
+            key, _, val = line.partition(": ")
+            existing[key.strip()] = val.strip()
+
+    # Merge updates
+    existing.update({k: _format_yaml_value(v) for k, v in updates.items()})
+
+    # Rebuild
+    fm_lines = ["---"]
+    for key, value in existing.items():
+        fm_lines.append(f"{key}: {value}")
+    fm_lines.append("---")
+
+    before = lines[:fm_start]
+    after = lines[fm_end + 1:]
+    return "\n".join(before + fm_lines + after)
+
+
+def _format_yaml_value(value) -> str:
+    """Format a Python value for YAML front matter."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str) and (":" in value or " " in value):
+        return f'"{value}"'
+    return str(value)
+
+
+def _sync_update_daily_note():
+    """Update daily note synchronously (called via asyncio.to_thread)."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    note_path = OBSIDIAN_DAILY_PATH / f"{today}.md"
+    if not note_path.exists():
+        return
+    content = note_path.read_text(encoding="utf-8")
+    updates = {
+        "timer_status": timer_engine.current_mode.value,
+        "timer_work_time": format_timer_time(timer_engine.total_work_time_ms),
+        "timer_break_earned": format_timer_time(
+            timer_engine.accumulated_break_ms + timer_engine.total_break_time_ms
+        ),
+        "timer_break_used": format_timer_time(timer_engine.total_break_time_ms),
+        "timer_break_available": format_timer_time(timer_engine.accumulated_break_ms),
+        "timer_backlog": format_timer_time(timer_engine.break_backlog_ms),
+        "last_timer_update": datetime.now().strftime("%H:%M:%S"),
+    }
+    updated = _merge_frontmatter(content, updates)
+    note_path.write_text(updated, encoding="utf-8")
+
+
+async def timer_update_daily_note():
+    """Update today's daily note front matter asynchronously."""
+    try:
+        await asyncio.to_thread(_sync_update_daily_note)
+    except Exception as e:
+        print(f"TIMER: Failed to update daily note: {e}")
+
+
+def _sync_save_to_db(state_json: str):
+    """Save timer state to SQLite synchronously (called via asyncio.to_thread)."""
+    import sqlite3
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute(
+        """INSERT INTO timer_state (id, state_json, updated_at)
+           VALUES (1, ?, CURRENT_TIMESTAMP)
+           ON CONFLICT(id) DO UPDATE SET state_json = excluded.state_json, updated_at = CURRENT_TIMESTAMP""",
+        (state_json,)
+    )
+    conn.commit()
+    conn.close()
+
+
+async def timer_save_to_db():
+    """Save timer state to SQLite asynchronously."""
+    try:
+        now_ms = int(time.monotonic() * 1000)
+        state_json = json.dumps(timer_engine.to_dict(now_ms))
+        await asyncio.to_thread(_sync_save_to_db, state_json)
+    except Exception as e:
+        print(f"TIMER: Failed to save to DB: {e}")
+
+
+def timer_load_from_db():
+    """Load timer state from DB on startup."""
+    import sqlite3
+    now_ms = int(time.monotonic() * 1000)
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA busy_timeout=5000")
+        row = conn.execute("SELECT state_json FROM timer_state WHERE id = 1").fetchone()
+        conn.close()
+
+        if row:
+            saved = json.loads(row[0])
+            timer_engine.from_dict(saved, now_mono_ms=now_ms)
+            print(f"TIMER: Restored state from DB (mode={timer_engine.current_mode.value}, break={timer_engine.accumulated_break_ms / 1000:.0f}s)")
+            return
+    except Exception as e:
+        print(f"TIMER: DB load failed: {e}")
+
+    # Fresh start
+    print("TIMER: Fresh start (no DB state found)")
 
 
 # ============ Audio Proxy State ============
@@ -2420,10 +2716,10 @@ async def trigger_window_close():
 async def handle_desktop_detection(request: DesktopDetectionRequest):
     """
     Handle desktop detection events from AHK.
-    This is the authoritative endpoint for mode changes (migrated from mesh-pipe).
+    This is the authoritative endpoint for mode changes.
 
     AHK detects: video/music/gaming/silence
-    token-api: decides if mode change is allowed, triggers Obsidian timer command
+    token-api: decides if mode change is allowed, updates internal timer
 
     Logic:
     - If work_mode is "clocked_out" -> all modes allowed, no enforcement
@@ -2436,11 +2732,10 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
     source = request.source
 
     # Validate detected mode
-    valid_modes = list(OBSIDIAN_CONFIG["mode_commands"].keys())
-    if detected_mode not in valid_modes:
+    if detected_mode not in VALID_DETECTION_MODES:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid detected_mode '{detected_mode}'. Valid: {valid_modes}"
+            detail=f"Invalid detected_mode '{detected_mode}'. Valid: {VALID_DETECTION_MODES}"
         )
 
     work_mode = DESKTOP_STATE.get("work_mode", "clocked_in")
@@ -2456,9 +2751,9 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
             action="none",
             detected_mode=detected_mode,
             reason="mode_unchanged",
-            productivity_active=True,  # Not relevant for unchanged
+            productivity_active=True,
             active_instance_count=0,
-            obsidian_triggered=False
+            timer_updated=False
         )
 
     # Check productivity status
@@ -2487,36 +2782,32 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
         print(f"    Gym mode - all modes allowed")
     # CLOCKED IN: Video/gaming mode requires either break time OR productivity
     elif detected_mode == "video" or detected_mode == "gaming":
-        timer_state = get_obsidian_timer_state()
-        has_break_time = timer_state.get("breakAvailableSeconds", 0) > 0
+        has_break_time = timer_engine.accumulated_break_ms > 0
+        break_secs = round(timer_engine.accumulated_break_ms / 1000)
 
         if has_break_time:
-            # User has earned break time - allow video/gaming, Obsidian will consume it
             allowed = True
             reason = "break_time_available"
-            print(f"    {detected_mode.title()} allowed: {timer_state.get('breakAvailableSeconds', 0)}s break available")
+            print(f"    {detected_mode.title()} allowed: {break_secs}s break available")
         elif productivity_active:
-            # No break time but actively working - video drains break (penalty)
             allowed = True
             reason = "productivity_active"
             print(f"    {detected_mode.title()} allowed: productivity active (penalty mode)")
         else:
-            # No break time AND no productivity - block
             allowed = False
             reason = "no_productivity_no_break"
             print(f"    {detected_mode.title()} blocked: no break time, no productivity")
 
     if allowed:
-        # Update state
+        # Update desktop state
         old_mode = DESKTOP_STATE["current_mode"]
         DESKTOP_STATE["current_mode"] = detected_mode
         DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
 
-        # Trigger Obsidian command
-        command_id = OBSIDIAN_CONFIG["mode_commands"][detected_mode]
-        obsidian_triggered = trigger_obsidian_command(command_id)
+        # Update internal timer (automatic = respects manual lock)
+        now_ms = int(time.monotonic() * 1000)
+        timer_updated, _ = timer_engine.set_mode(TimerMode("work_" + detected_mode), is_automatic=True, now_mono_ms=now_ms)
 
-        # Log event
         await log_event(
             "desktop_mode_change",
             details={
@@ -2524,13 +2815,13 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
                 "new_mode": detected_mode,
                 "window_title": window_title,
                 "source": source,
-                "obsidian_triggered": obsidian_triggered,
+                "timer_updated": timer_updated,
                 "productivity_active": productivity_active,
                 "active_instances": active_count
             }
         )
 
-        print(f"<<< Mode changed: {old_mode} -> {detected_mode} | obsidian={obsidian_triggered}")
+        print(f"<<< Mode changed: {old_mode} -> {detected_mode} | timer={timer_updated}")
 
         return DesktopDetectionResponse(
             action="mode_changed",
@@ -2538,7 +2829,7 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
             old_mode=old_mode,
             new_mode=detected_mode,
             reason="allowed",
-            obsidian_triggered=obsidian_triggered,
+            timer_updated=timer_updated,
             productivity_active=productivity_active,
             active_instance_count=active_count
         )
@@ -2546,8 +2837,8 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
         # Mode change blocked - immediately enforce by closing distraction windows
         print(f"<<< Mode change BLOCKED: {detected_mode} | reason={reason}")
 
-        # Close distraction windows immediately (push-based enforcement)
         enforce_result = close_distraction_windows()
+        send_pavlok_stimulus(reason="desktop_distraction_blocked")
 
         await log_event(
             "desktop_mode_blocked",
@@ -2562,14 +2853,13 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
             }
         )
 
-        # Return 403 to indicate blocked
         raise HTTPException(
             status_code=403,
             detail=DesktopDetectionResponse(
                 action="blocked",
                 detected_mode=detected_mode,
                 reason=reason,
-                obsidian_triggered=False,
+                timer_updated=False,
                 productivity_active=productivity_active,
                 active_instance_count=active_count
             ).model_dump()
@@ -2593,8 +2883,9 @@ async def handle_phone_activity(request: PhoneActivityRequest):
     app_name = request.app.lower()
     action = request.action.lower()
     package = request.package
+    display_name = get_phone_app_display_name(app_name, package)
 
-    print(f">>> Phone activity: app={app_name} action={action} package={package}")
+    print(f">>> Phone activity: app={app_name} ({display_name}) action={action} package={package}")
 
     # Handle app close
     if action == "close":
@@ -2603,24 +2894,22 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         PHONE_STATE["is_distracted"] = False
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
 
-        # Switch Obsidian timer to silence when distraction app closes (async to not block response)
-        obsidian_triggered = False
-        if old_app:  # Only trigger if we were tracking an app
+        # Switch timer to silence when distraction app closes
+        timer_updated = False
+        if old_app:
             DESKTOP_STATE["current_mode"] = "silence"
             DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
-            trigger_obsidian_command_async(
-                OBSIDIAN_CONFIG["mode_commands"]["silence"],
-                no_focus=True
-            )
-            obsidian_triggered = True  # Dispatched (async)
-            print(f"    Phone close -> silence | obsidian=dispatched")
+            now_ms = int(time.monotonic() * 1000)
+            timer_updated, _ = timer_engine.set_mode(TimerMode.WORK_SILENCE, is_automatic=True, now_mono_ms=now_ms)
+            print(f"    Phone close -> silence | timer={timer_updated}")
 
         await log_event(
             "phone_app_closed",
             details={
                 "app": app_name,
+                "display_name": display_name,
                 "package": package,
-                "obsidian_triggered": obsidian_triggered
+                "timer_updated": timer_updated
             }
         )
 
@@ -2644,6 +2933,15 @@ async def handle_phone_activity(request: PhoneActivityRequest):
             message="App not in distraction list"
         )
 
+    # Helper to sync timer mode for phone distraction
+    def _sync_phone_timer():
+        DESKTOP_STATE["current_mode"] = distraction_mode
+        DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
+        now_ms = int(time.monotonic() * 1000)
+        updated, _ = timer_engine.set_mode(TimerMode("work_" + distraction_mode), is_automatic=True, now_mono_ms=now_ms)
+        print(f"    Phone open -> {distraction_mode} | timer={updated}")
+        return updated
+
     # Check work mode
     work_mode = DESKTOP_STATE.get("work_mode", "clocked_in")
 
@@ -2652,25 +2950,14 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         PHONE_STATE["current_app"] = app_name
         PHONE_STATE["is_distracted"] = True
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
-
-        # Sync Obsidian timer to phone distraction mode (async to not block response)
-        obsidian_triggered = False
-        if distraction_mode in OBSIDIAN_CONFIG["mode_commands"]:
-            DESKTOP_STATE["current_mode"] = distraction_mode
-            DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
-            trigger_obsidian_command_async(
-                OBSIDIAN_CONFIG["mode_commands"][distraction_mode],
-                no_focus=True
-            )
-            obsidian_triggered = True  # Dispatched (async)
-            print(f"    Phone open -> {distraction_mode} | obsidian=dispatched")
+        _sync_phone_timer()
 
         await log_event(
             "phone_distraction_allowed",
             details={
                 "app": app_name,
+                "display_name": display_name,
                 "reason": work_mode,
-                "obsidian_triggered": obsidian_triggered
             }
         )
 
@@ -2681,8 +2968,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         )
 
     # Clocked in - check break time and productivity
-    timer_state = get_obsidian_timer_state()
-    break_secs = timer_state.get("breakAvailableSeconds", 0)
+    break_secs = round(timer_engine.accumulated_break_ms / 1000)
 
     # Check productivity (active Claude instances)
     async with aiosqlite.connect(DB_PATH) as db:
@@ -2704,30 +2990,18 @@ async def handle_phone_activity(request: PhoneActivityRequest):
 
     # Decision logic (same as desktop)
     if break_secs > 0:
-        # Has break time - allow
         PHONE_STATE["current_app"] = app_name
         PHONE_STATE["is_distracted"] = True
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
-
-        # Sync Obsidian timer to phone distraction mode (async to not block response)
-        obsidian_triggered = False
-        if distraction_mode in OBSIDIAN_CONFIG["mode_commands"]:
-            DESKTOP_STATE["current_mode"] = distraction_mode
-            DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
-            trigger_obsidian_command_async(
-                OBSIDIAN_CONFIG["mode_commands"][distraction_mode],
-                no_focus=True
-            )
-            obsidian_triggered = True  # Dispatched (async)
-            print(f"    Phone open -> {distraction_mode} | obsidian=dispatched")
+        _sync_phone_timer()
 
         await log_event(
             "phone_distraction_allowed",
             details={
                 "app": app_name,
+                "display_name": display_name,
                 "reason": "break_time",
                 "break_seconds": break_secs,
-                "obsidian_triggered": obsidian_triggered
             }
         )
 
@@ -2740,30 +3014,18 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         )
 
     elif productivity_active:
-        # No break but productive - allow with penalty
         PHONE_STATE["current_app"] = app_name
         PHONE_STATE["is_distracted"] = True
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
-
-        # Sync Obsidian timer to phone distraction mode (async to not block response)
-        obsidian_triggered = False
-        if distraction_mode in OBSIDIAN_CONFIG["mode_commands"]:
-            DESKTOP_STATE["current_mode"] = distraction_mode
-            DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
-            trigger_obsidian_command_async(
-                OBSIDIAN_CONFIG["mode_commands"][distraction_mode],
-                no_focus=True
-            )
-            obsidian_triggered = True  # Dispatched (async)
-            print(f"    Phone open -> {distraction_mode} | obsidian=dispatched")
+        _sync_phone_timer()
 
         await log_event(
             "phone_distraction_allowed",
             details={
                 "app": app_name,
+                "display_name": display_name,
                 "reason": "productivity_active",
                 "active_instances": active_count,
-                "obsidian_triggered": obsidian_triggered
             }
         )
 
@@ -2776,16 +3038,15 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         )
 
     else:
-        # No break, no productivity - block and enforce
         print(f"    BLOCKED: no break time, no productivity")
-
-        # Send enforcement command to phone to disable the app
         enforce_result = enforce_phone_app(app_name, action="disable")
+        send_pavlok_stimulus(reason="phone_distraction_blocked")
 
         await log_event(
             "phone_distraction_blocked",
             details={
                 "app": app_name,
+                "display_name": display_name,
                 "reason": "no_break_no_productivity",
                 "enforcement": enforce_result
             }
@@ -2802,12 +3063,11 @@ async def handle_phone_activity(request: PhoneActivityRequest):
 @app.get("/phone")
 async def get_phone_state():
     """Get current phone activity state."""
-    timer_state = get_obsidian_timer_state()
     return {
         "current_app": PHONE_STATE.get("current_app"),
         "is_distracted": PHONE_STATE.get("is_distracted", False),
         "last_activity": PHONE_STATE.get("last_activity"),
-        "break_seconds": timer_state.get("breakAvailableSeconds", 0),
+        "break_seconds": round(timer_engine.accumulated_break_ms / 1000),
         "work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
         "reachable": PHONE_STATE.get("reachable"),
         "last_reachable_check": PHONE_STATE.get("last_reachable_check"),
@@ -2831,42 +3091,140 @@ async def manual_enforce_phone(app: str, action: str = "disable"):
 @app.post("/api/timer/break-exhausted")
 async def handle_break_exhausted():
     """
-    Called by Obsidian when break time hits 0.
-    Instantly enforces phone app closure if a distraction app is active.
-    This replaces the 5-second polling approach with push-based enforcement.
+    Break exhaustion enforcement endpoint.
+    Now also triggered internally by the timer worker when break time runs out.
+    Kept for backward compat (Obsidian JS may still call it during transition).
     """
-    current_app = PHONE_STATE.get("current_app")
-    if not current_app:
-        return {"enforced": False, "reason": "no_active_app"}
+    result = await enforce_break_exhausted_impl()
+    await log_event("break_exhausted_enforcement", details=result)
 
-    # Map app name to enforcement target
-    enforce_app = current_app
-    if current_app in ("x", "twitter", "com.twitter.android"):
-        enforce_app = "twitter"
-    elif current_app in ("youtube", "com.google.android.youtube", "app.revanced.android.youtube"):
-        enforce_app = "youtube"
-    elif current_app in PHONE_DISTRACTION_APPS:
-        mode = PHONE_DISTRACTION_APPS.get(current_app)
-        if mode == "gaming":
-            enforce_app = "game"
+    if not result.get("enforced"):
+        return {"enforced": False, "reason": "no_active_distractions"}
 
-    print(f"BREAK-EXHAUSTED: Enforcing disable on {current_app} (mapped to {enforce_app})")
-    result = enforce_phone_app(enforce_app, action="disable")
+    return result
 
-    # Clear phone state since we're enforcing closure
-    PHONE_STATE["current_app"] = None
-    PHONE_STATE["is_distracted"] = False
 
-    await log_event(
-        "break_exhausted_enforcement",
-        details={
-            "app": current_app,
-            "enforce_app": enforce_app,
-            "result": result
-        }
+@app.post("/api/timer/set-break")
+async def set_break_time(seconds: int):
+    """Debug: directly set accumulated break time (in seconds). Negative values set backlog."""
+    if seconds < 0:
+        timer_engine._accumulated_break_ms = 0
+        timer_engine._break_backlog_ms = abs(seconds) * 1000
+    else:
+        timer_engine._accumulated_break_ms = seconds * 1000
+        timer_engine._break_backlog_ms = 0
+    await log_event("timer_debug_set_break", details={"seconds": seconds})
+    await timer_save_to_db()
+    return {
+        "accumulated_break_seconds": max(seconds, 0),
+        "accumulated_break_ms": timer_engine._accumulated_break_ms,
+        "backlog_seconds": round(timer_engine._break_backlog_ms / 1000),
+        "backlog_ms": timer_engine._break_backlog_ms,
+    }
+
+
+@app.get("/api/timer")
+async def get_timer_state():
+    """Get full timer state (for debugging, dashboards, Stream Deck)."""
+    return {
+        "current_mode": timer_engine.current_mode.value,
+        "total_work_time": format_timer_time(timer_engine.total_work_time_ms),
+        "total_work_time_ms": timer_engine.total_work_time_ms,
+        "total_break_time": format_timer_time(timer_engine.total_break_time_ms),
+        "total_break_time_ms": timer_engine.total_break_time_ms,
+        "accumulated_break": format_timer_time(timer_engine.accumulated_break_ms),
+        "accumulated_break_ms": timer_engine.accumulated_break_ms,
+        "accumulated_break_seconds": round(timer_engine.accumulated_break_ms / 1000),
+        "break_backlog": format_timer_time(timer_engine.break_backlog_ms),
+        "break_backlog_ms": timer_engine.break_backlog_ms,
+        "is_in_backlog": timer_engine.break_backlog_ms > 0,
+        "daily_start_date": timer_engine.daily_start_date,
+        "manual_mode_lock": timer_engine.manual_mode_lock,
+        "desktop_mode": DESKTOP_STATE.get("current_mode", "silence"),
+        "work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
+    }
+
+
+@app.post("/api/timer/break")
+async def enter_break_mode():
+    """Enter break mode (for Stream Deck / TUI / manual control)."""
+    if timer_engine.accumulated_break_ms <= 0:
+        raise HTTPException(status_code=400, detail="No break time available")
+
+    now_ms = int(time.monotonic() * 1000)
+    changed, _ = timer_engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=now_ms)
+    if changed:
+        await log_event("timer_mode_change", details={"new_mode": "break", "source": "api"})
+    return {"status": "break", "changed": changed, "break_available_seconds": round(timer_engine.accumulated_break_ms / 1000)}
+
+
+@app.post("/api/timer/pause")
+async def enter_pause_mode():
+    """Enter pause mode (for Stream Deck / TUI / manual control)."""
+    now_ms = int(time.monotonic() * 1000)
+    changed, _ = timer_engine.set_mode(TimerMode.PAUSE, is_automatic=False, now_mono_ms=now_ms)
+    if changed:
+        await log_event("timer_mode_change", details={"new_mode": "pause", "source": "api"})
+    return {"status": "pause", "changed": changed}
+
+
+@app.post("/api/timer/resume")
+async def resume_work_mode():
+    """Exit break/pause and return to work_silence."""
+    now_ms = int(time.monotonic() * 1000)
+    changed, _ = timer_engine.set_mode(TimerMode.WORK_SILENCE, is_automatic=False, now_mono_ms=now_ms)
+    if changed:
+        DESKTOP_STATE["current_mode"] = "silence"
+        DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
+        await log_event("timer_mode_change", details={"new_mode": "work_silence", "source": "api"})
+    return {"status": "work_silence", "changed": changed}
+
+
+# ============ Pavlok Endpoints ============
+
+@app.post("/api/pavlok/zap")
+async def pavlok_zap(
+    type: str = "zap",
+    value: int | None = None,
+    reason: str = "manual",
+):
+    """Send a stimulus to the Pavlok watch. Bypasses cooldown for manual triggers."""
+    result = send_pavlok_stimulus(
+        stimulus_type=type,
+        value=value,
+        reason=reason,
+        respect_cooldown=False,
     )
+    await log_event("pavlok_stimulus", details=result)
+    return result
 
-    return {"enforced": True, "app": current_app, "result": result}
+
+@app.post("/api/pavlok/toggle")
+async def pavlok_toggle(enabled: bool | None = None):
+    """Toggle or set Pavlok enforcement. No body = toggle current state."""
+    if enabled is None:
+        PAVLOK_CONFIG["enabled"] = not PAVLOK_CONFIG["enabled"]
+    else:
+        PAVLOK_CONFIG["enabled"] = enabled
+    await log_event("pavlok_toggled", details={"enabled": PAVLOK_CONFIG["enabled"]})
+    return {"enabled": PAVLOK_CONFIG["enabled"]}
+
+
+@app.get("/api/pavlok/status")
+async def pavlok_status():
+    """Get current Pavlok state."""
+    cooldown_remaining = 0.0
+    if PAVLOK_STATE["last_stimulus_at"]:
+        elapsed = (datetime.now() - datetime.fromisoformat(PAVLOK_STATE["last_stimulus_at"])).total_seconds()
+        cooldown_remaining = max(0.0, PAVLOK_CONFIG["cooldown_seconds"] - elapsed)
+    return {
+        "enabled": PAVLOK_CONFIG["enabled"],
+        "token_set": bool(PAVLOK_CONFIG["token"]),
+        "last_stimulus_at": PAVLOK_STATE["last_stimulus_at"],
+        "cooldown_remaining_seconds": round(cooldown_remaining),
+        "default_zap_value": PAVLOK_CONFIG["default_zap_value"],
+        "cooldown_seconds": PAVLOK_CONFIG["cooldown_seconds"],
+    }
 
 
 # ============ Work Mode / Geofence Endpoints ============
@@ -2915,10 +3273,11 @@ async def set_work_mode(request: WorkModeRequest):
 
     print(f">>> Work mode changed: {old_mode} -> {request.mode} (source: {request.source})")
 
-    # If switching to gym mode, trigger the gym timer in Obsidian
-    obsidian_triggered = False
+    # If switching to gym mode, update internal timer
+    timer_updated = False
     if request.mode == "gym":
-        obsidian_triggered = trigger_obsidian_command(OBSIDIAN_CONFIG["mode_commands"]["gym"])
+        now_ms = int(time.monotonic() * 1000)
+        timer_updated, _ = timer_engine.set_mode(TimerMode.GYM, is_automatic=False, now_mono_ms=now_ms)
 
     await log_event(
         "work_mode_change",
@@ -2926,7 +3285,7 @@ async def set_work_mode(request: WorkModeRequest):
             "old_mode": old_mode,
             "new_mode": request.mode,
             "source": request.source,
-            "obsidian_triggered": obsidian_triggered,
+            "timer_updated": timer_updated,
         }
     )
 
@@ -2934,7 +3293,7 @@ async def set_work_mode(request: WorkModeRequest):
         "status": "success",
         "old_mode": old_mode,
         "new_mode": request.mode,
-        "obsidian_triggered": obsidian_triggered,
+        "timer_updated": timer_updated,
     }
 
 
@@ -3689,6 +4048,7 @@ tts_skip_requested: bool = False  # Flag to indicate skip was requested (vs. act
 tts_queue_lock = asyncio.Lock()
 tts_worker_task: Optional[asyncio.Task] = None
 stale_flag_cleaner_task: Optional[asyncio.Task] = None
+timer_worker_task: Optional[asyncio.Task] = None
 
 
 async def tts_queue_worker():
@@ -3775,6 +4135,105 @@ async def tts_queue_worker():
         except Exception as e:
             print(f"TTS worker error: {e}")
             await asyncio.sleep(1)
+
+
+async def timer_worker():
+    """Background worker: ticks timer every 1s, persists state periodically."""
+    last_daily_update = 0.0
+    last_db_save = 0.0
+
+    while True:
+        try:
+            await asyncio.sleep(1)
+            now_ms = int(time.monotonic() * 1000)
+            today = datetime.now().strftime("%Y-%m-%d")
+            result = timer_engine.tick(now_ms, today)
+
+            # Handle events
+            for event in result.events:
+                if event == TimerEvent.BREAK_EXHAUSTED:
+                    asyncio.create_task(_async_enforce_break_exhausted())
+                elif event == TimerEvent.DAILY_RESET:
+                    print(f"TIMER: Daily reset (was {result.reset_date}, now {today}). Productivity score: {result.productivity_score}")
+                    await asyncio.to_thread(
+                        _write_productivity_score, result.reset_date, result.productivity_score
+                    )
+
+            now = time.time()
+
+            # Update daily note every 30s
+            if now - last_daily_update >= 30:
+                await timer_update_daily_note()
+                last_daily_update = now
+
+            # Save to DB every 10s
+            if now - last_db_save >= 10:
+                await timer_save_to_db()
+                last_db_save = now
+
+        except asyncio.CancelledError:
+            # Save state on shutdown
+            await timer_save_to_db()
+            raise
+        except Exception as e:
+            print(f"TIMER worker error: {e}")
+            await asyncio.sleep(1)
+
+
+async def _async_enforce_break_exhausted():
+    """Async enforcement when timer detects break exhaustion."""
+    print("TIMER: Enforcing break exhaustion")
+    result = await enforce_break_exhausted_impl()
+    await log_event("break_exhausted_enforcement", details=result)
+
+
+async def enforce_break_exhausted_impl() -> dict:
+    """Shared enforcement logic for break exhaustion (used by timer worker and API endpoint)."""
+    enforced_any = False
+    phone_result = None
+    desktop_result = None
+
+    # Desktop enforcement: close distraction windows
+    desktop_result = close_distraction_windows()
+    if desktop_result.get("closed_count"):
+        enforced_any = True
+        print(f"BREAK-EXHAUSTED: Closed {desktop_result['closed_count']} desktop distraction windows")
+
+    # Phone enforcement: disable active distraction app
+    current_app = PHONE_STATE.get("current_app")
+    if current_app:
+        enforce_app = current_app
+        if current_app in ("x", "twitter", "com.twitter.android"):
+            enforce_app = "twitter"
+        elif current_app in ("youtube", "com.google.android.youtube", "app.revanced.android.youtube"):
+            enforce_app = "youtube"
+        elif current_app in PHONE_DISTRACTION_APPS:
+            mode = PHONE_DISTRACTION_APPS.get(current_app)
+            if mode == "gaming":
+                enforce_app = "game"
+
+        print(f"BREAK-EXHAUSTED: Enforcing disable on {current_app} (mapped to {enforce_app})")
+        phone_result = enforce_phone_app(enforce_app, action="disable")
+        enforced_any = True
+
+        PHONE_STATE["current_app"] = None
+        PHONE_STATE["is_distracted"] = False
+
+        # Switch timer/desktop back to silence since phone distraction is being closed
+        DESKTOP_STATE["current_mode"] = "silence"
+        DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
+        now_ms = int(time.monotonic() * 1000)
+        timer_engine.set_mode(TimerMode.WORK_SILENCE, is_automatic=True, now_mono_ms=now_ms)
+
+    if enforced_any:
+        send_pavlok_stimulus(reason="break_exhausted")
+
+    return {
+        "enforced": enforced_any,
+        "app": current_app,
+        "desktop_enforcement": desktop_result,
+        "phone_enforcement": phone_result,
+    }
 
 
 async def clear_stale_processing_flags():

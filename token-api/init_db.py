@@ -156,6 +156,15 @@ def init_database():
         )
     """)
 
+    # Create timer_state table (single-row, stores timer engine state as JSON)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS timer_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            state_json TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     # Seed devices
     cursor.execute("""
         INSERT OR IGNORE INTO devices (id, name, type, tailscale_ip, notification_method, tts_engine)

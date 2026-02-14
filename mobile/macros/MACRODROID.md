@@ -4,24 +4,38 @@ Current state of macros deployed to the phone.
 
 ## Summary
 
-- **Total Macros:** 22
-- **Enabled:** 20
+- **Total Macros:** 33
+- **Enabled:** 31
 - **Disabled:** 2 (Twitter Management, Games Management - local fallback only)
 
-## Telemetry (6 macros)
+## Global Variables
+
+| Variable | Type | Purpose |
+|----------|------|---------|
+| `yt_bg` | bool | YouTube background playback active (PiP/audio) |
+| `Connection` | bool | Server connectivity state |
+| `Revanced` | bool | ReVanced variant tracking |
+
+## Telemetry (9 macros)
 
 Report app events to server at `POST /phone`.
 
-| Macro | Trigger | POST Body | Fallback |
-|-------|---------|-----------|----------|
-| Twitter Open | X app opened | `{"app": "twitter", "action": "open"}` | Yes |
-| Twitter Close | X app closed | `{"app": "twitter", "action": "close"}` | No |
-| YouTube Open | YouTube opened | `{"app": "youtube", "action": "open"}` | Yes |
-| YouTube Close | YouTube closed | `{"app": "youtube", "action": "close"}` | No |
-| Games Open | Game opened | `{"app": "game", "action": "open"}` | Yes |
-| Games Close | Game closed | `{"app": "game", "action": "close"}` | No |
+| Macro | Trigger | POST Body | Notes |
+|-------|---------|-----------|-------|
+| Twitter Open | X app opened | `{"app": "twitter", "action": "open"}` | Fallback on server error |
+| Twitter Close | X app closed | `{"app": "twitter", "action": "close"}` | |
+| YouTube Open | YouTube opened | `{"app": "youtube", "action": "open"}` | Clears `yt_bg`, fallback + reconnect logic |
+| YouTube Close | YouTube closed | `{"app": "youtube", "action": "close"}` | PiP detection: if music playing, sets `yt_bg=true` and waits |
+| Youtube Play | Music starts (bg) | (runs YouTube Open) | Constraint: `yt_bg==true` |
+| Youtube Pause | Music stops (bg) | (runs YouTube Close) | Constraint: `yt_bg==true` |
+| Games Open | Game opened | `{"app": "game", "action": "open"}` | Fallback on server error |
+| Games Close | Game closed | `{"app": "game", "action": "close"}` | |
+| Spotify open | Spotify opened | (clears `yt_bg`) | New media source takes over |
 
-**Fallback behavior:** If server returns non-200, triggers local management and enables all local fallback macros.
+**YouTube PiP/Background Detection:**
+When YouTube leaves foreground, if music is still playing (PiP or background audio), the Close macro sets `yt_bg=true` and waits for music to stop. The Play/Pause macros use `MusicPlaying` trigger + `yt_bg` constraint to re-report open/close events during background playback.
+
+**Fallback behavior:** If server returns non-200 on open, triggers local management. If server reconnects (Connection==response_code), disables local fallback.
 
 ## Geofence (4 macros)
 
@@ -38,16 +52,17 @@ Report location events to server.
 - Home: `1e4e4f0d-...` (33.41694, -111.92196) r=20m
 - Gym: `7fa61f1d-fcc7-4ffc-8b83-0e5b6ba0e0dd` (33.42584, -111.91496) r=150m
 
-## Enforcement (6 macros)
+## Enforcement (7 macros)
 
-| Macro | Status | Trigger | Purpose |
-|-------|--------|---------|---------|
-| Enforce | ✓ | HTTP `/enforce` | Server-pushed enable/disable |
-| Enable Local Fallback | ✓ | HTTP `/enable-local` + run_macro | Enable local management |
-| Disable Local Fallback | ✓ | HTTP `/disable-local` | Disable local management |
-| Twitter Management | ✗ | X app opened | Local fallback enforcement |
-| Games Management | ✗ | Game opened | Local fallback enforcement |
-| Youtube management | ✓ | Various | Time/geofence based control |
+| Macro | Status | Purpose |
+|-------|--------|---------|
+| Enforce | ✓ | Server-pushed enable/disable via HTTP `/enforce` |
+| Enable Local Fallback | ✓ | Enable local management macros |
+| Disable Local Fallback | ✓ | Disable local management (server back) |
+| Twitter Management | ✗ | Local fallback enforcement for X |
+| Games Management | ✗ | Local fallback enforcement for games |
+| Youtube Enable | ✓ | Enable YouTube apps |
+| Youtube Disable | ✓ | Disable YouTube apps |
 
 ### Enforce Endpoint
 
@@ -56,25 +71,43 @@ Accepts `?action=disable&app=<name>` or `?action=enable&app=<name>`:
 - `app=youtube` → YouTube + ReVanced (com.google.android.youtube, app.revanced.android.youtube)
 - `app=game` → Thronefall, Slice & Dice, 20 Minutes Till Dawn, OneBit Adventure
 
-## Endpoints (2 macros)
+## Endpoints (3 macros)
 
 | Macro | Endpoint | Purpose |
 |-------|----------|---------|
-| List Exports API | `/list-exports` | List available .mdr exports |
 | Claude notifications | `/notify` | Show notification with vibrate |
+| Heartbeat | `/heartbeat` | Server reachability check (returns status JSON) |
+| Server Poll | Every 10min | GET /health, disables local fallback if server is up |
 
-## Other (4 macros)
+## Automation (2 macros)
 
-| Macro | Status | Purpose |
-|-------|--------|---------|
-| Spotify start | ✓ | Auto-start Spotify |
-| Youtube Toggle | ✓ | Toggle YouTube state |
-| Youtube Enable | ✓ | Enable YouTube apps |
-| Youtube Disable | ✓ | Sunrise-triggered YouTube control |
-| YouTube Gym Enable | ✓ | Enable YouTube at gym |
-| YouTube Gym Disable | ✓ | Disable YouTube leaving gym |
-| Change song | ✓ | Media control via swipe |
-| Server Poll | ✓ | Periodic server health check |
+| Macro | Endpoint | Purpose |
+|-------|----------|---------|
+| List Exports API | `/list-exports` | Export .mdr and respond |
+| Pavlok Endpoint | `/pavlok` | Trigger Pavlok stimulus |
+
+## System (1 macro)
+
+| Macro | Trigger | Purpose |
+|-------|---------|---------|
+| Boot Start SSHD | Device boot | Start Termux sshd via Termux:Tasker plugin |
+
+## Music & Audio (2 macros)
+
+| Macro | Trigger | Purpose |
+|-------|---------|---------|
+| Change song | Swipe gestures | Next/prev track on locked screen |
+| Spotify start | - | Auto-start Spotify |
+
+## Uncategorized / Test (5 macros)
+
+| Macro | Notes |
+|-------|-------|
+| Youtube Toggle | Toggle YouTube state |
+| Twitter | Test/legacy |
+| Tele | Test macro (media button trigger) |
+| Hello worl | Test macro |
+| Bluetooth priority | Placeholder (blocked by permissions) |
 
 ## App Package References
 
@@ -83,6 +116,7 @@ Accepts `?action=disable&app=<name>` or `?action=enable&app=<name>`:
 | X (Twitter) | `com.twitter.android` |
 | YouTube | `com.google.android.youtube` |
 | YouTube ReVanced | `app.revanced.android.youtube` |
+| Spotify | `com.spotify.music` |
 | Thronefall | `com.doghowlgames.thronefall` |
 | Slice & Dice | `com.com.tann.dice` |
 | 20 Minutes Till Dawn | `com.Flanne.MinutesTillDawn.roguelike.shooting.gp` |
@@ -93,9 +127,12 @@ Accepts `?action=disable&app=<name>` or `?action=enable&app=<name>`:
 All macro specs are in `/home/token/Scripts/mobile/macros/*.yaml`:
 - `twitter-open.yaml`, `twitter-close.yaml`
 - `youtube-open.yaml`, `youtube-close.yaml`
+- `youtube-play.yaml`, `youtube-pause.yaml`
+- `spotify-open.yaml`
 - `games-open.yaml`, `games-close.yaml`
 - `geofence-home-enter.yaml`, `geofence-home-exit.yaml`
 - `geofence-gym-enter.yaml`, `geofence-gym-exit.yaml`
 - `enforce.yaml`
 - `enable-local-fallback.yaml`, `disable-local-fallback.yaml`
 - `list-exports.yaml`
+- `heartbeat.yaml`, `pavlok.yaml`, `boot-sshd.yaml`

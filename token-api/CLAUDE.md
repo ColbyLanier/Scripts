@@ -12,7 +12,9 @@ Local FastAPI server for Claude instance management, notifications, and system c
 
 | File | Purpose |
 |------|---------|
-| `main.py` | FastAPI server (~3000 lines) |
+| `main.py` | FastAPI server (~5000 lines) |
+| `timer.py` | TimerEngine class — pure logic, no I/O |
+| `test_timer.py` | Unit tests for TimerEngine (48 tests) |
 | `token-api-tui.py` | TUI dashboard (~1500 lines) |
 | `init_db.py` | Database initialization |
 | `DESIGN.md` | Original design doc (partially outdated) |
@@ -67,6 +69,16 @@ GET    /api/notify/queue/status         # TTS queue status
 POST   /api/tts/skip                    # Skip current TTS (?clear_queue=true to clear queue)
 ```
 
+### Pavlok (Shock Watch)
+```
+POST   /api/pavlok/zap                  # Send stimulus (?type=zap|beep|vibe&value=1-100&reason=manual)
+POST   /api/pavlok/toggle               # Toggle enabled (?enabled=true|false, no param = toggle)
+GET    /api/pavlok/status               # Current state (enabled, cooldown, last stimulus)
+```
+
+Pavlok is hooked into all 3 enforcement paths (desktop blocked, phone blocked, break exhausted).
+Config: `PAVLOK_CONFIG` in main.py. Token: `.env` `PAVLOK_API_TOKEN`. Cooldown: 45s between stimuli.
+
 ### System
 ```
 GET    /api/dashboard                   # Dashboard data
@@ -118,7 +130,7 @@ The current page is shown in the status bar.
 
 ```bash
 # Check if server is running
-curl http://localhost:7777/health
+token-ping health                # or: curl http://localhost:7777/health
 
 # View active instances
 agents-db instances
@@ -133,7 +145,7 @@ agents-db query "SELECT id, tab_name FROM claude_instances WHERE id='...'"
 journalctl -u token-api -f
 
 # Test TTS (wait 10s after for user feedback)
-curl -s http://localhost:7777/api/notify/test | jq .
+token-ping notify/test           # or: curl -s http://localhost:7777/api/notify/test | jq .
 # Then sleep 10 and ask user if they heard it
 ```
 
@@ -155,12 +167,15 @@ curl -s http://localhost:7777/api/notify/test | jq .
 |---------|---------|
 | `agents-db` | Query local agents.db database |
 | `token-status` | Quick server status check |
-| `token-restart` | Restart the server (systemd) |
+| `token-restart` | Restart server and/or TUI (systemd) |
 | `notify-test` | Send test notifications |
 | `tts-skip` | Skip current TTS (--all to clear queue) |
 | `instance-name` | Rename current session |
 | `instance-stop` | Stop/unstick/kill instance by name (fuzzy match) |
 | `instances-clear` | Bulk clear stopped instances |
+| `token-ping` | Hit any endpoint (fuzzy match, auto-restart, OpenAPI-aware) |
+| `timer-status` | Quick timer status (mode, break time, work time) |
+| `timer-mode` | Switch timer mode (break, pause, resume) |
 
 ### General (also useful here)
 
@@ -175,8 +190,10 @@ curl -s http://localhost:7777/api/notify/test | jq .
 # Quick status check
 token-status
 
-# Restart the server
-token-restart                    # Restart via systemd
+# Restart the server (auto-signals TUI if code changed)
+token-restart                    # Restart via systemd (auto-detects TUI changes)
+token-restart --tui              # Restart server + always signal TUI restart
+token-restart --tui-only         # Signal TUI restart only (no server restart)
 token-restart --watch            # Restart and tail logs
 token-restart --status           # Check status only
 
@@ -199,6 +216,25 @@ notify-test --sound-only
 # Skip TTS
 tts-skip                         # Skip current TTS
 tts-skip --all                   # Skip and clear queue
+
+# Timer
+timer-status                     # One-line: mode, break, work time
+timer-status --watch             # Live updating (1s refresh)
+timer-status --json              # Raw JSON
+timer-mode break                 # Enter break mode
+timer-mode pause                 # Enter pause mode
+timer-mode resume                # Back to work_silence
+timer-mode status                # Show mode + lock state
+
+# Hit any endpoint
+token-ping                       # List all endpoints (from OpenAPI)
+token-ping health                # GET /health
+token-ping timer/break           # POST /api/timer/break (prefix match)
+token-ping break                 # POST /api/timer/break (suffix match)
+token-ping zap type=beep value=75  # POST with query params
+token-ping notify message=hello  # POST with JSON body (schema-aware)
+token-ping --raw health | jq .   # Pipe-friendly raw JSON
+token-ping --no-restart health   # Skip auto-restart if server down
 
 # Query database
 agents-db events --limit 5

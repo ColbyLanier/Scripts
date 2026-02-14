@@ -1,3 +1,4 @@
 #!/usr/bin/env bash
-# Convenience shim for cloud-logs command
-exec "$HOME/Scripts/cli-tools/bin/cli-wrapper" cloud-logs "$@"
+# Fetch and tail Cloud Run logs
+set -euo pipefail
+exec uv run --project "$HOME/Scripts/cli-tools" python -m cli_tools.cloud_logs.cli "$@"

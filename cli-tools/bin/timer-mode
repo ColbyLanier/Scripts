@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Switch timer mode from the command line.
+
+Usage:
+    timer-mode break          # Enter break mode (consumes accumulated break)
+    timer-mode pause          # Enter pause mode (no accumulation)
+    timer-mode resume         # Return to work_silence
+    timer-mode silence        # Alias for resume
+    timer-mode status         # Show current mode (same as timer-status)
+"""
+
+import sys
+import json
+import urllib.request
+
+API_URL = "http://localhost:7777"
+
+COMMANDS = {
+    "break": ("POST", "/api/timer/break"),
+    "pause": ("POST", "/api/timer/pause"),
+    "resume": ("POST", "/api/timer/resume"),
+    "silence": ("POST", "/api/timer/resume"),
+    "status": ("GET", "/api/timer"),
+}
+
+
+def color(text, code):
+    return f"\033[{code}m{text}\033[0m"
+
+
+def api_call(method, path):
+    try:
+        req = urllib.request.Request(f"{API_URL}{path}", method=method)
+        if method == "POST":
+            req.add_header("Content-Type", "application/json")
+            req.data = b""
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        try:
+            detail = json.loads(body).get("detail", body)
+        except Exception:
+            detail = body
+        return e.code, {"error": detail}
+    except Exception as e:
+        return 0, {"error": str(e)}
+
+
+def main():
+    args = sys.argv[1:]
+
+    if not args or "--help" in args or "-h" in args:
+        print(__doc__.strip())
+        return
+
+    cmd = args[0].lower()
+    if cmd not in COMMANDS:
+        print(f"Unknown command: {cmd}", file=sys.stderr)
+        print(f"Valid: {', '.join(COMMANDS.keys())}", file=sys.stderr)
+        sys.exit(1)
+
+    method, path = COMMANDS[cmd]
+    status, data = api_call(method, path)
+
+    if cmd == "status":
+        if status == 200:
+            mode = data.get("current_mode", "?")
+            break_s = data.get("accumulated_break_seconds", 0)
+            print(f"Mode: {mode}  Break: {break_s}s  Lock: {data.get('manual_mode_lock', False)}")
+        else:
+            print(color(f"Error: {data.get('error', 'unknown')}", "31"), file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if status == 200:
+        changed = data.get("changed", False)
+        new_mode = data.get("status", cmd)
+        if changed:
+            print(color(f"Switched to {new_mode}", "32"))
+        else:
+            print(f"Already in {new_mode} (no change)")
+
+        if "break_available_seconds" in data:
+            print(f"Break available: {data['break_available_seconds']}s")
+    elif status == 400:
+        print(color(f"Blocked: {data.get('error', 'unknown')}", "33"), file=sys.stderr)
+        sys.exit(1)
+    else:
+        print(color(f"Error ({status}): {data.get('error', 'unknown')}", "31"), file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

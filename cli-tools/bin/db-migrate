@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Run Cloud SQL schema migrations
+set -euo pipefail
+exec uv run --project "$HOME/Scripts/cli-tools" python -m cli_tools.db_migrate.cli "$@"

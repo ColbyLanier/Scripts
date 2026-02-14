@@ -1,18 +1,47 @@
-# YouTube Close Tracker
+# YouTube Close Tracker (with PiP/background audio detection)
 # Reports to /phone when YouTube is closed
+# If music is playing when YouTube leaves foreground, waits for music to stop
+# before sending the close event (handles PiP and background playback)
 
 name: "YouTube Close"
 category: "Telemetry"
 description: "Track YouTube app closes"
 enabled: true
 
+global_variables:
+  - name: yt_bg
+    type: boolean
+    value: false
+
 triggers:
   - type: app_launched
     apps: ["YouTube", "YouTube"]
     packages: ["com.google.android.youtube", "app.revanced.android.youtube"]
-    launched: false  # App closed
+    launched: false  # App closed/left foreground
 
 actions:
+  # If music is still playing, YouTube is in PiP or background audio
+  - type: if
+    conditions:
+      - type: music_active
+        playing: true
+
+  # Flag that YouTube is running in background
+  - type: set_variable
+    name: yt_bg
+    var_type: boolean
+    value: true
+    local: false
+
+  # Wait until music stops (PiP closed or audio paused)
+  - type: wait_until
+    triggers:
+      - type: music_playing
+        started: false  # Music stopped
+
+  - type: end_if
+
+  # POST close event (fires immediately if no media, after wait if media was playing)
   - type: http_request
     url: "http://100.95.109.23:7777/phone"
     method: POST
