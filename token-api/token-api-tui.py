@@ -53,8 +53,8 @@ from rich.text import Text
 from rich.prompt import Prompt
 from rich.highlighter import JSONHighlighter
 
-# API configuration
-API_URL = "http://localhost:7777"
+# API configuration — server runs on Mac Mini, reached via Tailscale
+API_URL = "http://100.95.109.23:7777"
 SERVER_PORT = 7777
 
 # Configuration
