@@ -5,9 +5,10 @@ Token-API TUI: Terminal dashboard for Claude instance management.
 Connects to existing Token-API server running on port 7777.
 
 Controls:
-  arrow/jk  - Select instance (up/down)
-  g/G       - Jump to first/last instance
-  h/l       - Switch info panel (Events/Logs/Deploy)
+  arrow/jk  - Select instance/cron job (up/down)
+  g/G       - Jump to first/last
+  [/]       - Switch table (Instances/Cron)
+  h/l       - Switch info panel (Events/Logs/Deploy/Monitor)
   Enter     - Open selected instance in new terminal tab
   r         - Rename selected instance
   y         - Copy resume command to clipboard (yank)
@@ -58,6 +59,13 @@ SERVER_PORT = 7777
 
 # Configuration
 DB_PATH = Path.home() / ".claude" / "agents.db"
+OPENCLAW_WORKSPACE = Path.home() / ".openclaw" / "workspace"
+HEARTBEAT_LOG_PATH = OPENCLAW_WORKSPACE / "memory" / "heartbeat_log.md"
+WATCHDOG_LOG_PATH = OPENCLAW_WORKSPACE / "memory" / "watchdog_log.md"
+HEARTBEAT_STATE_PATH = OPENCLAW_WORKSPACE / "memory" / "heartbeat-state.json"
+CRON_WORKER_LOG_PATH = OPENCLAW_WORKSPACE / "memory" / "cron_worker_log.md"
+SECURITY_LOG_PATH = OPENCLAW_WORKSPACE / "memory" / "security_log.md"
+CRON_RUNS_DIR = Path.home() / ".openclaw" / "cron" / "runs"
 REFRESH_INTERVAL = 2  # seconds
 TIMER_STATE_PATH = Path("/mnt/c/Users/colby/Documents/Obsidian/Token-ENV/Scripts/timer-state.json")
 
@@ -98,8 +106,10 @@ layout_mode = "full"  # "mobile", "vertical", "compact", or "full"
 layout_mode_forced = False  # True if user used --mobile, --vertical, --compact, or --no-mobile
 sort_mode = "recent_activity"  # "status", "recent_activity", "recent_stopped", "created"
 filter_mode = "all"  # "all", "active", "stopped"
+table_mode = "instances"  # "instances" or "cron"
+cron_selected_index = 0
 panel_page = 0  # 0 = events view, 1 = server logs view, 2 = deploy logs view
-PANEL_PAGE_MAX = 2  # 0=Events, 1=Logs, 2=Deploy
+PANEL_PAGE_MAX = 3  # 0=Events, 1=Logs, 2=Deploy, 3=Monitor
 deploy_active = False
 deploy_log_path = None
 deploy_metadata = {}
@@ -814,6 +824,374 @@ def create_mobile_instances_table(instances: list, selected_idx: int) -> Table:
     return table
 
 
+def _format_cron_schedule(job: dict) -> str:
+    """Format cron job schedule as a compact string."""
+    schedule = job.get("schedule", {})
+    every_ms = schedule.get("everyMs", 0)
+    if every_ms >= 3600000:
+        return f"{every_ms // 3600000}h"
+    elif every_ms >= 60000:
+        return f"{every_ms // 60000}m"
+    return schedule.get("cron", "?")
+
+
+def _format_cron_next(job: dict) -> str:
+    """Format next run countdown for a cron job."""
+    state = job.get("state", {})
+    next_run_ms = state.get("nextRunAtMs")
+    if not next_run_ms:
+        return "[dim]--:--[/dim]"
+    secs_left = max(0, int((next_run_ms / 1000) - time.time()))
+    mins, secs = divmod(secs_left, 60)
+    if mins >= 60:
+        hours = mins // 60
+        mins = mins % 60
+        cd_str = f"{hours}h{mins:02d}m"
+    else:
+        cd_str = f"{mins}:{secs:02d}"
+    if secs_left <= 0:
+        return "[green bold]NOW[/green bold]"
+    elif secs_left <= 60:
+        return f"[red bold]{cd_str}[/red bold]"
+    elif secs_left <= 300:
+        return f"[yellow]{cd_str}[/yellow]"
+    return f"[cyan]{cd_str}[/cyan]"
+
+
+def _format_cron_last(job: dict) -> str:
+    """Format last run time for a cron job."""
+    state = job.get("state", {})
+    last_run_ms = state.get("lastRunAtMs")
+    if not last_run_ms:
+        return "[dim]--[/dim]"
+    last_ago = int(time.time() - (last_run_ms / 1000))
+    if last_ago < 60:
+        return f"{last_ago}s ago"
+    elif last_ago < 3600:
+        return f"{last_ago // 60}m ago"
+    return f"{last_ago // 3600}h ago"
+
+
+def _format_cron_status(job: dict) -> str:
+    """Format cron job status."""
+    if not job.get("enabled", True):
+        return "[dim]disabled[/dim]"
+    state = job.get("state", {})
+    job_status = state.get("status", "idle")
+    if job_status == "running":
+        return "[green bold]running[/green bold]"
+    return "[cyan]idle[/cyan]"
+
+
+def create_cron_table(jobs: list, selected_idx: int) -> Table:
+    """Create the cron jobs table (full layout)."""
+    table = Table(
+        show_header=True,
+        header_style="bold cyan",
+        border_style="blue",
+        expand=False
+    )
+
+    table.add_column("", width=2, justify="center")
+    table.add_column("Name", style="white", min_width=15)
+    table.add_column("Schedule", style="dim", width=8, justify="center")
+    table.add_column("Next", width=10, justify="right")
+    table.add_column("Last", style="dim", width=10, justify="right")
+    table.add_column("Status", width=10)
+
+    for i, job in enumerate(jobs):
+        selector = "[yellow]>[/yellow]" if i == selected_idx else " "
+        name = job.get("name", job.get("id", "?")[:12])
+        if i == selected_idx:
+            name = f"[bold yellow]{name}[/bold yellow]"
+
+        table.add_row(
+            selector,
+            name,
+            _format_cron_schedule(job),
+            _format_cron_next(job),
+            _format_cron_last(job),
+            _format_cron_status(job),
+        )
+
+    if not jobs:
+        table.add_row(" ", "[dim]No cron jobs[/dim]", "-", "-", "-", "-")
+
+    return table
+
+
+def create_compact_cron_table(jobs: list, selected_idx: int) -> Table:
+    """Create a compact cron jobs table (compact/vertical layout)."""
+    table = Table(
+        show_header=True,
+        header_style="bold cyan",
+        border_style="blue",
+        expand=True
+    )
+
+    table.add_column("", width=2, justify="center")
+    table.add_column("Name", style="white")
+    table.add_column("Next", width=10, justify="right")
+    table.add_column("Last", style="dim", width=10, justify="right")
+
+    for i, job in enumerate(jobs):
+        selector = "[yellow]>[/yellow]" if i == selected_idx else " "
+        name = job.get("name", job.get("id", "?")[:12])
+        if i == selected_idx:
+            name = f"[bold yellow]{name}[/bold yellow]"
+
+        table.add_row(
+            selector,
+            name,
+            _format_cron_next(job),
+            _format_cron_last(job),
+        )
+
+    if not jobs:
+        table.add_row(" ", "[dim]No cron jobs[/dim]", "-", "-")
+
+    return table
+
+
+def create_mobile_cron_table(jobs: list, selected_idx: int) -> Table:
+    """Create a mobile cron jobs table."""
+    table = Table(
+        title="Cron [dim](jk \\[\\] q)[/dim]",
+        show_header=True,
+        header_style="bold cyan",
+        border_style="blue",
+        expand=True,
+        padding=(0, 0)
+    )
+
+    table.add_column("", width=1, justify="center")
+    table.add_column("Name", style="white", no_wrap=True, max_width=20)
+    table.add_column("Next", width=8, justify="right")
+
+    for i, job in enumerate(jobs):
+        selector = "[yellow]>[/yellow]" if i == selected_idx else " "
+        name = job.get("name", job.get("id", "?")[:12])
+        if len(name) > 18:
+            name = name[:15] + "..."
+        if i == selected_idx:
+            name = f"[bold yellow]{name}[/bold yellow]"
+
+        table.add_row(selector, name, _format_cron_next(job))
+
+    if not jobs:
+        table.add_row(" ", "[dim]No jobs[/dim]", "-")
+
+    return table
+
+
+def get_cron_run_history(job_id: str, max_runs: int = 5) -> list[dict]:
+    """Load recent run records from ~/.openclaw/cron/runs/<job_id>.jsonl.
+
+    Returns list of dicts with keys: ts, status, summary, error, durationMs
+    (most recent first).
+    """
+    run_file = CRON_RUNS_DIR / f"{job_id}.jsonl"
+    if not run_file.exists():
+        return []
+    try:
+        entries = []
+        for line in run_file.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            entries.append(json.loads(line))
+        # Most recent first, take last N
+        return entries[-max_runs:][::-1]
+    except Exception:
+        return []
+
+
+# Cache run history (refresh every 15s alongside cron jobs)
+_cron_runs_cache: dict[str, list] = {}
+_cron_runs_cache_time: float = 0
+
+
+def get_cached_cron_run_history(job_id: str, max_runs: int = 5) -> list[dict]:
+    """Cached wrapper around get_cron_run_history."""
+    global _cron_runs_cache, _cron_runs_cache_time
+    now = time.time()
+    if now - _cron_runs_cache_time > 15:
+        _cron_runs_cache = {}
+        _cron_runs_cache_time = now
+    if job_id not in _cron_runs_cache:
+        _cron_runs_cache[job_id] = get_cron_run_history(job_id, max_runs)
+    return _cron_runs_cache[job_id]
+
+
+def _wrap_summary_lines(text: str, width: int = 70) -> list[str]:
+    """Split a summary into lines that fit within width, respecting markdown bullets."""
+    raw_lines = text.split("\n")
+    out = []
+    for line in raw_lines:
+        line = line.rstrip()
+        # Strip markdown bold markers for cleaner display
+        clean = line.replace("**", "")
+        if not clean:
+            continue
+        # Wrap long lines
+        while len(clean) > width:
+            # Find a break point
+            brk = clean.rfind(" ", 0, width)
+            if brk <= 0:
+                brk = width
+            out.append(clean[:brk])
+            clean = "  " + clean[brk:].lstrip()
+        out.append(clean)
+    return out
+
+
+def create_cron_details_panel(job: dict, max_lines: int = 8) -> Panel:
+    """Create a panel showing details for the selected cron job."""
+    if not job:
+        return Panel("[dim]No cron job selected[/dim]", title="Cron Details", border_style="magenta")
+
+    lines = []
+    name = job.get("name", job.get("id", "?"))
+    job_id = job.get("id", "")
+    enabled = job.get("enabled", True)
+    schedule_str = _format_cron_schedule(job)
+    state = job.get("state", {})
+    job_status = state.get("status", "idle")
+
+    # Header: name + status
+    status_tag = "[green]enabled[/green]" if enabled else "[red]disabled[/red]"
+    if job_status == "running":
+        status_tag = "[green bold]RUNNING[/green bold]"
+    errors = state.get("consecutiveErrors", 0)
+    error_tag = f"  [red bold]{errors} consecutive errors[/red bold]" if errors > 0 else ""
+    lines.append(f"[bold]{name}[/bold]  ({schedule_str})  {status_tag}{error_tag}")
+
+    # Last/next timing
+    last_run_ms = state.get("lastRunAtMs")
+    if last_run_ms:
+        last_dt = datetime.fromtimestamp(last_run_ms / 1000)
+        last_str = last_dt.strftime("%H:%M:%S")
+        duration_ms = state.get("lastDurationMs")
+        dur_str = f" ({duration_ms // 1000}s)" if duration_ms else ""
+        last_status = state.get("lastStatus", "")
+        result_style = "green" if last_status in ("ok", "success", "") else "red"
+        result_tag = f"[{result_style}]{last_status}[/{result_style}]" if last_status else ""
+        lines.append(f"Last: [cyan]{last_str}[/cyan]{dur_str} {result_tag}  Next: {_format_cron_next(job)}")
+    else:
+        lines.append(f"[dim]No previous runs[/dim]  Next: {_format_cron_next(job)}")
+
+    # Load run transcript — the real content
+    runs = get_cached_cron_run_history(job_id, max_runs=3)
+    if runs:
+        latest = runs[0]
+        summary = latest.get("summary", "")
+        error = latest.get("error", "")
+
+        if error:
+            lines.append(f"[red]{error}[/red]")
+        if summary:
+            lines.append("")
+            summary_lines = _wrap_summary_lines(summary, width=70)
+            for sl in summary_lines:
+                if len(lines) >= max_lines:
+                    break
+                # Color bullet lines
+                stripped = sl.lstrip()
+                if stripped.startswith("- "):
+                    lines.append(f"[green]>[/green] {stripped[2:]}")
+                else:
+                    lines.append(sl)
+        elif not error:
+            lines.append("[dim]No summary from last run[/dim]")
+    else:
+        lines.append("[dim]No run history[/dim]")
+
+    content = "\n".join(lines[:max_lines])
+    return Panel(content, title="Cron Details", border_style="magenta")
+
+
+def create_compact_cron_details_panel(job: dict) -> Panel:
+    """Create a compact single-line cron details panel for vertical layout."""
+    if not job:
+        return Panel("[dim]No cron job selected[/dim]", title="Cron Details", border_style="magenta")
+
+    name = job.get("name", job.get("id", "?"))
+    job_id = job.get("id", "")
+    schedule_str = _format_cron_schedule(job)
+    state = job.get("state", {})
+    job_status = state.get("status", "idle")
+
+    parts = [f"[bold]{name}[/bold]"]
+    parts.append(f"[dim]({schedule_str})[/dim]")
+
+    if job_status == "running":
+        parts.append("[green bold]RUNNING[/green bold]")
+    elif not job.get("enabled", True):
+        parts.append("[red]disabled[/red]")
+
+    # First line of last run summary
+    runs = get_cached_cron_run_history(job_id, max_runs=1)
+    if runs:
+        latest = runs[0]
+        error = latest.get("error", "")
+        summary = latest.get("summary", "")
+        if error:
+            if len(error) > 40:
+                error = error[:37] + "..."
+            parts.append(f"[red]{error}[/red]")
+        elif summary:
+            # Grab first meaningful line
+            for line in summary.split("\n"):
+                line = line.strip().replace("**", "")
+                if line and not line.startswith("#"):
+                    if len(line) > 45:
+                        line = line[:42] + "..."
+                    parts.append(f"[dim]{line}[/dim]")
+                    break
+
+    content = "  ".join(parts)
+    return Panel(content, title="Cron Details", border_style="magenta")
+
+
+def create_mobile_cron_details_panel(job: dict) -> Panel:
+    """Create a compact cron details panel for mobile."""
+    if not job:
+        return Panel("[dim]No selection[/dim]", title="Details", border_style="magenta", padding=(0, 1))
+
+    lines = []
+    name = job.get("name", job.get("id", "?"))
+    job_id = job.get("id", "")
+    state = job.get("state", {})
+    job_status = state.get("status", "idle")
+
+    status_icon = "[green]>[/green]" if job_status == "running" else "[cyan]*[/cyan]"
+    lines.append(f"{status_icon} [bold]{name}[/bold]  [dim]{_format_cron_schedule(job)}[/dim]")
+
+    # Last run summary from transcript
+    runs = get_cached_cron_run_history(job_id, max_runs=1)
+    if runs:
+        latest = runs[0]
+        error = latest.get("error", "")
+        summary = latest.get("summary", "")
+        if error:
+            if len(error) > 35:
+                error = error[:32] + "..."
+            lines.append(f"[red]{error}[/red]")
+        elif summary:
+            # First meaningful line
+            for line in summary.split("\n"):
+                line = line.strip().replace("**", "")
+                if line and not line.startswith("#"):
+                    if len(line) > 35:
+                        line = line[:32] + "..."
+                    lines.append(f"[dim]{line}[/dim]")
+                    break
+    else:
+        lines.append(f"Next: {_format_cron_next(job)}")
+
+    return Panel("\n".join(lines), title="Details", border_style="magenta", padding=(0, 1))
+
+
 def create_compact_instances_table(instances: list, selected_idx: int) -> Table:
     """Create a compact instances table without Task column (for compact mode)."""
     max_name_len = 25
@@ -1258,26 +1636,354 @@ def create_server_status_panel() -> Panel:
     return Panel(content, title="API Server", border_style=border)
 
 
+def parse_heartbeat_entries(max_entries: int = 20) -> list[dict]:
+    """Parse structured entries from heartbeat_log.md."""
+    entries = []
+    try:
+        lines = HEARTBEAT_LOG_PATH.read_text().splitlines()
+        for line in lines:
+            line = line.strip()
+            if not line.startswith("- ["):
+                continue
+            # Parse: - [YYYY-MM-DD HH:MM:SS] ACTION: ... | NEXT: ...
+            # or:    - [YYYY-MM-DD HH:MM:SS] IDLE: ...
+            # or:    - [YYYY-MM-DD HH:MM:SS] heartbeat_ok ...
+            bracket_end = line.find("]", 3)
+            if bracket_end == -1:
+                continue
+            timestamp = line[3:bracket_end]
+            body = line[bracket_end + 1:].strip()
+
+            entry_type = "idle"
+            detail = body
+            if body.upper().startswith("ACTION:"):
+                entry_type = "action"
+                detail = body[7:].strip()
+            elif body.upper().startswith("IDLE:"):
+                entry_type = "idle"
+                detail = body[5:].strip()
+            elif "heartbeat_ok" in body.lower():
+                entry_type = "idle"
+                detail = body
+
+            entries.append({"timestamp": timestamp, "type": entry_type, "detail": detail})
+    except Exception:
+        pass
+    return entries[-max_entries:]
+
+
+HEARTBEAT_INTERVAL_SECONDS = 15 * 60  # 15 minutes
+
+
+def get_heartbeat_status() -> dict:
+    """Get combined heartbeat status from log, watchdog, and state files."""
+    entries = parse_heartbeat_entries(20)
+
+    # Count consecutive idle from end
+    consecutive_idle = 0
+    for entry in reversed(entries):
+        if entry["type"] == "idle":
+            consecutive_idle += 1
+        else:
+            break
+
+    # Count action vs idle in recent entries for activity ratio
+    recent = entries[-10:] if len(entries) >= 10 else entries
+    action_count = sum(1 for e in recent if e["type"] == "action")
+    total_recent = len(recent)
+
+    # Last heartbeat time
+    last_hb_time = entries[-1]["timestamp"] if entries else None
+
+    # Parse watchdog status
+    watchdog_status = "unknown"
+    watchdog_last_check = None
+    try:
+        wdog_lines = WATCHDOG_LOG_PATH.read_text().splitlines()
+        for line in reversed(wdog_lines):
+            line = line.strip()
+            if not line.startswith("- ["):
+                continue
+            bracket_end = line.find("]", 3)
+            if bracket_end == -1:
+                continue
+            watchdog_last_check = line[3:bracket_end]
+            body = line[bracket_end + 1:].strip()
+            if "STATUS OK" in body:
+                watchdog_status = "ok"
+            elif "TIER 1" in body:
+                watchdog_status = "nudge"
+            elif "TIER 2" in body:
+                watchdog_status = "escalation"
+            elif "WATCHDOG CHECK" in body:
+                continue  # Skip the CHECK line, look for the result line
+            break
+    except Exception:
+        pass
+
+    # Parse state file
+    last_task = None
+    try:
+        state = json.loads(HEARTBEAT_STATE_PATH.read_text())
+        last_task = state.get("last_task_worked")
+    except Exception:
+        pass
+
+    # Get openclaw heartbeat status
+    openclaw_status = None
+    try:
+        result = subprocess.run(
+            ["openclaw", "system", "heartbeat", "last"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            openclaw_status = json.loads(result.stdout)
+            if not isinstance(openclaw_status, dict):
+                openclaw_status = None
+    except Exception:
+        pass
+
+    # Compute last heartbeat epoch for countdown timer
+    last_hb_epoch = None
+    if openclaw_status and openclaw_status.get("ts"):
+        last_hb_epoch = openclaw_status["ts"] / 1000.0  # ms to seconds
+
+    return {
+        "entries": entries,
+        "consecutive_idle": consecutive_idle,
+        "action_count": action_count,
+        "total_recent": total_recent,
+        "last_hb_time": last_hb_time,
+        "last_hb_epoch": last_hb_epoch,
+        "watchdog_status": watchdog_status,
+        "watchdog_last_check": watchdog_last_check,
+        "last_task": last_task,
+        "openclaw_status": openclaw_status,
+    }
+
+
+# Cache heartbeat data (refresh every 10 seconds, not every frame)
+_heartbeat_cache: dict = {}
+_heartbeat_cache_time: float = 0
+
+
+def get_cached_heartbeat_status() -> dict:
+    global _heartbeat_cache, _heartbeat_cache_time
+    now = time.time()
+    if now - _heartbeat_cache_time > 10:
+        _heartbeat_cache = get_heartbeat_status()
+        _heartbeat_cache_time = now
+    return _heartbeat_cache
+
+
+def create_monitor_panel(max_lines: int = 8) -> Panel:
+    """Create the unified monitor panel — compact header + cron job list."""
+    status = get_cached_heartbeat_status()
+    jobs = get_cached_cron_jobs()
+    content = Text()
+
+    # Header line: GW status + watchdog + active cron count
+    oc = status.get("openclaw_status")
+    if oc:
+        oc_status = oc.get("status", "?")
+        silent = oc.get("silent", False)
+        content.append("GW:", style="white")
+        if oc_status == "ok-token":
+            content.append("ok", style="green" if not silent else "dim")
+        else:
+            content.append(oc_status, style="yellow")
+    else:
+        content.append("GW:", style="white")
+        content.append("?", style="dim")
+
+    wdog = status["watchdog_status"]
+    wdog_styles = {"ok": ("green", "OK"), "nudge": ("yellow", "NUDGE"), "escalation": ("red", "ESCALATED"), "unknown": ("dim", "?")}
+    wdog_style, wdog_label = wdog_styles.get(wdog, ("dim", wdog))
+    content.append("  Wdog:", style="white")
+    content.append(wdog_label, style=wdog_style)
+
+    enabled_count = sum(1 for j in jobs if j.get("enabled", True))
+    content.append(f"  {enabled_count}/{len(jobs)} active", style="green" if enabled_count > 0 else "red")
+    content.append("\n")
+
+    # Per-job rows
+    if not jobs:
+        content.append("No cron jobs found", style="dim")
+    else:
+        for job in jobs[:(max_lines - 1)]:
+            name = job.get("name", job.get("id", "?")[:8])
+            enabled = job.get("enabled", True)
+            state = job.get("state", {})
+            schedule = job.get("schedule", {})
+
+            if not enabled:
+                content.append("  ", style="dim")
+                content.append(name, style="dim strikethrough")
+                content.append(" disabled\n", style="dim")
+                continue
+
+            # Status icon
+            job_status = state.get("status", "idle")
+            if job_status == "running":
+                content.append(" > ", style="green bold")
+            else:
+                content.append("   ", style="cyan")
+
+            # Name
+            content.append(f"{name}", style="white bold")
+
+            # Schedule
+            every_ms = schedule.get("everyMs", 0)
+            if every_ms >= 3600000:
+                sched_str = f"{every_ms // 3600000}h"
+            elif every_ms >= 60000:
+                sched_str = f"{every_ms // 60000}m"
+            else:
+                sched_str = schedule.get("cron", "?")
+            content.append(f" ({sched_str})", style="dim")
+
+            # Next run countdown
+            next_run_ms = state.get("nextRunAtMs")
+            content.append("  next:", style="dim")
+            if next_run_ms:
+                secs_left = max(0, int((next_run_ms / 1000) - time.time()))
+                mins, secs = divmod(secs_left, 60)
+                if mins >= 60:
+                    hours = mins // 60
+                    mins = mins % 60
+                    cd_str = f"{hours}h{mins:02d}m"
+                else:
+                    cd_str = f"{mins}:{secs:02d}"
+
+                if secs_left <= 0:
+                    content.append("NOW", style="green bold")
+                elif secs_left <= 60:
+                    content.append(cd_str, style="red bold")
+                elif secs_left <= 300:
+                    content.append(cd_str, style="yellow")
+                else:
+                    content.append(cd_str, style="cyan")
+            else:
+                content.append("--:--", style="dim")
+
+            # Last run
+            last_run_ms = state.get("lastRunAtMs")
+            if last_run_ms:
+                last_ago = int(time.time() - (last_run_ms / 1000))
+                if last_ago < 60:
+                    last_str = f"{last_ago}s ago"
+                elif last_ago < 3600:
+                    last_str = f"{last_ago // 60}m ago"
+                else:
+                    last_str = f"{last_ago // 3600}h ago"
+                content.append(f"  last:{last_str}", style="dim")
+            else:
+                content.append("  last:--", style="dim")
+
+            content.append("\n")
+
+    # Remove trailing newline
+    if content.plain.endswith("\n"):
+        content.right_crop(1)
+
+    return Panel(content, title="Monitor", border_style="magenta")
+
+
+# --- Cron Agents Panel ---
+
+# Cache cron job list (refresh every 15 seconds)
+_cron_jobs_cache: list = []
+_cron_jobs_cache_time: float = 0
+
+
+def get_cached_cron_jobs() -> list:
+    """Fetch cron jobs from openclaw cron list --json, cached."""
+    global _cron_jobs_cache, _cron_jobs_cache_time
+    now = time.time()
+    if now - _cron_jobs_cache_time > 15:
+        try:
+            result = subprocess.run(
+                ["openclaw", "cron", "list", "--json"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                parsed = json.loads(result.stdout)
+                if isinstance(parsed, list):
+                    _cron_jobs_cache = parsed
+                elif isinstance(parsed, dict) and isinstance(parsed.get("jobs"), list):
+                    _cron_jobs_cache = parsed["jobs"]
+                else:
+                    _cron_jobs_cache = []
+            else:
+                _cron_jobs_cache = []
+        except Exception:
+            _cron_jobs_cache = []
+        _cron_jobs_cache_time = now
+    return _cron_jobs_cache
+
+
+def parse_log_entries(log_path: Path, max_entries: int = 5) -> list[dict]:
+    """Parse structured entries from a cron worker/security log file."""
+    entries = []
+    try:
+        lines = log_path.read_text().splitlines()
+        for line in lines:
+            line = line.strip()
+            if not line.startswith("- ["):
+                continue
+            bracket_end = line.find("]", 3)
+            if bracket_end == -1:
+                continue
+            timestamp = line[3:bracket_end]
+            body = line[bracket_end + 1:].strip()
+
+            entry_type = "info"
+            if body.upper().startswith("ACTION:"):
+                entry_type = "action"
+            elif body.upper().startswith("IDLE:"):
+                entry_type = "idle"
+            elif body.upper().startswith("ALERT:"):
+                entry_type = "alert"
+            elif body.upper().startswith("CHECK:"):
+                entry_type = "check"
+
+            entries.append({"timestamp": timestamp, "type": entry_type, "body": body})
+    except Exception:
+        pass
+    return entries[-max_entries:]
+
+
+def get_last_log_entry(log_path: Path) -> Optional[dict]:
+    """Get the most recent entry from a log file."""
+    entries = parse_log_entries(log_path, max_entries=1)
+    return entries[-1] if entries else None
+
+
+
 def create_info_panel(max_lines: int = 8) -> Panel:
-    """Create the info panel - events, server logs, or deploy logs based on panel_page."""
+    """Create the info panel - events, server logs, deploy logs, or monitor based on panel_page."""
     if panel_page == 0:
         events = get_recent_events(max_lines)
         return create_events_panel(events)
     elif panel_page == 1:
         return create_server_logs_panel(max_lines=max_lines)
-    else:
+    elif panel_page == 2:
         return create_deploy_logs_panel(max_lines=max_lines)
+    else:
+        return create_monitor_panel(max_lines=max_lines)
 
 
 def create_mobile_info_panel(max_lines: int = 4) -> Panel:
-    """Create a compact info panel for mobile - events, server logs, or deploy logs based on panel_page."""
+    """Create a compact info panel for mobile - events, server logs, deploy logs, or monitor based on panel_page."""
     if panel_page == 0:
         events = get_recent_events(max_lines)
         return create_mobile_events_panel(events)
     elif panel_page == 1:
         return create_server_logs_panel(max_lines=max_lines)
-    else:
+    elif panel_page == 2:
         return create_deploy_logs_panel(max_lines=max_lines)
+    else:
+        return create_monitor_panel(max_lines=max_lines)
 
 
 def create_status_bar(instances: list, selected_idx: int) -> Text:
@@ -1292,7 +1998,7 @@ def create_status_bar(instances: list, selected_idx: int) -> Text:
     mode_color = mode_colors.get(layout_mode, "white")
 
     # Page indicator
-    page_names = ["Events", "Logs", "Deploy"]
+    page_names = ["Events", "Logs", "Deploy", "Monitor"]
     page_name = page_names[panel_page] if panel_page < len(page_names) else "?"
 
     # Filter indicator
@@ -1300,8 +2006,15 @@ def create_status_bar(instances: list, selected_idx: int) -> Text:
     if filter_mode != "all":
         filter_indicator = f"  [magenta]F:{filter_mode}[/magenta]"
 
+    # Table mode indicator
+    if table_mode == "cron":
+        table_indicator = "[yellow bold]\\[Cron][/yellow bold]"
+    else:
+        table_indicator = "[cyan]\\[Instances][/cyan]"
+
     text = Text()
-    text.append(f"Instances: {active_count}/{total_count}  |  ", style="white")
+    text.append_text(Text.from_markup(f"{table_indicator} [dim](\\[/])[/dim]"))
+    text.append(f"  {active_count}/{total_count}  |  ", style="white")
     text.append_text(Text.from_markup(f"[{mode_color}]{layout_mode}[/{mode_color}]"))
     text.append(f"  |  {selected_idx + 1}/{total_count}  |  ", style="white")
     text.append_text(Text.from_markup(f"[cyan]{page_name}[/cyan] [dim](h/l)[/dim]"))
@@ -1348,10 +2061,13 @@ def create_mobile_status_bar(instances: list, selected_idx: int) -> Text:
     total_count = len(instances)
 
     # Page indicator
-    page_indicators = {0: "E", 1: "L", 2: "D"}
+    page_indicators = {0: "E", 1: "L", 2: "D", 3: "M"}
     page_indicator = page_indicators.get(panel_page, "?")
 
+    table_tag = "C" if table_mode == "cron" else "I"
+
     text = Text()
+    text.append(f"[{table_tag}] ", style="yellow" if table_mode == "cron" else "cyan")
     text.append(f"{active_count}/{total_count} ", style="white")
     if active_count > 0:
         text.append("*", style="green")
@@ -1399,8 +2115,14 @@ def generate_mobile_dashboard(instances: list, selected_idx: int) -> Layout:
             Layout(name="footer", size=1)
         )
 
-    layout["instances"].update(create_mobile_instances_table(instances, selected_idx))
-    layout["details"].update(create_mobile_instance_details_panel(selected_instance, selected_todos))
+    if table_mode == "cron":
+        cron_jobs = get_cached_cron_jobs()
+        selected_job = cron_jobs[cron_selected_index] if cron_jobs and 0 <= cron_selected_index < len(cron_jobs) else None
+        layout["instances"].update(create_mobile_cron_table(cron_jobs, cron_selected_index))
+        layout["details"].update(create_mobile_cron_details_panel(selected_job))
+    else:
+        layout["instances"].update(create_mobile_instances_table(instances, selected_idx))
+        layout["details"].update(create_mobile_instance_details_panel(selected_instance, selected_todos))
     layout["info_panel"].update(create_mobile_info_panel(max_lines=3))
     layout["footer"].update(create_mobile_status_bar(instances, selected_idx))
 
@@ -1456,7 +2178,12 @@ def generate_compact_dashboard(instances: list, selected_idx: int) -> Layout:
     ))
     layout["header"].update(header_layout)
 
-    layout["instances"].update(create_compact_instances_table(instances, selected_idx))
+    if table_mode == "cron":
+        cron_jobs = get_cached_cron_jobs()
+        selected_job = cron_jobs[cron_selected_index] if cron_jobs and 0 <= cron_selected_index < len(cron_jobs) else None
+        layout["instances"].update(create_compact_cron_table(cron_jobs, cron_selected_index))
+    else:
+        layout["instances"].update(create_compact_instances_table(instances, selected_idx))
     layout["info_panel"].update(create_info_panel(max_lines=3))
     layout["footer"].update(create_status_bar(instances, selected_idx))
 
@@ -1549,9 +2276,15 @@ def generate_vertical_dashboard(instances: list, selected_idx: int) -> Layout:
     # Calculate how many lines fit in the info panel (panel has 2 border lines)
     info_lines = max(1, events_size - 2)
 
-    layout["instances"].update(create_compact_instances_table(instances, selected_idx))
+    if table_mode == "cron":
+        cron_jobs = get_cached_cron_jobs()
+        selected_job = cron_jobs[cron_selected_index] if cron_jobs and 0 <= cron_selected_index < len(cron_jobs) else None
+        layout["instances"].update(create_compact_cron_table(cron_jobs, cron_selected_index))
+        layout["details"].update(create_compact_cron_details_panel(selected_job))
+    else:
+        layout["instances"].update(create_compact_instances_table(instances, selected_idx))
+        layout["details"].update(create_instance_details_panel(selected_instance, selected_todos, compact=True))
     layout["info_panel"].update(create_info_panel(max_lines=info_lines))
-    layout["details"].update(create_instance_details_panel(selected_instance, selected_todos, compact=True))
     layout["footer"].update(create_status_bar(instances, selected_idx))
 
     return layout
@@ -1619,8 +2352,14 @@ def generate_dashboard(instances: list, selected_idx: int) -> Layout:
     # Sidebar shows events or server logs based on panel_page
     layout["sidebar"].update(create_info_panel(max_lines=20))
 
-    layout["instances"].update(create_instances_table(instances, selected_idx))
-    layout["instance_details"].update(create_instance_details_panel(selected_instance, selected_todos))
+    if table_mode == "cron":
+        cron_jobs = get_cached_cron_jobs()
+        selected_job = cron_jobs[cron_selected_index] if cron_jobs and 0 <= cron_selected_index < len(cron_jobs) else None
+        layout["instances"].update(create_cron_table(cron_jobs, cron_selected_index))
+        layout["instance_details"].update(create_cron_details_panel(selected_job))
+    else:
+        layout["instances"].update(create_instances_table(instances, selected_idx))
+        layout["instance_details"].update(create_instance_details_panel(selected_instance, selected_todos))
     layout["tts_queue"].update(create_tts_queue_panel(tts_queue))
 
     layout["footer"].update(create_status_bar(instances, selected_idx))
@@ -1648,6 +2387,7 @@ def main():
     """Main entry point."""
     global selected_index, instances_cache, api_healthy, api_error_message, layout_mode, layout_mode_forced, sort_mode, filter_mode, panel_page
     global deploy_active, deploy_log_path, deploy_metadata, deploy_previous_page, deploy_auto_switched
+    global table_mode, cron_selected_index
 
     parser = argparse.ArgumentParser(description="Token-API TUI Dashboard")
     parser.add_argument("--mobile", "-m", action="store_true",
@@ -1692,7 +2432,7 @@ def main():
         console.print("Run the Token-API server first to initialize the database.")
         sys.exit(1)
 
-    console.print("[dim]Controls: jk=nav, gG=top/btm, h/l=page, Enter=open, r=rename, f=filter, s=stop, d=del, R=restart, q=quit[/dim]\n")
+    console.print("[dim]Controls: jk=nav, gG=top/btm, []=table, h/l=page, Enter=open, r=rename, f=filter, s=stop, d=del, R=restart, q=quit[/dim]\n")
 
     quit_flag = threading.Event()
     input_mode = threading.Event()
@@ -1814,6 +2554,14 @@ def main():
                         with action_lock:
                             action_queue.append('go_bottom')
                         update_flag.set()
+                    elif key == '[':
+                        with action_lock:
+                            action_queue.append('table_prev')
+                        update_flag.set()
+                    elif key == ']':
+                        with action_lock:
+                            action_queue.append('table_next')
+                        update_flag.set()
         except Exception:
             pass
         finally:
@@ -1839,13 +2587,18 @@ def main():
         live_ref.refresh()
 
     def _clamp_selection():
-        """Clamp selected_index to filtered list bounds."""
-        global selected_index
+        """Clamp selected_index and cron_selected_index to their list bounds."""
+        global selected_index, cron_selected_index
         displayed = _get_displayed()
         if displayed:
             selected_index = min(selected_index, len(displayed) - 1)
         else:
             selected_index = 0
+        cron_jobs = get_cached_cron_jobs()
+        if cron_jobs:
+            cron_selected_index = min(cron_selected_index, len(cron_jobs) - 1)
+        else:
+            cron_selected_index = 0
 
     try:
         with Live(get_dashboard(_get_displayed(), selected_index), console=console, refresh_per_second=10, screen=True) as live:
@@ -1861,23 +2614,48 @@ def main():
                 displayed = _get_displayed()
 
                 for action in actions_to_process:
-                    if action == 'up' and displayed:
-                        selected_index = max(0, selected_index - 1)
+                    if action == 'table_prev':
+                        table_mode = "instances"
+                        _refresh(live)
+                        continue
+
+                    elif action == 'table_next':
+                        table_mode = "cron"
+                        _clamp_selection()
+                        _refresh(live)
+                        continue
+
+                    if action == 'up':
+                        if table_mode == "cron":
+                            cron_selected_index = max(0, cron_selected_index - 1)
+                        elif displayed:
+                            selected_index = max(0, selected_index - 1)
                         _refresh(live)
 
-                    elif action == 'down' and displayed:
-                        selected_index = min(len(displayed) - 1, selected_index + 1)
+                    elif action == 'down':
+                        if table_mode == "cron":
+                            cron_jobs = get_cached_cron_jobs()
+                            cron_selected_index = min(len(cron_jobs) - 1, cron_selected_index + 1) if cron_jobs else 0
+                        elif displayed:
+                            selected_index = min(len(displayed) - 1, selected_index + 1)
                         _refresh(live)
 
-                    elif action == 'go_top' and displayed:
-                        selected_index = 0
+                    elif action == 'go_top':
+                        if table_mode == "cron":
+                            cron_selected_index = 0
+                        elif displayed:
+                            selected_index = 0
                         _refresh(live)
 
-                    elif action == 'go_bottom' and displayed:
-                        selected_index = len(displayed) - 1
+                    elif action == 'go_bottom':
+                        if table_mode == "cron":
+                            cron_jobs = get_cached_cron_jobs()
+                            cron_selected_index = len(cron_jobs) - 1 if cron_jobs else 0
+                        elif displayed:
+                            selected_index = len(displayed) - 1
                         _refresh(live)
 
-                    if action == 'rename' and displayed:
+                    if action == 'rename' and displayed and table_mode == "instances":
                         if 0 <= selected_index < len(displayed):
                             instance = displayed[selected_index]
                             instance_id = instance.get("id")
@@ -1910,7 +2688,7 @@ def main():
                             live.start()
                             _refresh(live)
 
-                    elif action == 'delete' and displayed:
+                    elif action == 'delete' and displayed and table_mode == "instances":
                         if 0 <= selected_index < len(displayed):
                             instance = displayed[selected_index]
                             instance_id = instance.get("id")
@@ -1943,7 +2721,7 @@ def main():
                             live.start()
                             _refresh(live)
 
-                    elif action == 'voice' and displayed:
+                    elif action == 'voice' and displayed and table_mode == "instances":
                         if 0 <= selected_index < len(displayed):
                             instance = displayed[selected_index]
                             instance_id = instance.get("id")
@@ -2049,7 +2827,7 @@ def main():
                         live.start()
                         _refresh(live)
 
-                    elif action == 'stop' and displayed:
+                    elif action == 'stop' and displayed and table_mode == "instances":
                         if 0 <= selected_index < len(displayed):
                             instance = displayed[selected_index]
                             instance_id = instance.get("id")
@@ -2060,7 +2838,7 @@ def main():
                                 _clamp_selection()
                                 _refresh(live)
 
-                    elif action in ('unstick', 'unstick2') and displayed:
+                    elif action in ('unstick', 'unstick2') and displayed and table_mode == "instances":
                         if 0 <= selected_index < len(displayed):
                             instance = displayed[selected_index]
                             instance_id = instance.get("id")
@@ -2089,7 +2867,7 @@ def main():
 
                             threading.Thread(target=_do_unstick, args=(instance_id, instance_name, level), daemon=True).start()
 
-                    elif action == 'kill' and displayed:
+                    elif action == 'kill' and displayed and table_mode == "instances":
                         # Kill uses unstick level 3 (SIGKILL) - no confirmation needed
                         # since terminal is preserved and instance can be resumed
                         if 0 <= selected_index < len(displayed):
@@ -2179,7 +2957,7 @@ def main():
                         listener_thread.join(timeout=0.5)
                         os.execv(sys.executable, [sys.executable] + sys.argv)
 
-                    elif action == 'open_terminal' and displayed:
+                    elif action == 'open_terminal' and displayed and table_mode == "instances":
                         # Open a new terminal tab with resume command for selected instance
                         global resume_feedback
                         if 0 <= selected_index < len(displayed):
@@ -2257,7 +3035,7 @@ def main():
                             deploy_auto_switched = False
                         _refresh(live)
 
-                    elif action == 'resume':
+                    elif action == 'resume' and table_mode == "instances":
                         # Copy resume command to clipboard (y key)
                         if not displayed:
                             resume_feedback = (time.time(), "No instances")

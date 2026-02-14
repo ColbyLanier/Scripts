@@ -18,7 +18,7 @@ triggers:
 
 actions:
   - type: http_request
-    url: "http://100.66.10.74:7777/phone"
+    url: "http://100.95.109.23:7777/phone"
     method: POST
     body: '{"app": "game", "action": "close"}'
     content_type: "application/json"

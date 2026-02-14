@@ -25,13 +25,39 @@ fi
 # SSH to WSL - Claude sessions are tracked by token-api hooks automatically
 # Usage: sshpc [command] - runs command on desktop, or starts interactive session
 ssh-desktop() {
+  local target_ip="$WSL_IP"
+  local target_user="token"
+
+  # --mac flag: connect to Mac Mini instead of WSL
+  if [[ "$1" == "--mac" ]]; then
+    target_ip="$MINI_IP"
+    target_user="tokenclaw"
+    shift
+  fi
+
   if [[ $# -gt 0 ]]; then
-    ssh token@${WSL_IP} -t "$*"
+    ssh ${target_user}@${target_ip} -t "$*"
   else
-    ssh token@${WSL_IP}
+    ssh ${target_user}@${target_ip}
   fi
 }
 alias sshpc="ssh-desktop"
+alias sshmac="ssh-desktop --mac"
+
+# ====================================================
+# MAC MINI SSH
+# ====================================================
+# SSH to Mac Mini via Tailscale
+# Usage: sshmini [command] - runs command on Mac Mini, or starts interactive session
+MINI_IP="100.95.109.23"
+ssh-mini() {
+  if [[ $# -gt 0 ]]; then
+    ssh tokenclaw@${MINI_IP} -t "$*"
+  else
+    ssh tokenclaw@${MINI_IP}
+  fi
+}
+alias sshmini="ssh-mini"
 
 # Fetch and update .bashrc from desktop
 alias fetch-bashrc='ssh token@${WSL_IP} "cat /home/token/Scripts/mobile/termux-bashrc-template" > ~/.bashrc && source ~/.bashrc && echo "bashrc updated and reloaded"'
@@ -243,18 +269,18 @@ alias gpull="git pull origin"
 alias gadd="git add ."
 
 # ====================================================
-# WINDOWS SYSTEM CONTROL
+# SYSTEM CONTROL (Mac Mini Token-API)
 # ====================================================
-# Shutdown Windows with 15s delay, Ctrl+C to cancel
-shutdown() {
-    local API="http://${WINDOWS_IP}:7777"
+# Token-API now runs on Mac Mini (100.95.109.23:7777)
+# Shutdown Mac Mini with 1min delay, Ctrl+C to cancel
+shutdown-mini() {
+    local API="http://${MINI_IP}:7777"
 
-    echo "Initiating shutdown in 15 seconds... (Ctrl+C to cancel)"
+    echo "Initiating Mac Mini shutdown in 60 seconds... (Ctrl+C to cancel)"
 
-    # Request shutdown with 15s delay
     local response=$(curl -s -X POST "$API/api/system/shutdown" \
         -H "Content-Type: application/json" \
-        -d '{"action": "shutdown", "delay_seconds": 15}')
+        -d '{"action": "shutdown", "delay_seconds": 60}')
 
     local success=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success', False))" 2>/dev/null)
 
@@ -263,11 +289,9 @@ shutdown() {
         return 1
     fi
 
-    # Trap Ctrl+C to cancel shutdown
     trap 'echo ""; echo "Cancelling shutdown..."; curl -s -X POST "$API/api/system/shutdown/cancel" | python3 -c "import sys,json; print(json.load(sys.stdin).get(\"message\", \"Unknown\"))"; trap - INT; return 130' INT
 
-    # Countdown
-    for i in {15..1}; do
+    for i in {60..1}; do
         printf "\rShutdown in %2d seconds... (Ctrl+C to cancel)" "$i"
         sleep 1
     done

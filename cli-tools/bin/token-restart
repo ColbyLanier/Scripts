@@ -2,12 +2,12 @@
 # token-restart - Restart the Token-API server
 #
 # Usage:
-#   token-restart              # Restart server via systemd
+#   token-restart              # Restart server via launchctl
 #   token-restart --kill       # Just kill, don't restart
 #   token-restart --watch      # Restart and monitor startup
 #   token-restart --status     # Show current status only
 #
-# The server runs on port 7777 and is managed by systemd (token-api.service)
+# The server runs on port 7777 and is managed by launchd (ai.openclaw.tokenapi)
 
 set -euo pipefail
 
@@ -17,13 +17,16 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m' # No Color
 
+LABEL="ai.openclaw.tokenapi"
+PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+
 show_help() {
     cat << 'EOF'
 token-restart - Restart the Token-API server
 
 Usage:
-    token-restart              Restart server (no sudo needed)
-    token-restart --kill       Kill process (systemd auto-restarts in ~5s)
+    token-restart              Restart server (launchctl kickstart)
+    token-restart --kill       Kill process (launchd auto-restarts)
     token-restart --watch      Restart and monitor startup logs
     token-restart --status     Show current server status only
     token-restart -h, --help   Show this help
@@ -35,8 +38,8 @@ Examples:
 
 Notes:
     - Server runs on port 7777
-    - Uses pkill + systemd auto-restart (no sudo needed)
-    - Logs available via: journalctl -u token-api -f
+    - Managed by launchd (ai.openclaw.tokenapi)
+    - Logs: ~/.claude/token-api-stdout.log, token-api-stderr.log
 EOF
 }
 
@@ -53,11 +56,11 @@ check_health() {
 get_status() {
     echo "=== Token-API Status ==="
 
-    # Check systemd status
-    if systemctl is-active --quiet token-api 2>/dev/null; then
-        echo -e "Systemd: ${GREEN}active${NC}"
+    # Check launchd status
+    if launchctl print gui/501/${LABEL} > /dev/null 2>&1; then
+        echo -e "Launchd: ${GREEN}loaded${NC}"
     else
-        echo -e "Systemd: ${RED}inactive${NC}"
+        echo -e "Launchd: ${RED}not loaded${NC}"
     fi
 
     # Check process
@@ -76,7 +79,6 @@ get_status() {
 kill_server() {
     echo "Stopping Token-API..."
 
-    # Kill the process (no sudo needed)
     if pkill -f 'uvicorn.*7777' 2>/dev/null; then
         echo "Killed uvicorn process"
     else
@@ -91,23 +93,18 @@ kill_server() {
     fi
 
     echo -e "${GREEN}Server stopped${NC}"
-    echo "Note: systemd will auto-restart in ~5s unless you 'sudo systemctl stop token-api'"
+    echo "Note: launchd will auto-restart unless you 'launchctl bootout gui/501/${LABEL}'"
 }
 
 restart_server() {
     echo "Restarting Token-API..."
 
-    # Kill process - systemd will auto-restart (Restart=always, RestartSec=5)
-    # This avoids needing sudo for systemctl restart
-    if pgrep -f 'uvicorn.*7777' > /dev/null 2>&1; then
-        pkill -f 'uvicorn.*7777' 2>/dev/null || true
-        echo "Killed old process, waiting for systemd to restart..."
-    else
-        echo "No process running, starting fresh..."
-    fi
-
-    # Wait for systemd to restart (RestartSec=5)
-    sleep 2
+    # Use launchctl kickstart -k to kill and restart in one step
+    launchctl kickstart -k gui/501/${LABEL} 2>/dev/null || {
+        # If not loaded, bootstrap it
+        echo "Service not loaded, bootstrapping..."
+        launchctl bootstrap gui/501 "$PLIST" 2>/dev/null || true
+    }
 
     # Wait for startup
     local attempts=0
@@ -124,13 +121,13 @@ restart_server() {
     done
 
     echo -e "${RED}Server failed to start within ${max_attempts}s${NC}"
-    echo "Check logs: journalctl -u token-api -n 50"
+    echo "Check logs: tail ~/.claude/token-api-stderr.log"
     return 1
 }
 
 watch_logs() {
     echo "Tailing logs (Ctrl+C to stop)..."
-    journalctl -u token-api -f --no-pager
+    tail -f ~/.claude/token-api-stderr.log
 }
 
 # Parse arguments

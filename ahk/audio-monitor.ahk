@@ -73,7 +73,7 @@ global AM_CONFIG := {
     ; token-api integration (authoritative for all decisions)
     ; token-api handles: mode changes, window enforcement, productivity tracking
     ; Enforcement is PUSH-BASED: token-api closes windows directly when needed
-    tokenApiUrl: "http://localhost:7777"
+    tokenApiUrl: "http://100.95.109.23:7777"
 }
 
 ; ========================================

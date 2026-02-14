@@ -139,18 +139,20 @@ sys.excepthook = _global_exception_handler
 
 # Device IP mapping for SSH detection
 DEVICE_IPS = {
-    "100.102.92.24": "Token-S24",
-    "100.66.10.74": "desktop",
+    "100.102.92.24": "Token-S24",    # Phone
+    "100.69.198.87": "TokenPC",      # Windows PC
+    "100.66.10.74": "TokenPC",       # WSL (same physical machine)
+    "100.95.109.23": "Mac-Mini",     # Mac Mini (Tailscale)
+    "127.0.0.1": "Mac-Mini",         # Mac Mini (localhost)
 }
 
 # Profile pool for voice/sound assignment
-# Available voices: David, Zira (US), George, Hazel, Susan (UK), Catherine, James (AU),
-#                   Sean (IE), Heera, Ravi (IN), Linda, Richard (CA), Mark (US)
+# macOS voices: Daniel (British), Karen (Australian), Moira (Irish), Rishi (Indian)
 PROFILES = [
-    {"name": "profile_1", "tts_voice": "Microsoft George", "notification_sound": "chimes.wav", "color": "#0099ff"},      # British
-    {"name": "profile_2", "tts_voice": "Microsoft Catherine", "notification_sound": "notify.wav", "color": "#00cc66"},   # Australian
-    {"name": "profile_3", "tts_voice": "Microsoft Sean", "notification_sound": "ding.wav", "color": "#ff9900"},          # Irish
-    {"name": "profile_4", "tts_voice": "Microsoft Ravi", "notification_sound": "tada.wav", "color": "#cc66ff"},          # Indian
+    {"name": "profile_1", "tts_voice": "Daniel", "notification_sound": "chimes.wav", "color": "#0099ff"},      # British
+    {"name": "profile_2", "tts_voice": "Karen", "notification_sound": "notify.wav", "color": "#00cc66"},       # Australian
+    {"name": "profile_3", "tts_voice": "Moira", "notification_sound": "ding.wav", "color": "#ff9900"},         # Irish
+    {"name": "profile_4", "tts_voice": "Rishi", "notification_sound": "tada.wav", "color": "#cc66ff"},         # Indian
 ]
 
 # Scheduler instance
@@ -599,6 +601,15 @@ def resolve_device_from_ip(ip: str) -> str:
     return DEVICE_IPS.get(ip, "unknown")
 
 
+# Devices where we can inspect local PIDs, send signals, etc.
+LOCAL_DEVICES = {"desktop", "Mac-Mini", "TokenPC"}
+
+
+def is_local_device(device_id: str) -> bool:
+    """Check if device_id refers to a machine where we can manage processes locally."""
+    return device_id in LOCAL_DEVICES
+
+
 def get_next_available_profile(used_voices: set) -> dict:
     """Get a random available profile from the pool.
 
@@ -994,7 +1005,7 @@ async def register_instance(request: InstanceRegisterRequest):
     if not device_id and request.source_ip:
         device_id = resolve_device_from_ip(request.source_ip)
     if not device_id:
-        device_id = "desktop"  # Default to desktop for local sessions
+        device_id = "Mac-Mini"  # Default for local sessions on Mac Mini
 
     async with aiosqlite.connect(DB_PATH) as db:
         # Get currently used voices (from all registered instances, not just active)
@@ -1225,13 +1236,13 @@ async def kill_instance(instance_id: str):
 
     instance = dict(row)
     pid = instance.get("pid")
-    device_id = instance.get("device_id", "desktop")
+    device_id = instance.get("device_id", "Mac-Mini")
     working_dir = instance.get("working_dir", "")
     kill_signal = None
 
     # If no PID stored, attempt process discovery fallback
     if not pid:
-        if device_id == "desktop":
+        if is_local_device(device_id):
             pid = await find_claude_pid_by_workdir(working_dir)
             if pid:
                 logger.info(f"Kill: discovered PID {pid} via /proc scan for {working_dir}")
@@ -1265,7 +1276,7 @@ async def kill_instance(instance_id: str):
             )
 
     # Kill sequence based on device type
-    if device_id == "desktop":
+    if is_local_device(device_id):
         # Validate PID still belongs to claude
         if not is_pid_claude(pid):
             # Process already exited or PID reused by another process
@@ -1414,13 +1425,13 @@ async def unstick_instance(instance_id: str, level: int = 1):
 
     instance = dict(row)
     pid = instance.get("pid")
-    device_id = instance.get("device_id", "desktop")
+    device_id = instance.get("device_id", "Mac-Mini")
     working_dir = instance.get("working_dir", "")
     last_activity_before = instance.get("last_activity")
 
     # PID discovery fallback
     if not pid:
-        if device_id == "desktop":
+        if is_local_device(device_id):
             pid = await find_claude_pid_by_workdir(working_dir)
             if not pid:
                 raise HTTPException(
@@ -1449,7 +1460,7 @@ async def unstick_instance(instance_id: str, level: int = 1):
 
     # Send the signal
     diag_before = None
-    if device_id == "desktop":
+    if is_local_device(device_id):
         # If stored PID is stale, try to rediscover by working directory
         if not is_pid_claude(pid):
             logger.info(f"Unstick: stored PID {pid} is stale, attempting rediscovery...")
@@ -1507,7 +1518,7 @@ async def unstick_instance(instance_id: str, level: int = 1):
 
     # Capture diagnostics AFTER signal (desktop only)
     diag_after = None
-    if device_id == "desktop" and is_pid_claude(pid):
+    if is_local_device(device_id) and is_pid_claude(pid):
         diag_after = get_process_diagnostics(pid)
         logger.info(f"Unstick L{level} AFTER: PID {pid} state={diag_after.get('state', '?')} wchan={diag_after.get('wchan', '?')}")
 
@@ -1677,7 +1688,7 @@ async def diagnose_instance(instance_id: str):
 
     instance = dict(row)
     stored_pid = instance.get("pid")
-    device_id = instance.get("device_id", "desktop")
+    device_id = instance.get("device_id", "Mac-Mini")
     working_dir = instance.get("working_dir", "")
     last_activity = instance.get("last_activity")
     status = instance.get("status")
@@ -1703,7 +1714,7 @@ async def diagnose_instance(instance_id: str):
         except Exception as e:
             result["activity_age_error"] = str(e)
 
-    if device_id != "desktop":
+    if not is_local_device(device_id):
         result["note"] = "Detailed diagnostics only available for desktop instances"
         return result
 
@@ -2153,22 +2164,11 @@ PHONE_DISTRACTION_APPS = {
     "com.mojang.minecraftpe": "gaming",
 }
 
-# ============ Obsidian Timer State ============
-# Read timer-state.json to check break availability
-TIMER_STATE_PATH = Path("/mnt/c/Users/colby/Documents/Obsidian/Token-ENV/Scripts/timer-state.json")
-
+# ============ Timer State ============
+# Timer is now built into Token API itself; no external file dependency.
 
 def get_obsidian_timer_state() -> dict:
-    """
-    Read Obsidian timer-state.json for break availability.
-    Returns dict with breakAvailableSeconds, isInBacklog, etc.
-    """
-    try:
-        if TIMER_STATE_PATH.exists():
-            with open(TIMER_STATE_PATH, 'r') as f:
-                return json.load(f)
-    except Exception as e:
-        print(f"Error reading timer state: {e}")
+    """Return timer state stub — timer is integrated into Token API now."""
     return {"breakAvailableSeconds": 0, "isInBacklog": False}
 
 
@@ -2183,36 +2183,11 @@ AUDIO_PROXY_STATE = {
     "last_disconnect_time": None,
 }
 
-# Path to audio receiver script on Windows
-AUDIO_RECEIVER_PATH = r"C:\Scripts\audio-receiver.py"
-AUDIO_RECEIVER_PORT = 8765
-
-# Full path to PowerShell for WSL->Windows commands (systemd doesn't have Windows PATH)
-POWERSHELL_PATH = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
-
-# ============ Headless Mode State ============
-# Controls monitor disconnection for headless operation
-
-HEADLESS_STATE_FILE = Path("/home/token/Scripts/Powershell/headless-state.json")
-
+# ============ Headless Mode (disabled on macOS) ============
 
 def get_headless_state() -> dict:
-    """
-    Read headless mode state from Windows state file.
-    Returns dict with 'enabled', 'lastChanged', 'hostname'.
-    """
-    if HEADLESS_STATE_FILE.exists():
-        try:
-            with open(HEADLESS_STATE_FILE, encoding="utf-8-sig") as f:
-                data = json.load(f)
-                return {
-                    "enabled": data.get("enabled", False),
-                    "last_changed": data.get("lastChanged"),
-                    "hostname": data.get("hostname"),
-                }
-        except (json.JSONDecodeError, Exception) as e:
-            logger.warning(f"Failed to read headless state: {e}")
-    return {"enabled": False, "last_changed": None, "hostname": None, "error": "state file not found"}
+    """Headless mode is not applicable on macOS."""
+    return {"enabled": False, "last_changed": None, "hostname": None, "error": "not applicable on macOS"}
 
 
 async def poll_for_state_change(
@@ -2260,407 +2235,40 @@ async def poll_for_state_change(
 
 
 def trigger_headless_task(action: str = "toggle") -> tuple[bool, str]:
-    """
-    Trigger Windows scheduled task to control headless mode.
-
-    Args:
-        action: "toggle", "enable", or "disable"
-
-    Returns:
-        (success, message)
-    """
-    task_map = {
-        "toggle": "HeadlessToggle",
-        "enable": "HeadlessEnable",
-        "disable": "HeadlessDisable"
-    }
-
-    task_name = task_map.get(action.lower())
-    if not task_name:
-        return False, f"Invalid action: {action}. Use toggle/enable/disable"
-
-    try:
-        schtasks_path = "/mnt/c/Windows/System32/schtasks.exe"
-        result = subprocess.run(
-            [schtasks_path, "/run", "/tn", task_name],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-
-        if result.returncode == 0:
-            logger.info(f"HEADLESS: Triggered task {task_name}")
-            return True, f"Task {task_name} triggered successfully"
-        else:
-            error_msg = result.stderr.strip() or result.stdout.strip()
-            logger.error(f"HEADLESS: Failed to trigger {task_name}: {error_msg}")
-            return False, f"Failed to trigger task: {error_msg}"
-
-    except subprocess.TimeoutExpired:
-        return False, "Task trigger timed out"
-    except Exception as e:
-        logger.error(f"HEADLESS: Error triggering task: {e}")
-        return False, str(e)
+    """Headless mode is not applicable on macOS."""
+    return False, "Headless mode not available on macOS"
 
 
 def start_audio_receiver() -> dict:
-    """
-    Start audio-receiver.py on Windows via PowerShell.
-    Called from WSL to start the audio receiver on Windows.
-    Returns dict with success status, PID if started.
-    """
-    # PowerShell script to start the audio receiver
-    ps_script = f'''
-    # Check if already running
-    $existing = Get-Process -Name "python*" -ErrorAction SilentlyContinue | Where-Object {{
-        $_.CommandLine -like "*audio-receiver*"
-    }}
-    if ($existing) {{
-        Write-Output "already_running:$($existing.Id)"
-        exit 0
-    }}
-
-    # Check if script exists
-    if (-not (Test-Path "{AUDIO_RECEIVER_PATH}")) {{
-        Write-Output "error:script_not_found"
-        exit 1
-    }}
-
-    # Start the receiver in background
-    $proc = Start-Process -FilePath "python" -ArgumentList "{AUDIO_RECEIVER_PATH}" -PassThru -WindowStyle Hidden
-    Start-Sleep -Seconds 1
-
-    # Verify it started
-    if ($proc -and $proc.Id) {{
-        $check = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
-        if ($check) {{
-            Write-Output "started:$($proc.Id)"
-            exit 0
-        }}
-    }}
-    Write-Output "error:failed_to_start"
-    exit 1
-    '''
-
-    try:
-        result = subprocess.run(
-            [POWERSHELL_PATH, "-Command", ps_script],
-            capture_output=True,
-            text=True,
-            timeout=15
-        )
-
-        output = result.stdout.strip().split('\n')[-1] if result.stdout.strip() else ""
-
-        if output.startswith("started:"):
-            pid = int(output.split(":")[1])
-            print(f"AUDIO_PROXY: Started receiver with PID {pid}")
-            return {"success": True, "status": "started", "pid": pid}
-        elif output.startswith("already_running:"):
-            pid = int(output.split(":")[1])
-            print(f"AUDIO_PROXY: Receiver already running with PID {pid}")
-            return {"success": True, "status": "already_running", "pid": pid}
-        elif output.startswith("error:"):
-            error = output.split(":")[1]
-            print(f"AUDIO_PROXY: Error starting receiver: {error}")
-            return {"success": False, "error": error}
-        else:
-            print(f"AUDIO_PROXY: Unknown response: {output}")
-            return {"success": False, "error": f"unknown_response: {output}"}
-
-    except subprocess.TimeoutExpired:
-        print("AUDIO_PROXY: Timeout starting receiver")
-        return {"success": False, "error": "timeout"}
-    except Exception as e:
-        print(f"AUDIO_PROXY: Exception starting receiver: {e}")
-        return {"success": False, "error": str(e)}
+    """Audio proxy is not available on macOS."""
+    return {"success": False, "error": "not available on macOS"}
 
 
 def stop_audio_receiver() -> dict:
-    """
-    Stop audio-receiver.py on Windows via PowerShell.
-    Returns dict with success status.
-    """
-    ps_script = '''
-    $stopped = 0
-    # Find python processes running audio-receiver
-    Get-Process -Name "python*" -ErrorAction SilentlyContinue | ForEach-Object {
-        try {
-            $cmdline = (Get-CimInstance Win32_Process -Filter "ProcessId = $($_.Id)").CommandLine
-            if ($cmdline -like "*audio-receiver*") {
-                Stop-Process -Id $_.Id -Force
-                $stopped++
-            }
-        } catch {}
-    }
-    # Also kill any orphaned ffplay processes
-    Get-Process -Name "ffplay" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    Write-Output "stopped:$stopped"
-    '''
-
-    try:
-        result = subprocess.run(
-            [POWERSHELL_PATH, "-Command", ps_script],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-
-        output = result.stdout.strip().split('\n')[-1] if result.stdout.strip() else ""
-
-        if output.startswith("stopped:"):
-            count = int(output.split(":")[1])
-            print(f"AUDIO_PROXY: Stopped {count} receiver process(es)")
-            return {"success": True, "stopped_count": count}
-        else:
-            return {"success": True, "stopped_count": 0}
-
-    except subprocess.TimeoutExpired:
-        print("AUDIO_PROXY: Timeout stopping receiver")
-        return {"success": False, "error": "timeout"}
-    except Exception as e:
-        print(f"AUDIO_PROXY: Exception stopping receiver: {e}")
-        return {"success": False, "error": str(e)}
+    """Audio proxy is not available on macOS."""
+    return {"success": True, "stopped_count": 0}
 
 
 def check_audio_receiver_running() -> dict:
-    """
-    Check if audio-receiver.py is currently running on Windows.
-    Returns dict with running status and PID if found.
-    """
-    ps_script = '''
-    $found = $null
-    Get-Process -Name "python*" -ErrorAction SilentlyContinue | ForEach-Object {
-        try {
-            $cmdline = (Get-CimInstance Win32_Process -Filter "ProcessId = $($_.Id)").CommandLine
-            if ($cmdline -like "*audio-receiver*") {
-                $found = $_.Id
-            }
-        } catch {}
-    }
-    if ($found) {
-        Write-Output "running:$found"
-    } else {
-        Write-Output "not_running"
-    }
-    '''
-
-    try:
-        result = subprocess.run(
-            [POWERSHELL_PATH, "-Command", ps_script],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-
-        output = result.stdout.strip().split('\n')[-1] if result.stdout.strip() else ""
-
-        if output.startswith("running:"):
-            pid = int(output.split(":")[1])
-            return {"running": True, "pid": pid}
-        else:
-            return {"running": False, "pid": None}
-
-    except Exception as e:
-        return {"running": False, "pid": None, "error": str(e)}
+    """Audio proxy is not available on macOS."""
+    return {"running": False, "pid": None}
 
 
 def close_distraction_windows() -> dict:
-    """
-    Close distraction windows (YouTube in Brave) via PowerShell.
-    Called from WSL to execute on Windows.
-
-    More aggressive approach: uses taskkill if WM_CLOSE fails.
-
-    Returns dict with success status and details.
-    """
-    # PowerShell script to close Brave windows with YouTube in title
-    # Uses multiple methods: WM_CLOSE first, then taskkill if needed
-    ps_script = '''
-    $closed = 0
-    $targetPids = @()
-
-    # Method 1: Find Brave processes with YouTube in title via Get-Process
-    Get-Process -Name "brave" -ErrorAction SilentlyContinue | ForEach-Object {
-        $proc = $_
-        if ($proc.MainWindowTitle -match "YouTube") {
-            $targetPids += $proc.Id
-            try {
-                $proc.CloseMainWindow() | Out-Null
-                $closed++
-            } catch {}
-        }
-    }
-
-    # Method 2: Enumerate all windows to find YouTube tabs (catches non-main windows)
-    Add-Type @"
-    using System;
-    using System.Runtime.InteropServices;
-    using System.Text;
-    using System.Collections.Generic;
-    public class Win32Enum {
-        [DllImport("user32.dll")]
-        public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
-        [DllImport("user32.dll")]
-        public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
-        [DllImport("user32.dll")]
-        public static extern bool IsWindowVisible(IntPtr hWnd);
-        [DllImport("user32.dll")]
-        public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
-        [DllImport("user32.dll")]
-        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
-        public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
-        public const uint WM_CLOSE = 0x0010;
-
-        public static List<IntPtr> handles = new List<IntPtr>();
-        public static List<uint> pids = new List<uint>();
-    }
-"@ -ErrorAction SilentlyContinue
-
-    # Get all brave.exe PIDs first for matching
-    $bravePids = @(Get-Process -Name "brave" -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
-
-    $callback = {
-        param($hwnd, $lparam)
-        if ([Win32Enum]::IsWindowVisible($hwnd)) {
-            $sb = New-Object System.Text.StringBuilder 512
-            [Win32Enum]::GetWindowText($hwnd, $sb, 512) | Out-Null
-            $title = $sb.ToString()
-            # Check if title contains YouTube
-            if ($title -match "YouTube") {
-                $pid = 0
-                [Win32Enum]::GetWindowThreadProcessId($hwnd, [ref]$pid) | Out-Null
-                # Only target if window belongs to a brave.exe process
-                if ($pid -gt 0 -and $bravePids -contains $pid) {
-                    [Win32Enum]::handles.Add($hwnd) | Out-Null
-                    [Win32Enum]::pids.Add($pid) | Out-Null
-                }
-            }
-        }
-        return $true
-    }
-
-    [Win32Enum]::EnumWindows($callback, [IntPtr]::Zero) | Out-Null
-
-    # Send WM_CLOSE to all matching windows
-    foreach ($h in [Win32Enum]::handles) {
-        [Win32Enum]::SendMessage($h, [Win32Enum]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
-        $closed++
-    }
-
-    # Collect all target PIDs
-    $allPids = $targetPids + [Win32Enum]::pids | Select-Object -Unique
-
-    # Method 3: If we found processes but WM_CLOSE might not have worked, use taskkill
-    # Wait a moment then check if still running
-    if ($allPids.Count -gt 0) {
-        Start-Sleep -Milliseconds 500
-        foreach ($pid in $allPids) {
-            $stillRunning = Get-Process -Id $pid -ErrorAction SilentlyContinue
-            if ($stillRunning -and $stillRunning.MainWindowTitle -match "YouTube") {
-                # Force kill this specific tab/process
-                taskkill /PID $pid /F 2>$null | Out-Null
-                $closed++
-            }
-        }
-    }
-
-    Write-Output $closed
-    '''
-
-    try:
-        result = subprocess.run(
-            [POWERSHELL_PATH, "-Command", ps_script],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-
-        closed_count = 0
-        if result.stdout.strip():
-            try:
-                closed_count = int(result.stdout.strip().split('\n')[-1])
-            except ValueError:
-                pass
-
-        if result.returncode == 0:
-            print(f"ENFORCE: Closed {closed_count} distraction window(s)")
-            return {"success": True, "closed_count": closed_count}
-        else:
-            print(f"ENFORCE: PowerShell error: {result.stderr[:200]}")
-            return {"success": False, "error": result.stderr[:200]}
-
-    except subprocess.TimeoutExpired:
-        print("ENFORCE: PowerShell timeout")
-        return {"success": False, "error": "timeout"}
-    except Exception as e:
-        print(f"ENFORCE: Error: {e}")
-        return {"success": False, "error": str(e)}
+    """Window enforcement is not available on macOS (no desktop browser to manage)."""
+    logger.info("ENFORCE: close_distraction_windows not applicable on macOS")
+    return {"success": True, "closed_count": 0}
 
 
 def trigger_obsidian_command_async(command_id: str, no_focus: bool = False):
-    """Fire-and-forget Obsidian trigger that doesn't block the caller."""
-    import threading
-    thread = threading.Thread(
-        target=trigger_obsidian_command,
-        args=(command_id, no_focus),
-        daemon=True
-    )
-    thread.start()
+    """Fire-and-forget Obsidian trigger (log-only on macOS)."""
+    trigger_obsidian_command(command_id, no_focus)
 
 
 def trigger_obsidian_command(command_id: str, no_focus: bool = False) -> bool:
-    """
-    Trigger an Obsidian command via Advanced URI plugin.
-    From WSL, uses PowerShell to launch the URI on Windows.
-    Returns True if command was dispatched successfully.
-
-    Args:
-        command_id: The Obsidian command ID to trigger
-        no_focus: If True, attempt to trigger without stealing window focus
-                  (used for phone telemetry to avoid Obsidian jumping to foreground)
-    """
-    from urllib.parse import quote
-    vault = quote(OBSIDIAN_CONFIG["vault_name"])
-
-    # Build URI - add silent=true to minimize UI disruption
-    uri = f"obsidian://advanced-uri?vault={vault}&commandid={command_id}"
-    if no_focus:
-        uri += "&silent=true"
-
-    try:
-        if no_focus:
-            # Use PowerShell with -WindowStyle Hidden to avoid focus stealing
-            # cmd.exe start has quoting issues that mangle URIs from WSL
-            result = subprocess.run(
-                [POWERSHELL_PATH, "-WindowStyle", "Hidden", "-Command", f'Start-Process "{uri}"'],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                cwd="/mnt/c"
-            )
-        else:
-            # Normal PowerShell launch (brings window to front)
-            result = subprocess.run(
-                [POWERSHELL_PATH, "-Command", f'Start-Process "{uri}"'],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                cwd="/mnt/c"
-            )
-        if result.returncode == 0:
-            focus_mode = "no_focus" if no_focus else "normal"
-            print(f"OBSIDIAN: Triggered command '{command_id}' ({focus_mode})")
-            return True
-        else:
-            print(f"OBSIDIAN: Failed to trigger '{command_id}': {result.stderr}")
-            return False
-    except subprocess.TimeoutExpired:
-        print(f"OBSIDIAN: Timeout triggering '{command_id}'")
-        return False
-    except Exception as e:
-        print(f"OBSIDIAN: Error triggering '{command_id}': {e}")
-        return False
+    """Log Obsidian command (Obsidian is just a log sink now, not a runtime dependency)."""
+    logger.info(f"OBSIDIAN: command '{command_id}' (log-only, no_focus={no_focus})")
+    return True
 
 
 def enforce_phone_app(app_name: str, action: str = "disable") -> dict:
@@ -3504,85 +3112,24 @@ async def audio_proxy_status():
     )
 
 
-# ============ Headless Mode Endpoints ============
-# Control monitor disconnection for headless operation
+# ============ Headless Mode Endpoints (disabled on macOS) ============
 
 @app.get("/api/headless", response_model=HeadlessStatusResponse)
 async def headless_status():
-    """
-    Get current headless mode status.
-    Reads state from Windows-side state file.
-    """
-    state = get_headless_state()
-    return HeadlessStatusResponse(**state)
+    """Headless mode is not applicable on macOS."""
+    return HeadlessStatusResponse(**get_headless_state())
 
 
 @app.post("/api/headless", response_model=HeadlessControlResponse)
 async def headless_control(request: HeadlessControlRequest):
-    """
-    Control headless mode (toggle/enable/disable monitors).
-
-    Triggers Windows scheduled task which runs PowerShell with admin privileges.
-    Requires Setup-HeadlessTask.ps1 to have been run as Administrator first.
-
-    Idempotent: enable when already enabled (or disable when already disabled)
-    returns success without triggering the task again.
-    """
-    action = request.action.lower()
-
-    # Get state before action
-    before_state = get_headless_state()
-    current_enabled = before_state.get("enabled", False)
-
-    # Idempotency check - skip if already in desired state
-    if action == "enable" and current_enabled:
-        return HeadlessControlResponse(
-            success=True,
-            action=action,
-            before=HeadlessStatusResponse(**before_state),
-            after=HeadlessStatusResponse(**before_state),
-            message="Already enabled (no action taken)"
-        )
-    elif action == "disable" and not current_enabled:
-        return HeadlessControlResponse(
-            success=True,
-            action=action,
-            before=HeadlessStatusResponse(**before_state),
-            after=HeadlessStatusResponse(**before_state),
-            message="Already disabled (no action taken)"
-        )
-
-    # Trigger the scheduled task
-    success, message = trigger_headless_task(action)
-
-    if not success:
-        return HeadlessControlResponse(
-            success=False,
-            action=action,
-            before=HeadlessStatusResponse(**before_state),
-            after=None,
-            message=f"{message}. Hint: Run Setup-HeadlessTask.ps1 as Administrator first."
-        )
-
-    # Poll for state file update (state file is written at end of PowerShell script)
-    # We detect change by monitoring the lastChanged timestamp
-    original_timestamp = before_state.get("last_changed")
-    changed, after_state = await poll_for_state_change(
-        get_state_fn=get_headless_state,
-        key="last_changed",
-        original_value=original_timestamp,
-        timeout=5.0,  # Windows scheduled task typically takes 2-4 seconds
-    )
-
-    if not changed:
-        message += " (state update pending - poll /api/headless for final state)"
-
+    """Headless mode is not applicable on macOS."""
+    state = get_headless_state()
     return HeadlessControlResponse(
-        success=True,
-        action=action,
-        before=HeadlessStatusResponse(**before_state),
-        after=HeadlessStatusResponse(**after_state),
-        message=message
+        success=False,
+        action=request.action,
+        before=HeadlessStatusResponse(**state),
+        after=HeadlessStatusResponse(**state),
+        message="Headless mode not available on macOS"
     )
 
 
@@ -3592,76 +3139,48 @@ async def headless_control(request: HeadlessControlRequest):
 @app.post("/api/system/shutdown", response_model=ShutdownResponse)
 async def system_shutdown(request: ShutdownRequest):
     """
-    Shutdown or restart the Windows system.
+    Shutdown or restart the Mac Mini.
 
     Actions:
     - shutdown: Power off the system
     - restart: Restart the system
-
-    Options:
-    - delay_seconds: Wait before shutdown (default: 0)
-    - force: Force close applications without saving (default: false)
     """
     action = request.action.lower()
 
     if action not in ("shutdown", "restart"):
         raise HTTPException(status_code=400, detail="Invalid action. Use 'shutdown' or 'restart'")
 
-    # Build shutdown command
-    # /s = shutdown, /r = restart, /t = timeout, /f = force
-    shutdown_path = "/mnt/c/Windows/System32/shutdown.exe"
-    cmd = [shutdown_path]
-
     if action == "restart":
-        cmd.append("/r")
+        cmd = ["sudo", "shutdown", "-r"]
     else:
-        cmd.append("/s")
+        cmd = ["sudo", "shutdown", "-h"]
 
-    cmd.extend(["/t", str(request.delay_seconds)])
-
-    if request.force:
-        cmd.append("/f")
+    # macOS shutdown: +N means N minutes from now
+    delay_minutes = max(1, request.delay_seconds // 60) if request.delay_seconds > 0 else 0
+    cmd.append(f"+{delay_minutes}" if delay_minutes > 0 else "now")
 
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
 
         if result.returncode == 0:
-            logger.info(f"SYSTEM: Initiated {action} with delay={request.delay_seconds}s, force={request.force}")
+            logger.info(f"SYSTEM: Initiated {action} with delay={delay_minutes}min")
             return ShutdownResponse(
                 success=True,
                 action=action,
                 delay_seconds=request.delay_seconds,
-                message=f"System {action} initiated" + (f" in {request.delay_seconds} seconds" if request.delay_seconds > 0 else "")
+                message=f"System {action} initiated" + (f" in {delay_minutes} minutes" if delay_minutes > 0 else "")
             )
         else:
             error_msg = result.stderr.strip() or result.stdout.strip()
             logger.error(f"SYSTEM: Failed to {action}: {error_msg}")
             return ShutdownResponse(
-                success=False,
-                action=action,
-                delay_seconds=request.delay_seconds,
-                message=f"Failed to initiate {action}: {error_msg}"
+                success=False, action=action, delay_seconds=request.delay_seconds,
+                message=f"Failed: {error_msg}"
             )
-
-    except subprocess.TimeoutExpired:
-        return ShutdownResponse(
-            success=False,
-            action=action,
-            delay_seconds=request.delay_seconds,
-            message="Command timed out"
-        )
     except Exception as e:
         logger.error(f"SYSTEM: Error during {action}: {e}")
         return ShutdownResponse(
-            success=False,
-            action=action,
-            delay_seconds=request.delay_seconds,
-            message=str(e)
+            success=False, action=action, delay_seconds=request.delay_seconds, message=str(e)
         )
 
 
@@ -3670,19 +3189,14 @@ async def cancel_shutdown():
     """Cancel a pending shutdown/restart."""
     try:
         result = subprocess.run(
-            ["/mnt/c/Windows/System32/shutdown.exe", "/a"],
-            capture_output=True,
-            text=True,
-            timeout=10
+            ["sudo", "killall", "shutdown"],
+            capture_output=True, text=True, timeout=10
         )
-
         if result.returncode == 0:
             logger.info("SYSTEM: Cancelled pending shutdown")
             return {"success": True, "message": "Shutdown cancelled"}
         else:
-            error_msg = result.stderr.strip() or result.stdout.strip()
-            return {"success": False, "message": f"Failed to cancel: {error_msg}"}
-
+            return {"success": False, "message": f"No pending shutdown or cancel failed: {result.stderr.strip()}"}
     except Exception as e:
         return {"success": False, "message": str(e)}
 
@@ -3993,51 +3507,36 @@ async def root():
 # ============ TTS/Notification System ============
 
 # Platform detection
-def is_wsl() -> bool:
-    """Check if running in WSL."""
-    try:
-        with open("/proc/version", "r") as f:
-            return "microsoft" in f.read().lower() or "wsl" in f.read().lower()
-    except:
-        return False
+IS_MACOS = sys.platform == "darwin"
+DEFAULT_SOUND = "chimes.wav"
 
-IS_WSL = is_wsl()
-DEFAULT_SOUND = "chimes.wav"  # Windows Media sound name
+
+SOUND_MAP = {
+    "chimes.wav": "/System/Library/Sounds/Glass.aiff",
+    "notify.wav": "/System/Library/Sounds/Ping.aiff",
+    "ding.wav": "/System/Library/Sounds/Tink.aiff",
+    "tada.wav": "/System/Library/Sounds/Hero.aiff",
+}
 
 
 def play_sound(sound_file: str = None) -> dict:
-    """Play a notification sound. In WSL, uses Windows Media.SoundPlayer."""
+    """Play a notification sound using macOS afplay."""
     sound_name = sound_file or DEFAULT_SOUND
+    sound_path = SOUND_MAP.get(sound_name, SOUND_MAP["chimes.wav"])
 
-    if IS_WSL:
-        # Use Windows SoundPlayer via PowerShell
-        sound_path = f"C:\\\\Windows\\\\Media\\\\{sound_name}"
-        try:
-            result = subprocess.run(
-                [POWERSHELL_PATH, "-c", f"(New-Object Media.SoundPlayer '{sound_path}').PlaySync()"],
-                capture_output=True,
-                timeout=10
-            )
-            if result.returncode == 0:
-                return {"success": True, "method": "windows_soundplayer", "file": sound_name}
-            return {"success": False, "error": f"PowerShell sound failed: {result.stderr.decode()[:100]}"}
-        except subprocess.TimeoutExpired:
-            return {"success": False, "error": "Sound playback timed out"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-    else:
-        # Linux: try paplay then aplay
-        sound_path = sound_file or "/usr/share/sounds/freedesktop/stereo/complete.oga"
-        try:
-            result = subprocess.run(["paplay", sound_path], capture_output=True, timeout=10)
-            if result.returncode == 0:
-                return {"success": True, "method": "paplay", "file": sound_path}
-            result = subprocess.run(["aplay", sound_path], capture_output=True, timeout=10)
-            if result.returncode == 0:
-                return {"success": True, "method": "aplay", "file": sound_path}
-            return {"success": False, "error": "Both paplay and aplay failed"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+    try:
+        result = subprocess.run(
+            ["afplay", sound_path],
+            capture_output=True,
+            timeout=10
+        )
+        if result.returncode == 0:
+            return {"success": True, "method": "afplay", "file": sound_path}
+        return {"success": False, "error": f"afplay failed: {result.stderr.decode()[:100]}"}
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "Sound playback timed out"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 async def log_event_sync(event_type: str, instance_id: str = None, device_id: str = None, details: dict = None):
@@ -4059,7 +3558,7 @@ def clean_markdown_for_tts(text: str) -> str:
     """
     import re
 
-    # Unicode arrows/symbols that SAPI mispronounces
+    # Unicode arrows/symbols that TTS mispronounces
     text = text.replace('→', ' to ')
     text = text.replace('←', ' from ')
     text = text.replace('↔', ' both ways ')
@@ -4072,18 +3571,12 @@ def clean_markdown_for_tts(text: str) -> str:
     text = text.replace('—', ', ')  # Em dash
     text = text.replace('–', ', ')  # En dash
 
-    # Remove backslashes (they get doubled by PowerShell escaping and read aloud)
+    # Remove backslashes that might be read aloud
     text = text.replace('\\', ' ')
 
     # Path compression - replace long paths with friendly names
     path_replacements = [
-        # Specific paths first (longer/more specific before shorter/generic)
-        ('/mnt/c/Users/colby/Documents/Obsidian/Token-ENV', 'Obsidian Path'),
-        ('~/ProcAgentDir/ProcurementAgentAI', 'pax path'),
-        ('/home/token/ProcAgentDir/ProcurementAgentAI', 'pax path'),
-        # Generic home paths last (strip entirely)
-        ('/home/token/', ''),
-        ('/home/token', ''),
+        ('~/.openclaw/workspace/', ''),
         ('~/', ''),
     ]
     for path, replacement in path_replacements:
@@ -4129,7 +3622,7 @@ def clean_markdown_for_tts(text: str) -> str:
 
 
 def speak_tts(message: str, voice: str = None, rate: int = 0, instance_id: str = None) -> dict:
-    """Speak a message using TTS. In WSL, uses Windows SAPI via PowerShell.
+    """Speak a message using macOS `say` command.
 
     Uses Popen instead of run() to allow process termination via skip_tts().
     """
@@ -4141,96 +3634,35 @@ def speak_tts(message: str, voice: str = None, rate: int = 0, instance_id: str =
     # Clean markdown syntax for natural TTS output
     message = clean_markdown_for_tts(message)
 
-    if IS_WSL:
-        # Use Windows SAPI via PowerShell
-        voice = voice or "Microsoft Zira Desktop"
+    voice = voice or "Daniel"
+    # Map SAPI rate scale (-10..10) to say WPM; default 0 → 190 WPM (slightly fast)
+    wpm = 190 if rate == 0 else 175 + (rate * 15)
+    wpm = max(80, min(300, wpm))
 
-        # Use faster rate by default (SAPI rate: -10 to 10, 0=normal, 2≈1.5x)
-        effective_rate = 2 if rate == 0 else rate
+    try:
+        process = subprocess.Popen(
+            ["say", "-v", voice, "-r", str(wpm), message],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        tts_current_process = process
+        process.wait(timeout=300)
+        tts_current_process = None
 
-        # Escape special characters for PowerShell
-        escaped = message.replace("\\", "\\\\").replace("'", "''").replace("$", "\\$").replace("`", "\\`")
-
-        ps_script = f"""
-Add-Type -AssemblyName System.Speech
-$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
-$synth.SelectVoice('{voice}')
-$synth.Rate = [int]{effective_rate}
-$synth.Speak('{escaped}')
-"""
-        try:
-            process = subprocess.Popen(
-                [POWERSHELL_PATH],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-            tts_current_process = process
-            stdout, stderr = process.communicate(input=ps_script.encode(), timeout=300)
+        if process.returncode == 0:
+            return {"success": True, "method": "macos_say", "voice": voice, "message": message[:50]}
+        if tts_skip_requested:
+            tts_skip_requested = False
+            return {"success": True, "method": "skipped", "message": message[:50]}
+        return {"success": False, "error": f"say failed with code {process.returncode}"}
+    except subprocess.TimeoutExpired:
+        if tts_current_process:
+            tts_current_process.kill()
             tts_current_process = None
-
-            if process.returncode == 0:
-                return {"success": True, "method": "windows_sapi", "voice": voice, "message": message[:50]}
-            # Check if this was an intentional skip (vs. actual failure)
-            if tts_skip_requested:
-                tts_skip_requested = False  # Reset flag
-                return {"success": True, "method": "skipped", "message": message[:50]}
-            error = stderr.decode()[:200] if stderr else "Unknown error"
-            return {"success": False, "error": f"SAPI failed: {error}"}
-        except subprocess.TimeoutExpired:
-            if tts_current_process:
-                tts_current_process.kill()
-                tts_current_process = None
-            return {"success": False, "error": "TTS timed out"}
-        except Exception as e:
-            tts_current_process = None
-            return {"success": False, "error": str(e)}
-    else:
-        # Linux: try espeak then festival
-        try:
-            espeak_rate = 175 + (rate * 25)  # Convert -10..10 to espeak scale
-            espeak_rate = max(80, min(500, espeak_rate))
-
-            process = subprocess.Popen(
-                ["espeak", "-s", str(espeak_rate), message],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-            tts_current_process = process
-            process.wait(timeout=300)
-            tts_current_process = None
-
-            if process.returncode == 0:
-                return {"success": True, "method": "espeak", "message": message[:50]}
-            if tts_skip_requested:
-                tts_skip_requested = False
-                return {"success": True, "method": "skipped", "message": message[:50]}
-
-            process = subprocess.Popen(
-                ["festival", "--tts"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-            tts_current_process = process
-            process.communicate(input=message.encode(), timeout=300)
-            tts_current_process = None
-
-            if process.returncode == 0:
-                return {"success": True, "method": "festival", "message": message[:50]}
-            if tts_skip_requested:
-                tts_skip_requested = False
-                return {"success": True, "method": "skipped", "message": message[:50]}
-
-            return {"success": False, "error": "Both espeak and festival failed"}
-        except subprocess.TimeoutExpired:
-            if tts_current_process:
-                tts_current_process.kill()
-                tts_current_process = None
-            return {"success": False, "error": "TTS timed out"}
-        except Exception as e:
-            tts_current_process = None
-            return {"success": False, "error": str(e)}
+        return {"success": False, "error": "TTS timed out"}
+    except Exception as e:
+        tts_current_process = None
+        return {"success": False, "error": str(e)}
 
 
 # ============ TTS Queue System ============
@@ -4462,7 +3894,7 @@ async def queue_tts(instance_id: str, message: str) -> dict:
     if not row:
         return {"success": False, "error": f"Instance {instance_id} not found"}
 
-    voice = row["tts_voice"] or "Microsoft Zira Desktop"
+    voice = row["tts_voice"] or "Daniel"
     sound = row["notification_sound"] or "chimes.wav"
     tab_name = row["tab_name"] or instance_id
 
@@ -4544,22 +3976,10 @@ async def skip_tts(clear_queue: bool = False) -> dict:
         # Set flag BEFORE killing so speak_tts() knows this was intentional
         tts_skip_requested = True
         try:
-            if IS_WSL:
-                # In WSL, process.kill() doesn't stop Windows processes
-                # Use Windows taskkill via cmd.exe to forcefully terminate PowerShell
-                subprocess.run(
-                    ["/mnt/c/WINDOWS/System32/cmd.exe", "/c", "taskkill /IM powershell.exe /F"],
-                    timeout=5,
-                    capture_output=True
-                )
-                result["skipped"] = True
-                logger.info("TTS process killed via Windows taskkill")
-            else:
-                # On native Linux, regular kill works
-                tts_current_process.kill()
-                tts_current_process.wait(timeout=1.0)
-                result["skipped"] = True
-                logger.info("TTS process killed via skip")
+            tts_current_process.kill()
+            tts_current_process.wait(timeout=1.0)
+            result["skipped"] = True
+            logger.info("TTS process killed via skip")
         except Exception as e:
             logger.warning(f"Error killing TTS process: {e}")
 
@@ -4628,7 +4048,7 @@ async def send_notification(request: NotifyRequest):
                 device_id = row["device_id"]
 
     if not device_id:
-        device_id = "desktop"  # Default
+        device_id = "Mac-Mini"  # Default
 
     # Get device config
     async with aiosqlite.connect(DB_PATH) as db:
@@ -4785,7 +4205,7 @@ async def handle_session_start(payload: dict) -> dict:
     tab_name = payload.get("env", {}).get("CLAUDE_TAB_NAME") or f"Claude {datetime.now().strftime('%H:%M')}"
 
     # Resolve device_id from source_ip
-    device_id = resolve_device_from_ip(source_ip) if source_ip else "desktop"
+    device_id = resolve_device_from_ip(source_ip) if source_ip else "Mac-Mini"
 
     async with aiosqlite.connect(DB_PATH) as db:
         # Check if already registered
@@ -4976,9 +4396,9 @@ async def handle_stop(payload: dict) -> dict:
         return {"success": False, "action": "instance_not_found"}
 
     instance = dict(instance)
-    device_id = instance.get("device_id", "desktop")
+    device_id = instance.get("device_id", "Mac-Mini")
     tab_name = instance.get("tab_name", "Claude")
-    tts_voice = instance.get("tts_voice", "Microsoft Zira Desktop")
+    tts_voice = instance.get("tts_voice", "Daniel")
     notification_sound = instance.get("notification_sound", "chimes.wav")
 
     # Mark as no longer processing

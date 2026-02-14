@@ -159,7 +159,7 @@ def init_database():
     # Seed devices
     cursor.execute("""
         INSERT OR IGNORE INTO devices (id, name, type, tailscale_ip, notification_method, tts_engine)
-        VALUES ('desktop', 'Desktop', 'local', '100.66.10.74', 'tts_sound', 'windows_sapi')
+        VALUES ('Mac-Mini', 'Mac Mini', 'local', '100.95.109.23', 'tts_sound', 'macos_say')
     """)
 
     cursor.execute("""
@@ -187,7 +187,7 @@ def init_database():
 
     print(f"Database initialized at {DB_PATH}")
     print("Tables created: claude_instances, devices, events, scheduled_tasks, task_executions, task_locks, audio_proxy_state")
-    print("Devices seeded: desktop, Token-S24")
+    print("Devices seeded: Mac-Mini, Token-S24")
     print("Tasks seeded: cleanup_stale_instances, purge_old_events")
 
 
