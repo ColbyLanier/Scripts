@@ -36,8 +36,9 @@ app = FastAPI(title="Token Satellite", version="1.0.0")
 tts_current_process: Optional[subprocess.Popen] = None
 tts_skip_event = threading.Event()
 
-# Full path — bare "cmd.exe" isn't on PATH under systemd
+# Full paths — bare exes aren't on PATH under systemd
 CMD_EXE = "/mnt/c/Windows/System32/cmd.exe"
+POWERSHELL_EXE = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 
 # Mapping of app aliases to Windows executables
 APP_TARGETS = {
@@ -179,7 +180,7 @@ $synth.Speak('{escaped}')
 
     try:
         process = subprocess.Popen(
-            ["powershell.exe"],
+            [POWERSHELL_EXE],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
