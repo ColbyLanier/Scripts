@@ -570,6 +570,38 @@ async def init_db():
             )
         """)
 
+        # Create checkins table (productivity check-in responses)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS checkins (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                checkin_type TEXT NOT NULL,
+                date TEXT NOT NULL,
+                energy INTEGER,
+                focus INTEGER,
+                mood TEXT,
+                plan TEXT,
+                notes TEXT,
+                on_track INTEGER,
+                source TEXT DEFAULT 'discord',
+                prompted_at TIMESTAMP NOT NULL,
+                responded_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(checkin_type, date)
+            )
+        """)
+
+        # Create nudges table (Phase 2 - idle detection nudges)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS nudges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nudge_type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                idle_minutes REAL,
+                acknowledged INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # Seed devices if not exist
         await db.execute("""
             INSERT OR IGNORE INTO devices (id, name, type, tailscale_ip, notification_method, tts_engine)
@@ -595,6 +627,20 @@ async def init_db():
                     'Delete events older than 30 days',
                     'cron', '0 3 * * *', 1)
         """)
+
+        # Seed check-in scheduled tasks (weekdays only)
+        checkin_tasks = [
+            ("checkin_morning_start", "Morning Start Check-in", "Energy, focus, mood, and today's focus", "0 9 * * 1-5"),
+            ("checkin_mid_morning", "Mid-Morning Check-in", "Focus check and on-track status", "30 10 * * 1-5"),
+            ("checkin_decision_point", "Decision Point Check-in", "Gym or power through, energy check", "0 11 * * 1-5"),
+            ("checkin_afternoon", "Afternoon Start Check-in", "Energy and focus after lunch", "0 13 * * 1-5"),
+            ("checkin_afternoon_check", "Afternoon Check", "Energy, focus, and need help assessment", "30 14 * * 1-5"),
+        ]
+        for task_id, name, desc, schedule in checkin_tasks:
+            await db.execute("""
+                INSERT OR IGNORE INTO scheduled_tasks (id, name, description, task_type, schedule, max_retries)
+                VALUES (?, ?, ?, 'cron', ?, 0)
+            """, (task_id, name, desc, schedule))
 
         await db.commit()
         print(f"Database initialized at {DB_PATH}")
@@ -772,6 +818,11 @@ async def purge_old_events() -> dict:
 TASK_REGISTRY = {
     "cleanup_stale_instances": cleanup_stale_instances,
     "purge_old_events": purge_old_events,
+    "checkin_morning_start": lambda: trigger_checkin("morning_start"),
+    "checkin_mid_morning": lambda: trigger_checkin("mid_morning"),
+    "checkin_decision_point": lambda: trigger_checkin("decision_point"),
+    "checkin_afternoon": lambda: trigger_checkin("afternoon"),
+    "checkin_afternoon_check": lambda: trigger_checkin("afternoon_check"),
 }
 
 
@@ -2168,6 +2219,13 @@ DISTRACTION_PATTERNS = [
     "Reddit",
 ]
 
+# Windows satellite server config (token-satellite on WSL via Tailscale)
+DESKTOP_CONFIG = {
+    "host": "100.66.10.74",  # WSL Tailscale IP
+    "port": 7777,
+    "timeout": 5,
+}
+
 # Desktop mode state (tracks current mode from AHK detection)
 DESKTOP_STATE = {
     "current_mode": "silence",
@@ -2175,6 +2233,9 @@ DESKTOP_STATE = {
     # Work mode: "clocked_in" (normal enforcement), "clocked_out" (no enforcement), "gym" (gym timer)
     "work_mode": "clocked_in",
     "work_mode_changed_at": None,
+    # AHK heartbeat tracking
+    "ahk_reachable": None,
+    "ahk_last_heartbeat": None,
 }
 
 # Valid desktop detection modes (replaces OBSIDIAN_CONFIG["mode_commands"].keys())
@@ -2184,7 +2245,7 @@ VALID_DETECTION_MODES = ["silence", "music", "video", "gaming", "gym", "work_gym
 timer_engine = TimerEngine(now_mono_ms=int(time.monotonic() * 1000))
 
 # Paths for Obsidian vault (write-only consumer for daily notes)
-OBSIDIAN_VAULT_PATH = Path("/mnt/c/Users/colby/Documents/Obsidian/Token-ENV")
+OBSIDIAN_VAULT_PATH = Path.home() / "Token-ENV"
 OBSIDIAN_DAILY_PATH = OBSIDIAN_VAULT_PATH / "Journal" / "Daily"
 
 
@@ -2205,6 +2266,264 @@ def _write_productivity_score(date_str: str, score: int):
         print(f"TIMER: Wrote productivity score {score} to {date_str}")
     except Exception as e:
         print(f"TIMER: Failed to write productivity score: {e}")
+
+# ============ Productivity Check-In System ============
+DISCORD_CHECKIN_CHANNEL = "1472043387535495323"
+
+CHECKIN_SCHEDULE = {
+    "morning_start": {
+        "cron": "0 9 * * 1-5",
+        "name": "Morning Start",
+        "time_suffix": "0900",
+        "fields": ["energy", "focus", "mood", "notes"],
+        "discord_message": (
+            "**Morning Check-in**\n"
+            "How are you starting the day?\n\n"
+            "Reply with: `energy focus mood notes`\n"
+            "Example: `7 8 good shipping auth refactor`\n\n"
+            "Or submit via API: POST /api/checkin/submit"
+        ),
+        "tts_prompt": "Time for your morning check-in. How's your energy and focus?",
+    },
+    "mid_morning": {
+        "cron": "30 10 * * 1-5",
+        "name": "Mid-Morning",
+        "time_suffix": "1030",
+        "fields": ["focus", "on_track"],
+        "discord_message": (
+            "**Mid-Morning Check**\n"
+            "Still locked in?\n\n"
+            "Reply with: `focus on_track`\n"
+            "Example: `6 yes`"
+        ),
+        "tts_prompt": "Mid-morning check. Are you still on track?",
+    },
+    "decision_point": {
+        "cron": "0 11 * * 1-5",
+        "name": "Decision Point",
+        "time_suffix": "1100",
+        "fields": ["energy", "plan"],
+        "discord_message": (
+            "**11 AM Decision Point**\n"
+            "Gym now or power through?\n\n"
+            "Reply with: `energy plan`\n"
+            "Example: `5 gym` or `7 power_through`"
+        ),
+        "tts_prompt": "Decision point. Gym or power through?",
+    },
+    "afternoon": {
+        "cron": "0 13 * * 1-5",
+        "name": "Afternoon Start",
+        "time_suffix": "1300",
+        "fields": ["energy", "focus"],
+        "discord_message": (
+            "**Afternoon Check-in**\n"
+            "Post-lunch status?\n\n"
+            "Reply with: `energy focus`\n"
+            "Example: `4 3`"
+        ),
+        "tts_prompt": "Afternoon check-in. How's the energy after lunch?",
+    },
+    "afternoon_check": {
+        "cron": "30 14 * * 1-5",
+        "name": "Afternoon Check",
+        "time_suffix": "1430",
+        "fields": ["energy", "focus", "notes"],
+        "discord_message": (
+            "**2:30 PM Check**\n"
+            "Energy holding up? Need help with anything?\n\n"
+            "Reply with: `energy focus notes`\n"
+            "Example: `3 2 need to take a walk`"
+        ),
+        "tts_prompt": "Afternoon check. Energy holding up?",
+    },
+}
+
+
+class CheckinSubmit(BaseModel):
+    type: str  # checkin_type from CHECKIN_SCHEDULE
+    energy: Optional[int] = None
+    focus: Optional[int] = None
+    mood: Optional[str] = None
+    plan: Optional[str] = None
+    notes: Optional[str] = None
+    on_track: Optional[bool] = None
+
+
+def send_discord_checkin(message: str):
+    """Send check-in prompt to Discord via openclaw CLI."""
+    try:
+        cmd = [
+            "openclaw", "message", "send",
+            "--channel", "discord",
+            "--target", DISCORD_CHECKIN_CHANNEL,
+            "--message", message,
+        ]
+        subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to send Discord check-in: {e}")
+        return False
+
+
+def speak_checkin_tts(message: str):
+    """Speak check-in prompt via TTS (non-blocking fire-and-forget)."""
+    try:
+        subprocess.Popen(
+            ["say", "-v", "Daniel", "-r", "190", message],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except Exception as e:
+        logger.error(f"Failed to speak check-in TTS: {e}")
+
+
+async def trigger_checkin(checkin_type: str) -> dict:
+    """Trigger a productivity check-in: Discord message + TTS nudge."""
+    config = CHECKIN_SCHEDULE.get(checkin_type)
+    if not config:
+        return {"error": f"Unknown checkin type: {checkin_type}"}
+
+    # Skip if not working
+    work_mode = DESKTOP_STATE.get("work_mode", "clocked_in")
+    if work_mode in ("clocked_out", "gym"):
+        logger.info(f"Skipping check-in {checkin_type}: work_mode={work_mode}")
+        return {"skipped": True, "reason": f"work_mode={work_mode}"}
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    prompted_at = datetime.now().isoformat()
+
+    # Log the prompt in the database
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT OR IGNORE INTO checkins (checkin_type, date, prompted_at)
+            VALUES (?, ?, ?)
+        """, (checkin_type, today, prompted_at))
+        await db.commit()
+
+    # Send Discord message
+    discord_sent = send_discord_checkin(config["discord_message"])
+
+    # TTS nudge
+    speak_checkin_tts(config["tts_prompt"])
+
+    logger.info(f"Check-in triggered: {checkin_type} (discord={discord_sent})")
+    await log_event("checkin_prompted", details={
+        "checkin_type": checkin_type,
+        "discord_sent": discord_sent,
+    })
+
+    return {
+        "checkin_type": checkin_type,
+        "name": config["name"],
+        "discord_sent": discord_sent,
+        "prompted_at": prompted_at,
+    }
+
+
+DAILY_NOTE_DIR = Path.home() / "Token-ENV" / "Journal" / "Daily"
+
+
+def update_daily_note_frontmatter(checkin_type: str, data: dict) -> bool:
+    """Write time-stamped check-in fields to today's daily note frontmatter.
+
+    Adds fields like energy_0900, focus_0900, etc. and updates top-level
+    energy/focus/mood so meta-bind widgets reflect the latest values.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    note_path = DAILY_NOTE_DIR / f"{today}.md"
+
+    if not note_path.exists():
+        logger.warning(f"Daily note not found: {note_path}")
+        return False
+
+    try:
+        content = note_path.read_text(encoding="utf-8")
+    except Exception as e:
+        logger.error(f"Failed to read daily note: {e}")
+        return False
+
+    # Parse frontmatter (between --- delimiters)
+    if not content.startswith("---"):
+        logger.warning("Daily note has no frontmatter")
+        return False
+
+    end_idx = content.index("---", 3)
+    frontmatter = content[3:end_idx].strip()
+    body = content[end_idx:]  # includes closing ---
+
+    # Build new fields from check-in data
+    config = CHECKIN_SCHEDULE.get(checkin_type, {})
+    time_suffix = config.get("time_suffix", "")
+
+    new_fields = {}
+    if data.get("energy") is not None and time_suffix:
+        new_fields[f"energy_{time_suffix}"] = data["energy"]
+    if data.get("focus") is not None and time_suffix:
+        new_fields[f"focus_{time_suffix}"] = data["focus"]
+    if data.get("mood") is not None and time_suffix:
+        new_fields[f"mood_{time_suffix}"] = data["mood"]
+    if data.get("plan") is not None and time_suffix:
+        new_fields[f"checkin_plan_{time_suffix}"] = data["plan"]
+    if data.get("notes") is not None and time_suffix:
+        new_fields[f"checkin_notes_{time_suffix}"] = f'"{data["notes"]}"'
+
+    if not new_fields:
+        return False
+
+    # Parse existing frontmatter lines into ordered dict
+    lines = frontmatter.split("\n")
+    fm_lines = []
+    existing_keys = set()
+    for line in lines:
+        if ":" in line:
+            key = line.split(":", 1)[0].strip()
+            existing_keys.add(key)
+        fm_lines.append(line)
+
+    # Update existing keys or append new ones
+    for key, value in new_fields.items():
+        field_line = f"{key}: {value}"
+        if key in existing_keys:
+            # Replace existing line
+            for i, line in enumerate(fm_lines):
+                if line.startswith(f"{key}:"):
+                    fm_lines[i] = field_line
+                    break
+        else:
+            fm_lines.append(field_line)
+
+    # Also update top-level energy/focus/mood to latest value (for meta-bind widgets)
+    top_level_updates = {}
+    if data.get("energy") is not None:
+        top_level_updates["energy"] = data["energy"]
+    if data.get("focus") is not None:
+        top_level_updates["focus"] = data["focus"]
+    if data.get("mood") is not None:
+        top_level_updates["mood"] = data["mood"]
+
+    for key, value in top_level_updates.items():
+        field_line = f"{key}: {value}"
+        if key in existing_keys:
+            for i, line in enumerate(fm_lines):
+                if line.startswith(f"{key}:"):
+                    fm_lines[i] = field_line
+                    break
+        else:
+            fm_lines.append(field_line)
+
+    # Reconstruct file
+    new_frontmatter = "\n".join(fm_lines)
+    new_content = f"---\n{new_frontmatter}\n{body}"
+
+    try:
+        note_path.write_text(new_content, encoding="utf-8")
+        logger.info(f"Updated daily note frontmatter: {list(new_fields.keys())}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to write daily note: {e}")
+        return False
+
 
 # Phone HTTP server config (MacroDroid on phone via Tailscale)
 PHONE_CONFIG = {
@@ -2551,9 +2870,79 @@ def check_audio_receiver_running() -> dict:
 
 
 def close_distraction_windows() -> dict:
-    """Window enforcement is not available on macOS (no desktop browser to manage)."""
-    logger.info("ENFORCE: close_distraction_windows not applicable on macOS")
-    return {"success": True, "closed_count": 0}
+    """
+    Close distraction windows on Windows via token-satellite.
+
+    Mode-aware enforcement:
+    - video mode → close brave (YouTube in browser)
+    - gaming mode → close minecraft
+    """
+    current_mode = DESKTOP_STATE.get("current_mode", "silence")
+
+    # Map modes to apps to close
+    mode_targets = {
+        "video": ["brave"],
+        "gaming": ["minecraft"],
+    }
+
+    targets = mode_targets.get(current_mode, [])
+    if not targets:
+        logger.info(f"ENFORCE: No targets for mode '{current_mode}'")
+        return {"success": True, "closed_count": 0, "mode": current_mode}
+
+    results = []
+    for app in targets:
+        result = enforce_desktop_app(app, "close")
+        results.append(result)
+
+    closed = sum(1 for r in results if r.get("success"))
+    logger.info(f"ENFORCE: Closed {closed}/{len(targets)} targets for mode '{current_mode}'")
+    return {"success": closed > 0 or not targets, "closed_count": closed, "results": results}
+
+
+def enforce_desktop_app(app_name: str, action: str = "close") -> dict:
+    """Send enforcement command to Windows via token-satellite."""
+    host = DESKTOP_CONFIG["host"]
+    port = DESKTOP_CONFIG["port"]
+    timeout = DESKTOP_CONFIG["timeout"]
+
+    url = f"http://{host}:{port}/enforce"
+
+    try:
+        response = requests.post(
+            url,
+            json={"app": app_name, "action": action},
+            timeout=timeout,
+        )
+        logger.info(f"DESKTOP: Enforce {action} {app_name} -> {response.status_code}")
+        return {
+            "success": response.status_code == 200,
+            "app": app_name,
+            "status_code": response.status_code,
+            "response": response.json() if response.status_code == 200 else response.text,
+        }
+    except Exception as e:
+        logger.error(f"DESKTOP: Error enforcing {action} {app_name}: {e}")
+        DESKTOP_STATE["ahk_reachable"] = False
+        return {"success": False, "app": app_name, "error": str(e)}
+
+
+def check_desktop_reachable() -> dict:
+    """Check if Windows satellite server is reachable."""
+    host = DESKTOP_CONFIG["host"]
+    port = DESKTOP_CONFIG["port"]
+    timeout = DESKTOP_CONFIG["timeout"]
+
+    url = f"http://{host}:{port}/health"
+
+    try:
+        response = requests.get(url, timeout=timeout)
+        DESKTOP_STATE["ahk_reachable"] = True
+        DESKTOP_STATE["ahk_last_heartbeat"] = datetime.now().isoformat()
+        return {"reachable": True, "status_code": response.status_code}
+    except Exception:
+        DESKTOP_STATE["ahk_reachable"] = False
+        return {"reachable": False}
 
 
 def trigger_obsidian_command_async(command_id: str, no_focus: bool = False):
@@ -2864,6 +3253,60 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
                 active_instance_count=active_count
             ).model_dump()
         )
+
+
+# ============ Desktop Satellite Endpoints ============
+
+
+@app.post("/desktop/heartbeat")
+async def handle_desktop_heartbeat(request: dict):
+    """Receive heartbeat from AHK audio-monitor (~every 30s)."""
+    mode = request.get("mode", "unknown")
+    source = request.get("source", "unknown")
+
+    DESKTOP_STATE["ahk_reachable"] = True
+    DESKTOP_STATE["ahk_last_heartbeat"] = datetime.now().isoformat()
+
+    logger.debug(f"AHK heartbeat: mode={mode} source={source}")
+    return {
+        "status": "ok",
+        "ahk_mode": mode,
+        "server_mode": DESKTOP_STATE.get("current_mode", "silence"),
+    }
+
+
+@app.post("/desktop/enforce")
+async def manual_enforce_desktop(app: str = "brave", action: str = "close"):
+    """Manually trigger desktop enforcement via token-satellite (for testing)."""
+    result = enforce_desktop_app(app, action)
+
+    await log_event(
+        "desktop_manual_enforcement",
+        details={"app": app, "action": action, "result": result}
+    )
+
+    return result
+
+
+@app.get("/desktop/ping")
+async def ping_desktop():
+    """Check if Windows satellite server is reachable."""
+    result = check_desktop_reachable()
+    return result
+
+
+@app.post("/satellite/restart")
+async def restart_satellite_proxy():
+    """Proxy restart to WSL satellite. Timeout expected (satellite exits)."""
+    host = DESKTOP_CONFIG["host"]
+    port = DESKTOP_CONFIG["port"]
+    try:
+        requests.post(f"http://{host}:{port}/restart", timeout=3)
+        return {"success": True}
+    except requests.exceptions.Timeout:
+        return {"success": True, "note": "timeout expected during restart"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 # ============ Phone Activity Detection ============
@@ -3313,6 +3756,150 @@ async def clock_in():
     DESKTOP_STATE["work_mode_changed_at"] = datetime.now().isoformat()
     await log_event("work_mode_change", details={"new_mode": "clocked_in", "source": "quick_api"})
     return {"status": "clocked_in", "message": "Enforcement enabled"}
+
+
+# ============ Check-In Endpoints ============
+
+@app.post("/api/checkin/submit")
+async def submit_checkin(request: CheckinSubmit):
+    """Submit a productivity check-in response. Stores in DB and writes to daily note."""
+    config = CHECKIN_SCHEDULE.get(request.type)
+    if not config:
+        raise HTTPException(status_code=400, detail=f"Unknown checkin type: {request.type}")
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    now = datetime.now().isoformat()
+
+    # Upsert the check-in response
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Check if a prompt row exists (created by trigger_checkin)
+        cursor = await db.execute(
+            "SELECT id, prompted_at FROM checkins WHERE checkin_type = ? AND date = ?",
+            (request.type, today)
+        )
+        existing = await cursor.fetchone()
+
+        if existing:
+            await db.execute("""
+                UPDATE checkins SET
+                    energy = ?, focus = ?, mood = ?, plan = ?, notes = ?,
+                    on_track = ?, responded_at = ?
+                WHERE checkin_type = ? AND date = ?
+            """, (
+                request.energy, request.focus, request.mood, request.plan, request.notes,
+                1 if request.on_track else (0 if request.on_track is not None else None),
+                now, request.type, today,
+            ))
+        else:
+            # Submit without a prior prompt (manual submission)
+            await db.execute("""
+                INSERT INTO checkins (checkin_type, date, energy, focus, mood, plan, notes, on_track, prompted_at, responded_at, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'api')
+            """, (
+                request.type, today, request.energy, request.focus, request.mood,
+                request.plan, request.notes,
+                1 if request.on_track else (0 if request.on_track is not None else None),
+                now, now,
+            ))
+
+        await db.commit()
+
+    # Write to daily note frontmatter
+    data = {k: v for k, v in request.model_dump().items() if k != "type" and v is not None}
+    obsidian_updated = update_daily_note_frontmatter(request.type, data)
+
+    await log_event("checkin_submitted", details={
+        "checkin_type": request.type,
+        "energy": request.energy,
+        "focus": request.focus,
+        "obsidian_updated": obsidian_updated,
+    })
+
+    return {"status": "ok", "checkin_type": request.type, "obsidian_updated": obsidian_updated}
+
+
+@app.get("/api/checkin/today")
+async def get_today_checkins():
+    """Return all check-ins for today with completion status."""
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM checkins WHERE date = ? ORDER BY prompted_at",
+            (today,)
+        )
+        rows = await cursor.fetchall()
+
+    checkins = []
+    completed_types = set()
+    for row in rows:
+        entry = dict(row)
+        entry["completed"] = entry["responded_at"] is not None
+        if entry["completed"]:
+            completed_types.add(entry["checkin_type"])
+        checkins.append(entry)
+
+    # Show which check-ins are pending (not yet prompted or responded)
+    pending = [k for k in CHECKIN_SCHEDULE if k not in completed_types]
+
+    return {
+        "date": today,
+        "checkins": checkins,
+        "completed": list(completed_types),
+        "pending": pending,
+    }
+
+
+@app.get("/api/checkin/status")
+async def get_checkin_status():
+    """Return next upcoming check-in and overall status."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    now = datetime.now()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT checkin_type, responded_at FROM checkins WHERE date = ?",
+            (today,)
+        )
+        rows = await cursor.fetchall()
+
+    completed = [r["checkin_type"] for r in rows if r["responded_at"]]
+    prompted = [r["checkin_type"] for r in rows]
+
+    # Determine next check-in based on current time
+    schedule_order = ["morning_start", "mid_morning", "decision_point", "afternoon", "afternoon_check"]
+    time_map = {"morning_start": "09:00", "mid_morning": "10:30", "decision_point": "11:00",
+                "afternoon": "13:00", "afternoon_check": "14:30"}
+
+    next_checkin = None
+    next_at = None
+    pending = []
+    for ctype in schedule_order:
+        scheduled_time = datetime.strptime(f"{today} {time_map[ctype]}", "%Y-%m-%d %H:%M")
+        if ctype not in completed:
+            pending.append(ctype)
+            if scheduled_time > now and next_checkin is None:
+                next_checkin = ctype
+                next_at = time_map[ctype]
+
+    return {
+        "next": next_checkin,
+        "next_at": next_at,
+        "completed": completed,
+        "pending": pending,
+        "prompted": prompted,
+    }
+
+
+@app.post("/api/checkin/trigger/{checkin_type}")
+async def manual_trigger_checkin(checkin_type: str):
+    """Manually trigger a check-in (for testing)."""
+    result = await trigger_checkin(checkin_type)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
 
 
 @app.post("/api/events/log")

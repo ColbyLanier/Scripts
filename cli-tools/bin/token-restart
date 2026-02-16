@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# token-restart - Restart the Token-API server
+# token-restart - Multi-device restart orchestrator
 #
 # Usage:
-#   token-restart              # Restart server via launchctl
-#   token-restart --kill       # Just kill, don't restart
-#   token-restart --watch      # Restart and monitor startup
-#   token-restart --status     # Show current status only
-#
-# The server runs on port 7777 and is managed by launchd (ai.openclaw.tokenapi)
+#   token-restart              # Full restart: git push, Mac, WSL, phone TUI
+#   token-restart --mac-only   # Mac token-api only (legacy behavior)
+#   token-restart --wsl-only   # WSL satellite only
+#   token-restart --kill       # Just kill Mac server, don't restart
+#   token-restart --watch      # Restart and monitor startup logs
+#   token-restart --status     # All-device status
+#   token-restart --no-push    # Skip git push
 
 set -euo pipefail
 
@@ -15,65 +16,100 @@ set -euo pipefail
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
-NC='\033[0m' # No Color
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m'
 
+# Mac config
 LABEL="ai.openclaw.tokenapi"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
 
+# WSL config
+WSL_HOST="100.66.10.74"
+WSL_PORT=7777
+
+# Signal dir
+SIGNAL_DIR="$HOME/.claude"
+
 show_help() {
     cat << 'EOF'
-token-restart - Restart the Token-API server
+token-restart - Multi-device restart orchestrator
 
 Usage:
-    token-restart              Restart server (launchctl kickstart)
-    token-restart --kill       Kill process (launchd auto-restarts)
+    token-restart              Full restart (git push → Mac → WSL → phone)
+    token-restart --mac-only   Mac token-api only (legacy)
+    token-restart --wsl-only   WSL satellite only
+    token-restart --kill       Kill Mac process (launchd auto-restarts)
     token-restart --watch      Restart and monitor startup logs
-    token-restart --status     Show current server status only
+    token-restart --status     All-device status
+    token-restart --no-push    Skip git push step
     token-restart -h, --help   Show this help
 
-Examples:
-    token-restart              # Quick restart
-    token-restart --watch      # Restart and tail logs
-    token-restart --status     # Check if running
+Flow:
+    1. git push (Mac → origin)
+    2. Restart Mac token-api (launchctl) + write Mac TUI signals
+    3. Restart WSL satellite (HTTP → git pull + restart, SSH fallback)
+    4. Signal phone TUI restart (SSH)
+    5. Health-check all, print summary
 
 Notes:
-    - Server runs on port 7777
-    - Managed by launchd (ai.openclaw.tokenapi)
-    - Logs: ~/.claude/token-api-stdout.log, token-api-stderr.log
+    - WSL and phone steps are fire-and-forget if unreachable
+    - WSL satellite self-restarts via systemd (Restart=always)
+    - Mac server managed by launchd (ai.openclaw.tokenapi)
 EOF
 }
 
-check_health() {
-    if curl -sf http://localhost:7777/health > /dev/null 2>&1; then
-        echo -e "${GREEN}●${NC} Server is healthy"
+# ============ Git ============
+
+git_push() {
+    echo -e "${BLUE}→${NC} Pushing code to origin..."
+    if git -C ~/Scripts push --quiet 2>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} Push succeeded"
         return 0
     else
-        echo -e "${RED}●${NC} Server is not responding"
+        echo -e "  ${YELLOW}⚠${NC} Push failed (WSL will get stale code)"
         return 1
     fi
 }
 
-get_status() {
-    echo "=== Token-API Status ==="
+# ============ TUI Signals ============
 
-    # Check launchd status
+write_tui_signals() {
+    local signal_data="{\"reason\":\"token-restart\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+    mkdir -p "$SIGNAL_DIR"
+    for suffix in desktop mobile; do
+        echo "$signal_data" > "$SIGNAL_DIR/tui-restart-${suffix}.signal"
+    done
+}
+
+# ============ Mac ============
+
+check_mac_health() {
+    curl -sf http://localhost:7777/health > /dev/null 2>&1
+}
+
+get_mac_status() {
+    echo -e "${BOLD}Mac token-api${NC}"
+
     if launchctl print gui/501/${LABEL} > /dev/null 2>&1; then
-        echo -e "Launchd: ${GREEN}loaded${NC}"
+        echo -e "  Launchd: ${GREEN}loaded${NC}"
     else
-        echo -e "Launchd: ${RED}not loaded${NC}"
+        echo -e "  Launchd: ${RED}not loaded${NC}"
     fi
 
-    # Check process
     local pid
     pid=$(pgrep -f 'uvicorn.*7777' 2>/dev/null || true)
     if [[ -n "$pid" ]]; then
-        echo -e "Process: ${GREEN}running${NC} (PID: $pid)"
+        echo -e "  Process: ${GREEN}running${NC} (PID: $pid)"
     else
-        echo -e "Process: ${RED}not running${NC}"
+        echo -e "  Process: ${RED}not running${NC}"
     fi
 
-    # Health check
-    check_health
+    if check_mac_health; then
+        echo -e "  Health:  ${GREEN}●${NC} healthy"
+    else
+        echo -e "  Health:  ${RED}●${NC} not responding"
+    fi
 }
 
 kill_server() {
@@ -96,42 +132,191 @@ kill_server() {
     echo "Note: launchd will auto-restart unless you 'launchctl bootout gui/501/${LABEL}'"
 }
 
-restart_server() {
-    echo "Restarting Token-API..."
+restart_mac() {
+    echo -e "${BLUE}→${NC} Restarting Mac token-api..."
 
-    # Use launchctl kickstart -k to kill and restart in one step
     launchctl kickstart -k gui/501/${LABEL} 2>/dev/null || {
-        # If not loaded, bootstrap it
-        echo "Service not loaded, bootstrapping..."
+        echo "  Service not loaded, bootstrapping..."
         launchctl bootstrap gui/501 "$PLIST" 2>/dev/null || true
     }
 
-    # Wait for startup
     local attempts=0
     local max_attempts=10
 
     while [[ $attempts -lt $max_attempts ]]; do
         sleep 1
-        if curl -sf http://localhost:7777/health > /dev/null 2>&1; then
-            echo -e "${GREEN}Server is up and healthy${NC}"
+        if check_mac_health; then
+            echo -e "  ${GREEN}✓${NC} Mac server is up and healthy"
             return 0
         fi
         attempts=$((attempts + 1))
         echo "  Waiting... ($attempts/$max_attempts)"
     done
 
-    echo -e "${RED}Server failed to start within ${max_attempts}s${NC}"
-    echo "Check logs: tail ~/.claude/token-api-stderr.log"
+    echo -e "  ${RED}✗${NC} Mac server failed to start within ${max_attempts}s"
+    echo "  Check logs: tail ~/.claude/token-api-stderr.log"
     return 1
 }
+
+# ============ WSL ============
+
+check_wsl_health() {
+    curl -sf --connect-timeout 2 "http://${WSL_HOST}:${WSL_PORT}/health" > /dev/null 2>&1
+}
+
+get_wsl_status() {
+    echo -e "${BOLD}WSL satellite${NC} (${WSL_HOST}:${WSL_PORT})"
+
+    if check_wsl_health; then
+        echo -e "  Health:  ${GREEN}●${NC} healthy"
+    else
+        echo -e "  Health:  ${RED}●${NC} not responding"
+    fi
+
+    if ssh -o ConnectTimeout=2 -o BatchMode=yes wsl 'true' 2>/dev/null; then
+        echo -e "  SSH:     ${GREEN}●${NC} reachable"
+    else
+        echo -e "  SSH:     ${RED}●${NC} unreachable"
+    fi
+}
+
+restart_wsl() {
+    echo -e "${BLUE}→${NC} Restarting WSL satellite..."
+
+    # Try HTTP restart first
+    local http_ok=false
+    if curl -sf --connect-timeout 2 -X POST "http://${WSL_HOST}:${WSL_PORT}/restart" > /dev/null 2>&1; then
+        http_ok=true
+        echo -e "  ${GREEN}✓${NC} HTTP restart sent (satellite will git pull + restart)"
+    else
+        # Timeout is expected (satellite exits), check if we got a connection at all
+        local http_code
+        http_code=$(curl -s --connect-timeout 2 -o /dev/null -w '%{http_code}' -X POST "http://${WSL_HOST}:${WSL_PORT}/restart" 2>/dev/null || echo "000")
+        if [[ "$http_code" == "000" ]]; then
+            echo -e "  ${YELLOW}⚠${NC} HTTP unreachable, trying SSH fallback..."
+        else
+            # Got a response (or timeout after connection) — restart is happening
+            http_ok=true
+            echo -e "  ${GREEN}✓${NC} HTTP restart sent (timeout expected)"
+        fi
+    fi
+
+    # SSH fallback if HTTP failed to connect
+    if [[ "$http_ok" == false ]]; then
+        if ssh -o ConnectTimeout=3 -o BatchMode=yes wsl \
+            'cd ~/Scripts && git pull --ff-only 2>/dev/null; systemctl --user restart token-satellite' 2>/dev/null; then
+            echo -e "  ${GREEN}✓${NC} SSH fallback: git pull + systemd restart"
+        else
+            echo -e "  ${YELLOW}⚠${NC} WSL unreachable (HTTP + SSH failed), skipping"
+            return 0
+        fi
+    fi
+
+    # Health-check loop
+    local attempts=0
+    local max_attempts=8
+    sleep 2  # Give satellite time to restart
+    while [[ $attempts -lt $max_attempts ]]; do
+        if check_wsl_health; then
+            echo -e "  ${GREEN}✓${NC} WSL satellite is healthy"
+            return 0
+        fi
+        attempts=$((attempts + 1))
+        sleep 1
+    done
+
+    echo -e "  ${YELLOW}⚠${NC} WSL satellite not yet healthy (may still be starting)"
+    return 0
+}
+
+# ============ Phone ============
+
+get_phone_status() {
+    echo -e "${BOLD}Phone${NC}"
+    if ssh -o ConnectTimeout=3 -o BatchMode=yes phone 'true' 2>/dev/null; then
+        echo -e "  SSH:     ${GREEN}●${NC} reachable"
+    else
+        echo -e "  SSH:     ${RED}●${NC} unreachable"
+    fi
+}
+
+restart_phone_tui() {
+    echo -e "${BLUE}→${NC} Signaling phone TUI restart..."
+    local signal_data="{\"reason\":\"token-restart\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+    if ssh -o ConnectTimeout=3 -o BatchMode=yes phone \
+        "mkdir -p ~/.claude && echo '${signal_data}' > ~/.claude/tui-restart-mobile.signal" 2>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} Phone TUI signal written"
+    else
+        echo -e "  ${YELLOW}⚠${NC} Phone unreachable, skipping"
+    fi
+}
+
+# ============ Status ============
+
+get_status_all() {
+    echo "=== Multi-Device Status ==="
+    echo ""
+    get_mac_status
+    echo ""
+    get_wsl_status
+    echo ""
+    get_phone_status
+}
+
+# ============ Watch ============
 
 watch_logs() {
     echo "Tailing logs (Ctrl+C to stop)..."
     tail -f ~/.claude/token-api-stderr.log
 }
 
-# Parse arguments
+# ============ Full Restart ============
+
+full_restart() {
+    local no_push="$1"
+
+    echo -e "${BOLD}=== Token Restart ===${NC}"
+    echo ""
+
+    # 1. Git push
+    if [[ "$no_push" == false ]]; then
+        git_push || true
+        echo ""
+    fi
+
+    # 2. Mac restart + TUI signals
+    restart_mac || true
+    write_tui_signals
+    echo ""
+
+    # 3. WSL and phone in parallel
+    restart_wsl &
+    local wsl_pid=$!
+    restart_phone_tui &
+    local phone_pid=$!
+
+    wait $wsl_pid 2>/dev/null || true
+    wait $phone_pid 2>/dev/null || true
+
+    # 4. Summary
+    echo ""
+    echo -e "${BOLD}=== Summary ===${NC}"
+    if check_mac_health; then
+        echo -e "  Mac:   ${GREEN}●${NC} healthy"
+    else
+        echo -e "  Mac:   ${RED}●${NC} not responding"
+    fi
+    if check_wsl_health; then
+        echo -e "  WSL:   ${GREEN}●${NC} healthy"
+    else
+        echo -e "  WSL:   ${YELLOW}○${NC} unknown"
+    fi
+}
+
+# ============ Parse Arguments ============
+
 ACTION="restart"
+NO_PUSH=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -151,6 +336,18 @@ while [[ $# -gt 0 ]]; do
             ACTION="status"
             shift
             ;;
+        --mac-only)
+            ACTION="mac-only"
+            shift
+            ;;
+        --wsl-only)
+            ACTION="wsl-only"
+            shift
+            ;;
+        --no-push)
+            NO_PUSH=true
+            shift
+            ;;
         *)
             echo "Unknown option: $1" >&2
             echo "Use --help for usage" >&2
@@ -162,16 +359,23 @@ done
 # Execute action
 case "$ACTION" in
     status)
-        get_status
+        get_status_all
         ;;
     kill)
         kill_server
         ;;
     watch)
-        restart_server
+        full_restart "$NO_PUSH"
         watch_logs
         ;;
+    mac-only)
+        restart_mac
+        write_tui_signals
+        ;;
+    wsl-only)
+        restart_wsl
+        ;;
     restart)
-        restart_server
+        full_restart "$NO_PUSH"
         ;;
 esac

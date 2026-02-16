@@ -79,6 +79,20 @@ GET    /api/pavlok/status               # Current state (enabled, cooldown, last
 Pavlok is hooked into all 3 enforcement paths (desktop blocked, phone blocked, break exhausted).
 Config: `PAVLOK_CONFIG` in main.py. Token: `.env` `PAVLOK_API_TOKEN`. Cooldown: 45s between stimuli.
 
+### Productivity Check-Ins
+```
+POST   /api/checkin/submit              # Submit check-in response (energy, focus, mood, etc.)
+GET    /api/checkin/today               # All check-ins for today + pending/completed
+GET    /api/checkin/status              # Next check-in, completed list, pending list
+POST   /api/checkin/trigger/{type}      # Manually trigger a check-in (testing)
+```
+
+Check-in types: `morning_start` (9am), `mid_morning` (10:30), `decision_point` (11am), `afternoon` (1pm), `afternoon_check` (2:30pm). Weekdays only. Skipped when work_mode is `clocked_out` or `gym`.
+
+Submit body: `{"type": "morning_start", "energy": 7, "focus": 8, "mood": "good", "notes": "..."}`
+
+Responses are stored in `checkins` table and written as time-stamped frontmatter fields (e.g., `energy_0900`, `focus_0900`) to the daily note in `~/Documents/Token-ENV/Journal/Daily/`.
+
 ### System
 ```
 GET    /api/dashboard                   # Dashboard data
