@@ -2232,6 +2232,10 @@ DESKTOP_STATE = {
     "last_detection": None,
     # Work mode: "clocked_in" (normal enforcement), "clocked_out" (no enforcement), "gym" (gym timer)
     "work_mode": "clocked_in",
+    # Grace period: ignore silence detections for 15s after startup to avoid
+    # AHK restart race (AHK initializes with silence before detecting real state)
+    "startup_time": time.time(),
+    "startup_grace_secs": 15,
     "work_mode_changed_at": None,
     # AHK heartbeat tracking
     "ahk_reachable": None,
@@ -3144,6 +3148,23 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
             active_instance_count=0,
             timer_updated=False
         )
+
+    # Startup grace period: ignore transitions TO silence for N seconds after
+    # server start. AHK restarts detect silence before catching real audio state.
+    grace_secs = DESKTOP_STATE.get("startup_grace_secs", 0)
+    if grace_secs > 0 and detected_mode == "silence" and current_mode != "silence":
+        elapsed = time.time() - DESKTOP_STATE.get("startup_time", 0)
+        if elapsed < grace_secs:
+            remaining = round(grace_secs - elapsed, 1)
+            print(f"    GRACE PERIOD: Ignoring silence detection ({remaining}s remaining, current={current_mode})")
+            return DesktopDetectionResponse(
+                action="none",
+                detected_mode=detected_mode,
+                reason=f"startup_grace_period ({remaining}s remaining)",
+                productivity_active=True,
+                active_instance_count=0,
+                timer_updated=False
+            )
 
     # Check productivity status
     async with aiosqlite.connect(DB_PATH) as db:
