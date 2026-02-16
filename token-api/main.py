@@ -16,6 +16,7 @@ import time
 import signal
 import random
 import asyncio
+import functools
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -151,12 +152,12 @@ DEVICE_IPS = {
 }
 
 # Profile pool for voice/sound assignment
-# macOS voices: Daniel (British), Karen (Australian), Moira (Irish), Rishi (Indian)
+# WSL voices via Windows SAPI, Mac voices via macOS `say` (fallback)
 PROFILES = [
-    {"name": "profile_1", "tts_voice": "Daniel", "notification_sound": "chimes.wav", "color": "#0099ff"},      # British
-    {"name": "profile_2", "tts_voice": "Karen", "notification_sound": "notify.wav", "color": "#00cc66"},       # Australian
-    {"name": "profile_3", "tts_voice": "Moira", "notification_sound": "ding.wav", "color": "#ff9900"},         # Irish
-    {"name": "profile_4", "tts_voice": "Rishi", "notification_sound": "tada.wav", "color": "#cc66ff"},         # Indian
+    {"name": "profile_1", "wsl_voice": "Microsoft George", "wsl_rate": 2, "mac_voice": "Daniel", "notification_sound": "chimes.wav", "color": "#0099ff"},
+    {"name": "profile_2", "wsl_voice": "Microsoft Susan", "wsl_rate": 1, "mac_voice": "Karen", "notification_sound": "notify.wav", "color": "#00cc66"},
+    {"name": "profile_3", "wsl_voice": "Microsoft Sean", "wsl_rate": 0, "mac_voice": "Moira", "notification_sound": "ding.wav", "color": "#ff9900"},
+    {"name": "profile_4", "wsl_voice": "Microsoft Heera", "wsl_rate": 1, "mac_voice": "Rishi", "notification_sound": "tada.wav", "color": "#cc66ff"},
 ]
 
 # Scheduler instance
@@ -680,7 +681,7 @@ def get_next_available_profile(used_voices: set) -> dict:
     Returns:
         A random profile whose voice is not in use, or a random profile if all are used.
     """
-    available = [p for p in PROFILES if p["tts_voice"] not in used_voices]
+    available = [p for p in PROFILES if p["mac_voice"] not in used_voices]
     if available:
         return random.choice(available)
     # If all voices used, return random profile anyway
@@ -1150,7 +1151,7 @@ async def register_instance(request: InstanceRegisterRequest):
                 request.source_ip,
                 device_id,
                 profile["name"],
-                profile["tts_voice"],
+                profile["mac_voice"],
                 profile["notification_sound"],
                 request.pid,
                 now,
@@ -1171,7 +1172,7 @@ async def register_instance(request: InstanceRegisterRequest):
         session_id=session_id,
         profile={
             "name": profile["name"],
-            "tts_voice": profile["tts_voice"],
+            "tts_voice": profile["mac_voice"],
             "notification_sound": profile["notification_sound"],
             "color": profile.get("color", "#0099ff")
         }
@@ -1928,12 +1929,12 @@ async def list_voices():
     """List all available TTS voices from the profile pool."""
     voices = []
     for profile in PROFILES:
-        voice = profile["tts_voice"]
-        # Extract short name: "Microsoft George" -> "George"
-        short_name = voice.replace("Microsoft ", "")
+        mac_voice = profile["mac_voice"]
+        wsl_voice = profile.get("wsl_voice", "")
         voices.append({
-            "voice": voice,
-            "short_name": short_name,
+            "voice": mac_voice,
+            "wsl_voice": wsl_voice,
+            "short_name": mac_voice,
             "profile_name": profile["name"]
         })
     return {"voices": voices}
@@ -1952,7 +1953,7 @@ def find_voice_linear_probe(used_voices: set) -> str | None:
     start = random.randint(0, n - 1)
     for i in range(n):
         idx = (start + i) % n
-        voice = PROFILES[idx]["tts_voice"]
+        voice = PROFILES[idx]["mac_voice"]
         if voice not in used_voices:
             return voice
     return None
@@ -1966,7 +1967,7 @@ async def change_instance_voice(instance_id: str, request: VoiceChangeRequest):
     gets bumped using random offset + linear probe to find an open slot.
     No cascade - bumped instance just finds the next available voice.
     """
-    all_voices = {p["tts_voice"] for p in PROFILES}
+    all_voices = {p["mac_voice"] for p in PROFILES}
     if request.voice not in all_voices:
         raise HTTPException(
             status_code=400,
@@ -2225,6 +2226,36 @@ DESKTOP_CONFIG = {
     "port": 7777,
     "timeout": 5,
 }
+
+# TTS backend routing state (WSL-first with Mac fallback)
+TTS_BACKEND = {
+    "current": None,          # "wsl" | "mac" | None — what's currently speaking
+    "satellite_available": None,  # True/False/None (unknown)
+    "last_health_check": 0,
+    "health_check_ttl": 30,   # Re-probe satellite every 30s
+}
+
+
+def is_satellite_tts_available() -> bool:
+    """Check if the WSL satellite TTS endpoint is reachable. Cached with 30s TTL."""
+    now = time.time()
+    if (TTS_BACKEND["satellite_available"] is not None
+            and now - TTS_BACKEND["last_health_check"] < TTS_BACKEND["health_check_ttl"]):
+        return TTS_BACKEND["satellite_available"]
+
+    host = DESKTOP_CONFIG["host"]
+    port = DESKTOP_CONFIG["port"]
+    try:
+        resp = requests.get(f"http://{host}:{port}/health", timeout=2)
+        available = resp.status_code == 200
+    except Exception:
+        available = False
+
+    TTS_BACKEND["satellite_available"] = available
+    TTS_BACKEND["last_health_check"] = now
+    if available:
+        logger.info("TTS: Satellite available for WSL TTS")
+    return available
 
 # Desktop mode state (tracks current mode from AHK detection)
 DESKTOP_STATE = {
@@ -4433,7 +4464,14 @@ async def get_task_history(task_id: str, limit: int = 20):
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "tts_backend": {
+            "current": TTS_BACKEND["current"],
+            "satellite_available": TTS_BACKEND["satellite_available"],
+        },
+    }
 
 
 @app.get("/api/logs/recent", response_model=LogsResponse)
@@ -4588,20 +4626,16 @@ def clean_markdown_for_tts(text: str) -> str:
     return text.strip()
 
 
-def speak_tts(message: str, voice: str = None, rate: int = 0, instance_id: str = None) -> dict:
+def speak_tts_mac(message: str, voice: str = None, rate: int = 0) -> dict:
     """Speak a message using macOS `say` command.
 
     Uses Popen instead of run() to allow process termination via skip_tts().
     """
     global tts_current_process, tts_skip_requested
 
-    if not message:
-        return {"success": False, "error": "No message provided"}
-
-    # Clean markdown syntax for natural TTS output
-    message = clean_markdown_for_tts(message)
-
     voice = voice or "Daniel"
+    TTS_BACKEND["current"] = "mac"
+
     # Map SAPI rate scale (-10..10) to say WPM; default 0 → 190 WPM (slightly fast)
     wpm = 190 if rate == 0 else 175 + (rate * 15)
     wpm = max(80, min(300, wpm))
@@ -4615,6 +4649,7 @@ def speak_tts(message: str, voice: str = None, rate: int = 0, instance_id: str =
         tts_current_process = process
         process.wait(timeout=300)
         tts_current_process = None
+        TTS_BACKEND["current"] = None
 
         if process.returncode == 0:
             return {"success": True, "method": "macos_say", "voice": voice, "message": message[:50]}
@@ -4626,10 +4661,79 @@ def speak_tts(message: str, voice: str = None, rate: int = 0, instance_id: str =
         if tts_current_process:
             tts_current_process.kill()
             tts_current_process = None
+        TTS_BACKEND["current"] = None
         return {"success": False, "error": "TTS timed out"}
     except Exception as e:
         tts_current_process = None
+        TTS_BACKEND["current"] = None
         return {"success": False, "error": str(e)}
+
+
+def speak_tts_wsl(message: str, voice: str, rate: int = 0) -> dict:
+    """Speak a message via WSL satellite TTS (Windows SAPI voices).
+
+    Blocks until satellite returns (speech complete or skipped).
+    """
+    host = DESKTOP_CONFIG["host"]
+    port = DESKTOP_CONFIG["port"]
+    TTS_BACKEND["current"] = "wsl"
+
+    try:
+        resp = requests.post(
+            f"http://{host}:{port}/tts/speak",
+            json={"message": message, "voice": voice, "rate": rate},
+            timeout=300  # Long timeout — blocks until speech done
+        )
+        TTS_BACKEND["current"] = None
+
+        if resp.status_code == 200:
+            data = resp.json()
+            method = "skipped" if data.get("skipped") else "wsl_sapi"
+            return {"success": data.get("success", False), "method": method, "voice": voice, "message": message[:50]}
+        elif resp.status_code == 409:
+            return {"success": False, "error": "satellite_busy"}
+        else:
+            return {"success": False, "error": f"satellite returned {resp.status_code}"}
+
+    except (requests.ConnectionError, requests.Timeout) as e:
+        TTS_BACKEND["current"] = None
+        TTS_BACKEND["satellite_available"] = False
+        TTS_BACKEND["last_health_check"] = time.time()
+        logger.warning(f"TTS WSL: Satellite unreachable: {e}")
+        return {"success": False, "error": "satellite_unreachable"}
+    except Exception as e:
+        TTS_BACKEND["current"] = None
+        logger.error(f"TTS WSL: Unexpected error: {e}")
+        return {"success": False, "error": str(e)}
+
+
+def speak_tts(message: str, voice: str = None, rate: int = 0,
+              instance_id: str = None, wsl_voice: str = None, wsl_rate: int = None) -> dict:
+    """Route TTS to WSL satellite (preferred) or Mac fallback.
+
+    Args:
+        message: Text to speak
+        voice: macOS voice name (for Mac fallback)
+        rate: Rate for Mac TTS
+        instance_id: Optional instance ID for logging
+        wsl_voice: Windows SAPI voice name (for WSL)
+        wsl_rate: Rate for WSL TTS (-10 to 10)
+    """
+    if not message:
+        return {"success": False, "error": "No message provided"}
+
+    # Clean markdown syntax for natural TTS output
+    message = clean_markdown_for_tts(message)
+
+    # Try WSL first if voice available and satellite is up
+    if wsl_voice and is_satellite_tts_available():
+        result = speak_tts_wsl(message, wsl_voice, wsl_rate if wsl_rate is not None else 0)
+        if result.get("success"):
+            return result
+        # Any WSL failure → fallback to Mac
+        logger.info(f"TTS: WSL failed ({result.get('error')}), falling back to Mac ({voice or 'Daniel'})")
+
+    return speak_tts_mac(message, voice, rate)
 
 
 # ============ TTS Queue System ============
@@ -4694,10 +4798,24 @@ async def tts_queue_worker():
                         logger.warning(f"Sound failed: {sound_result.get('error')}")
                     await asyncio.sleep(0.3)  # Brief pause after sound
 
+                # Look up WSL voice from profile matching this mac voice
+                wsl_voice = None
+                wsl_rate = None
+                for p in PROFILES:
+                    if p["mac_voice"] == tts_current.voice:
+                        wsl_voice = p.get("wsl_voice")
+                        wsl_rate = p.get("wsl_rate", 0)
+                        break
+
                 # Speak the message (run in executor to allow skip API to interrupt)
-                logger.info(f"TTS worker: speaking {len(tts_current.message)} chars with {tts_current.voice}")
+                logger.info(f"TTS worker: speaking {len(tts_current.message)} chars with {tts_current.voice} (wsl={wsl_voice})")
                 loop = asyncio.get_event_loop()
-                tts_result = await loop.run_in_executor(None, speak_tts, tts_current.message, tts_current.voice)
+                tts_result = await loop.run_in_executor(
+                    None, functools.partial(
+                        speak_tts, tts_current.message, tts_current.voice,
+                        0, tts_current.instance_id, wsl_voice, wsl_rate
+                    )
+                )
                 logger.info(f"TTS worker: speak result = {json.dumps(tts_result)}")
 
                 # Log completion, skip, or failure
@@ -5021,12 +5139,16 @@ def get_tts_queue_status() -> dict:
     return {
         "current": current,
         "queue": queue_list,
-        "queue_length": len(queue_list)
+        "queue_length": len(queue_list),
+        "backend": TTS_BACKEND["current"],
+        "satellite_available": TTS_BACKEND["satellite_available"],
     }
 
 
 async def skip_tts(clear_queue: bool = False) -> dict:
     """Skip current TTS and optionally clear the queue.
+
+    Routes skip to the correct backend: WSL satellite or local Mac process.
 
     Args:
         clear_queue: If True, also clear all pending items in the queue.
@@ -5036,21 +5158,34 @@ async def skip_tts(clear_queue: bool = False) -> dict:
     """
     global tts_current_process, tts_current, tts_queue, tts_skip_requested
 
-    result = {"skipped": False, "cleared": 0}
+    result = {"skipped": False, "cleared": 0, "backend": TTS_BACKEND["current"]}
+    current_backend = TTS_BACKEND["current"]
 
-    # Kill current TTS process if running
-    if tts_current_process and tts_current_process.poll() is None:
-        # Set flag BEFORE killing so speak_tts() knows this was intentional
-        tts_skip_requested = True
+    if current_backend == "wsl":
+        # Skip on WSL satellite
+        host = DESKTOP_CONFIG["host"]
+        port = DESKTOP_CONFIG["port"]
         try:
-            tts_current_process.kill()
-            tts_current_process.wait(timeout=1.0)
-            result["skipped"] = True
-            logger.info("TTS process killed via skip")
+            resp = requests.post(f"http://{host}:{port}/tts/skip", timeout=3)
+            result["skipped"] = resp.status_code == 200
+            logger.info(f"TTS skip routed to WSL satellite: {resp.status_code}")
         except Exception as e:
-            logger.warning(f"Error killing TTS process: {e}")
+            logger.warning(f"TTS skip to WSL satellite failed (non-fatal): {e}")
 
-        tts_current_process = None
+    elif current_backend == "mac":
+        # Kill local Mac `say` process
+        if tts_current_process and tts_current_process.poll() is None:
+            tts_skip_requested = True
+            try:
+                tts_current_process.kill()
+                tts_current_process.wait(timeout=1.0)
+                result["skipped"] = True
+                logger.info("TTS process killed via skip (Mac)")
+            except Exception as e:
+                logger.warning(f"Error killing TTS process: {e}")
+            tts_current_process = None
+
+    # else: nothing playing, no-op
 
     # Clear queue if requested
     if clear_queue:
@@ -5311,7 +5446,7 @@ async def handle_session_start(payload: dict) -> dict:
                 source_ip,
                 device_id,
                 profile["name"],
-                profile["tts_voice"],
+                profile["mac_voice"],
                 profile["notification_sound"],
                 payload.get("pid"),
                 now,

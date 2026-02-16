@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """TTS Studio - Voice testing and selection TUI."""
 
+import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -152,8 +153,25 @@ def create_status_panel(voices: list[VoiceConfig], message: str = "") -> Panel:
     return Panel(content, border_style="dim")
 
 
+# Map WSL SAPI voices to closest macOS `say` voice for fallback
+MAC_VOICE_PAIRS = {
+    "Microsoft David": "Daniel",
+    "Microsoft Zira": "Karen",
+    "Microsoft Mark": "Daniel",
+    "Microsoft George": "Daniel",
+    "Microsoft Susan": "Karen",
+    "Microsoft Catherine": "Karen",
+    "Microsoft James": "Daniel",
+    "Microsoft Sean": "Moira",
+    "Microsoft Hazel": "Moira",
+    "Microsoft Heera": "Rishi",
+    "Microsoft Ravi": "Rishi",
+    "Microsoft Linda": "Karen",
+}
+
+
 def generate_profile_code(voices: list[VoiceConfig]) -> str:
-    """Generate the PROFILES code for main.py."""
+    """Generate the PROFILES code for main.py (unified WSL + Mac format)."""
     selected = [v for v in voices if v.selected]
     if not selected:
         return "# No voices selected"
@@ -162,13 +180,17 @@ def generate_profile_code(voices: list[VoiceConfig]) -> str:
     colors = ["#0099ff", "#00cc66", "#ff9900", "#cc66ff", "#ff6666", "#66cccc", "#ffcc00", "#cc99ff"]
 
     lines = ["# Profile pool for voice/sound assignment"]
+    lines.append("# WSL voices via Windows SAPI, Mac voices via macOS `say` (fallback)")
     lines.append("PROFILES = [")
 
     for i, v in enumerate(selected):
         sound = sounds[i % len(sounds)]
         color = colors[i % len(colors)]
-        region_comment = f"  # {v.region}"
-        lines.append(f'    {{"name": "profile_{i+1}", "tts_voice": "{v.name}", "notification_sound": "{sound}", "color": "{color}"}},{region_comment}')
+        mac_voice = MAC_VOICE_PAIRS.get(v.name, "Daniel")
+        lines.append(
+            f'    {{"name": "profile_{i+1}", "wsl_voice": "{v.name}", "wsl_rate": {v.rate}, '
+            f'"mac_voice": "{mac_voice}", "notification_sound": "{sound}", "color": "{color}"}},'
+        )
 
     lines.append("]")
     return "\n".join(lines)
@@ -362,15 +384,21 @@ def main():
                 if confirm.lower() == 'y':
                     # Actually update main.py
                     try:
-                        with open("/home/token/Scripts/token-api/main.py", "r") as f:
+                        import platform
+                        if platform.system() == "Darwin":
+                            main_py_path = os.path.expanduser("~/Scripts/token-api/main.py")
+                        else:
+                            main_py_path = "/home/token/Scripts/token-api/main.py"
+
+                        with open(main_py_path, "r") as f:
                             content = f.read()
 
                         # Find and replace PROFILES block
                         import re
-                        pattern = r'# Profile pool for voice/sound assignment\nPROFILES = \[.*?\]'
+                        pattern = r'# Profile pool for voice/sound assignment\n.*?PROFILES = \[.*?\]'
                         new_content = re.sub(pattern, code, content, flags=re.DOTALL)
 
-                        with open("/home/token/Scripts/token-api/main.py", "w") as f:
+                        with open(main_py_path, "w") as f:
                             f.write(new_content)
 
                         status_message = f"Saved {len(selected)} voices to main.py!"
