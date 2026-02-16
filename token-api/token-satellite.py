@@ -28,10 +28,14 @@ logger = logging.getLogger("token_satellite")
 
 app = FastAPI(title="Token Satellite", version="1.0.0")
 
+# Full path — bare "cmd.exe" isn't on PATH under systemd
+CMD_EXE = "/mnt/c/Windows/System32/cmd.exe"
+
 # Mapping of app aliases to Windows executables
 APP_TARGETS = {
     "brave": "brave.exe",
     "minecraft": "javaw.exe",
+    "spotify": "Spotify.exe",
 }
 
 # Processes that must NEVER be enforced
@@ -77,7 +81,7 @@ async def enforce(request: EnforceRequest):
 
     try:
         result = subprocess.run(
-            ["cmd.exe", "/c", "taskkill", "/IM", exe, "/F"],
+            [CMD_EXE, "/c", "taskkill", "/IM", exe, "/F"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -107,7 +111,7 @@ async def list_processes():
 
     try:
         result = subprocess.run(
-            ["cmd.exe", "/c", "tasklist", "/FO", "CSV", "/NH"],
+            [CMD_EXE, "/c", "tasklist", "/FO", "CSV", "/NH"],
             capture_output=True,
             text=True,
             timeout=10,
