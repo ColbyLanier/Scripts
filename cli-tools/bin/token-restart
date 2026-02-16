@@ -5,10 +5,13 @@
 #   token-restart              # Full restart: git push, Mac, WSL, phone TUI
 #   token-restart --mac-only   # Mac token-api only (legacy behavior)
 #   token-restart --wsl-only   # WSL satellite only
+#   token-restart --tui-only   # Signal TUI restarts only (no server restart)
 #   token-restart --kill       # Just kill Mac server, don't restart
 #   token-restart --watch      # Restart and monitor startup logs
 #   token-restart --status     # All-device status
 #   token-restart --no-push    # Skip git push
+#
+# When run from WSL or phone, proxies the restart to Mac via HTTP.
 
 set -euo pipefail
 
@@ -20,16 +23,22 @@ BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# Mac config
-LABEL="ai.openclaw.tokenapi"
-PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
-
-# WSL config
+# Network config
+MAC_HOST="100.95.109.23"
+MAC_PORT=7777
 WSL_HOST="100.66.10.74"
 WSL_PORT=7777
 
+# Mac-only config (only used when running on Mac)
+LABEL="ai.openclaw.tokenapi"
+PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+
 # Signal dir
 SIGNAL_DIR="$HOME/.claude"
+
+is_mac() {
+    [[ "$(uname)" == "Darwin" ]]
+}
 
 show_help() {
     cat << 'EOF'
@@ -39,11 +48,14 @@ Usage:
     token-restart              Full restart (git push → Mac → WSL → phone)
     token-restart --mac-only   Mac token-api only (legacy)
     token-restart --wsl-only   WSL satellite only
+    token-restart --tui-only   Signal TUI restarts only (no server restart)
     token-restart --kill       Kill Mac process (launchd auto-restarts)
     token-restart --watch      Restart and monitor startup logs
     token-restart --status     All-device status
     token-restart --no-push    Skip git push step
     token-restart -h, --help   Show this help
+
+    When run from a non-Mac device, proxies to Mac via HTTP.
 
 Flow:
     1. git push (Mac → origin)
@@ -57,6 +69,52 @@ Notes:
     - WSL satellite self-restarts via systemd (Restart=always)
     - Mac server managed by launchd (ai.openclaw.tokenapi)
 EOF
+}
+
+# ============ Remote Proxy ============
+# When run from WSL or phone, proxy to Mac which orchestrates everything
+
+remote_restart() {
+    echo -e "${BOLD}=== Token Restart (remote → Mac) ===${NC}"
+    echo ""
+    echo -e "${BLUE}→${NC} Proxying restart to Mac ($MAC_HOST)..."
+
+    # Pass through relevant flags
+    local flags=""
+    [[ "${NO_PUSH}" == true ]] && flags="$flags --no-push"
+    [[ "${ACTION}" == "mac-only" ]] && flags="$flags --mac-only"
+    [[ "${ACTION}" == "wsl-only" ]] && flags="$flags --wsl-only"
+    [[ "${ACTION}" == "tui-only" ]] && flags="$flags --tui-only"
+
+    if ssh -o ConnectTimeout=5 -o BatchMode=yes mini "token-restart${flags}" 2>&1; then
+        echo ""
+        echo -e "  ${GREEN}✓${NC} Remote restart completed"
+    else
+        echo -e "  ${RED}✗${NC} Failed to reach Mac via SSH"
+        echo "  Ensure 'mini' SSH host is configured and reachable"
+        return 1
+    fi
+}
+
+remote_status() {
+    echo -e "${BOLD}=== Multi-Device Status (via Mac) ===${NC}"
+    echo ""
+    ssh -o ConnectTimeout=5 -o BatchMode=yes mini "token-restart --status" 2>&1 || {
+        echo -e "  ${RED}✗${NC} Cannot reach Mac via SSH"
+        # Fall back to direct health checks
+        echo ""
+        echo -e "${BOLD}Direct checks:${NC}"
+        if curl -sf --connect-timeout 2 "http://${MAC_HOST}:${MAC_PORT}/health" > /dev/null 2>&1; then
+            echo -e "  Mac:   ${GREEN}●${NC} healthy"
+        else
+            echo -e "  Mac:   ${RED}●${NC} not responding"
+        fi
+        if curl -sf --connect-timeout 2 "http://${WSL_HOST}:${WSL_PORT}/health" > /dev/null 2>&1; then
+            echo -e "  WSL:   ${GREEN}●${NC} healthy"
+        else
+            echo -e "  WSL:   ${YELLOW}○${NC} unknown"
+        fi
+    }
 }
 
 # ============ Git ============
@@ -344,6 +402,10 @@ while [[ $# -gt 0 ]]; do
             ACTION="wsl-only"
             shift
             ;;
+        --tui-only)
+            ACTION="tui-only"
+            shift
+            ;;
         --no-push)
             NO_PUSH=true
             shift
@@ -356,7 +418,20 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Execute action
+# Remote proxy: if not on Mac, forward to Mac via SSH
+if ! is_mac; then
+    case "$ACTION" in
+        status)
+            remote_status
+            ;;
+        *)
+            remote_restart
+            ;;
+    esac
+    exit $?
+fi
+
+# Execute action (Mac only from here)
 case "$ACTION" in
     status)
         get_status_all
@@ -374,6 +449,20 @@ case "$ACTION" in
         ;;
     wsl-only)
         restart_wsl
+        ;;
+    tui-only)
+        echo -e "${BLUE}→${NC} Signaling TUI restarts (no server restart)..."
+        write_tui_signals
+        echo -e "  ${GREEN}✓${NC} Mac TUI signals written"
+        # Write WSL TUI signals via SSH
+        signal_data="{\"reason\":\"token-restart --tui-only\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+        if ssh -o ConnectTimeout=3 -o BatchMode=yes wsl \
+            "mkdir -p ~/.claude && for s in desktop mobile; do echo '${signal_data}' > ~/.claude/tui-restart-\${s}.signal; done" 2>/dev/null; then
+            echo -e "  ${GREEN}✓${NC} WSL TUI signals written"
+        else
+            echo -e "  ${YELLOW}⚠${NC} WSL unreachable, skipping"
+        fi
+        restart_phone_tui
         ;;
     restart)
         full_restart "$NO_PUSH"
