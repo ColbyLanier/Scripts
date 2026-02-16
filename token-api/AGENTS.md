@@ -1,0 +1,336 @@
+# Token-API Project
+
+Local FastAPI server for Claude instance management, notifications, and system coordination.
+
+## Architecture
+
+- **Mac Server**: `main.py` - FastAPI app on port 7777 (LaunchAgent `ai.openclaw.tokenapi`)
+- **WSL Satellite**: `token-satellite.py` - Companion server on WSL port 7777 (systemd `token-satellite.service`)
+- **TUI**: `token-api-tui.py` - Rich-based dashboard for monitoring instances
+- **Database**: `~/.claude/agents.db` (SQLite, shared with Claude Code)
+
+### Multi-Device Network
+
+```
+Mac Mini (100.95.109.23:7777)     ← primary server, all state lives here
+  ├── WSL (100.66.10.74:7777)     ← satellite: TTS (Windows SAPI), process enforcement, /restart
+  └── Phone (SSH)                  ← TUI restart signals only, webhook notifications
+```
+
+- Mac proxies to WSL via `DESKTOP_CONFIG` for enforcement and `/satellite/restart`
+- **TTS routing**: WSL-first (Windows SAPI voices) with Mac `say` fallback. Satellite availability cached with 30s TTL health probes. Mobile sessions use webhook notifications instead (no TTS queue).
+- `token-restart` orchestrates all three: git push → Mac restart → WSL restart → phone signal
+- TUI runs on any device, connects to Mac API at `100.95.109.23:7777`
+- 15s startup grace period ignores silence detections after server restart (AHK restart race)
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `main.py` | FastAPI server (~5000 lines) |
+| `token-satellite.py` | WSL companion server: TTS engine, enforcement (systemd: `token-satellite.service`) |
+| `tts-studio.py` | TUI for auditioning/selecting Windows SAPI voices (run on WSL) |
+| `timer.py` | TimerEngine class — pure logic, no I/O |
+| `test_timer.py` | Unit tests for TimerEngine (48 tests) |
+| `token-api-tui.py` | TUI dashboard (~1500 lines) |
+| `init_db.py` | Database initialization |
+| `DESIGN.md` | Original design doc (partially outdated) |
+
+## Database Tool
+
+Query the local agents.db with the `agents-db` CLI:
+
+```bash
+agents-db instances              # Show all instances
+agents-db events --limit 10      # Recent events
+agents-db tables                 # List tables
+agents-db describe claude_instances
+agents-db query "SELECT * FROM events WHERE event_type='instance_renamed'"
+agents-db --json instances       # JSON output
+```
+
+## Key Tables
+
+### claude_instances
+Core instance registry. Key columns:
+- `id` - Instance UUID
+- `tab_name` - Display name (set via rename, or auto "Claude HH:MM")
+- `working_dir` - Instance working directory
+- `status` - 'active' or 'stopped'
+- `is_processing` - 1 when actively processing a prompt
+- `device_id` - 'desktop', 'Token-S24', etc.
+
+### events
+Event log for instance lifecycle, renames, TTS, notifications.
+
+## Core API Endpoints
+
+### Instance Management
+```
+POST   /api/instances/register          # Register new instance
+DELETE /api/instances/{id}              # Stop instance
+PATCH  /api/instances/{id}/rename       # Rename (sets tab_name)
+POST   /api/instances/{id}/activity     # Update processing state
+POST   /api/instances/{id}/unstick     # Nudge stuck instance (?level=1 SIGWINCH, ?level=2 SIGINT)
+GET    /api/instances/{id}/diagnose    # Get detailed process diagnostics
+GET    /api/instances                   # List all instances
+GET    /api/instances/{id}/todos        # Get instance task list
+```
+
+### Notifications
+```
+POST   /api/notify                      # Send notification
+POST   /api/notify/tts                  # TTS only
+POST   /api/notify/sound                # Sound only
+GET    /api/notify/queue/status         # TTS queue status
+POST   /api/tts/skip                    # Skip current TTS (?clear_queue=true to clear queue)
+```
+
+### Pavlok (Shock Watch)
+```
+POST   /api/pavlok/zap                  # Send stimulus (?type=zap|beep|vibe&value=1-100&reason=manual)
+POST   /api/pavlok/toggle               # Toggle enabled (?enabled=true|false, no param = toggle)
+GET    /api/pavlok/status               # Current state (enabled, cooldown, last stimulus)
+```
+
+Pavlok is hooked into all 3 enforcement paths (desktop blocked, phone blocked, break exhausted).
+Config: `PAVLOK_CONFIG` in main.py. Token: `.env` `PAVLOK_API_TOKEN`. Cooldown: 45s between stimuli.
+
+### Productivity Check-Ins
+```
+POST   /api/checkin/submit              # Submit check-in response (energy, focus, mood, etc.)
+GET    /api/checkin/today               # All check-ins for today + pending/completed
+GET    /api/checkin/status              # Next check-in, completed list, pending list
+POST   /api/checkin/trigger/{type}      # Manually trigger a check-in (testing)
+```
+
+Check-in types: `morning_start` (9am), `mid_morning` (10:30), `decision_point` (11am), `afternoon` (1pm), `afternoon_check` (2:30pm). Weekdays only. Skipped when work_mode is `clocked_out` or `gym`.
+
+Submit body: `{"type": "morning_start", "energy": 7, "focus": 8, "mood": "good", "notes": "..."}`
+
+Responses are stored in `checkins` table and written as time-stamped frontmatter fields (e.g., `energy_0900`, `focus_0900`) to the daily note in `~/Documents/Token-ENV/Journal/Daily/`.
+
+### System
+```
+GET    /api/dashboard                   # Dashboard data
+GET    /api/work-mode                   # Current work mode
+POST   /api/headless                    # Toggle headless mode
+POST   /satellite/restart               # Proxy restart to WSL satellite
+GET    /health                          # Health check (includes tts_backend status)
+```
+
+### Satellite Endpoints (WSL, port 7777)
+```
+GET    /health                          # Heartbeat (includes tts_engine status)
+POST   /enforce                         # Close Windows process by alias
+GET    /processes                       # List distraction-relevant processes
+POST   /tts/speak                       # Speak via Windows SAPI (blocking, persistent PS engine)
+POST   /tts/skip                        # Skip current TTS playback
+POST   /restart                         # Git pull + systemd restart
+```
+
+## Instance Naming
+
+The `tab_name` field stores the instance display name. The TUI displays:
+1. Custom `tab_name` (if user renamed it)
+2. `working_dir` path (if using default "Claude HH:MM" name)
+
+Auto-generated names match pattern `Claude HH:MM`. Any other name is considered custom.
+
+Rename via:
+- TUI: Press `r` on selected instance
+- CLI: `instance-name "my-name"`
+- API: `PATCH /api/instances/{id}/rename` with `{"tab_name": "..."}`
+
+## TUI Controls
+
+```
+↑↓ / jk  - Navigate instances (up/down)
+h / l    - Switch info panel (Events ↔ Logs)
+r        - Rename selected
+s        - Stop selected
+d        - Delete (with confirm)
+y        - Copy resume command to clipboard (yank)
+U        - Unstick frozen instance (SIGWINCH, gentle nudge)
+I        - Interrupt frozen instance (SIGINT, cancel current op)
+K        - Kill frozen instance (SIGKILL, auto-copies resume cmd)
+c        - Clear all stopped
+o        - Change sort order
+R        - Restart server
+q        - Quit
+```
+
+### Info Panel Pages
+
+The TUI has a paginated info panel (toggled with H/L):
+- **Page 0 (Events)**: Recent events from the database (registrations, stops, renames, TTS)
+- **Page 1 (Logs)**: Server logs from the API
+
+The current page is shown in the status bar.
+
+## Common Debug Patterns
+
+```bash
+# Check if server is running
+token-ping health                # or: curl http://localhost:7777/health
+
+# View active instances
+agents-db instances
+
+# Check recent events
+agents-db events --limit 20
+
+# Verify rename worked
+agents-db query "SELECT id, tab_name FROM claude_instances WHERE id='...'"
+
+# Watch server logs (if running via systemd)
+journalctl -u token-api -f
+
+# Test TTS (wait 10s after for user feedback)
+token-ping notify/test           # or: curl -s http://localhost:7777/api/notify/test | jq .
+# Then sleep 10 and ask user if they heard it
+```
+
+**Testing TTS:** After running a TTS test, sleep for ~10 seconds before continuing so the user can confirm whether they heard sound and/or speech.
+
+## Profile System
+
+4 static profiles assigned round-robin to new instances. Each profile has dual voices for WSL-first TTS with Mac fallback:
+
+| Profile | WSL Voice (Windows SAPI) | Mac Voice (fallback) | Sound |
+|---------|--------------------------|---------------------|-------|
+| profile_1 | Microsoft George | Daniel | chimes.wav |
+| profile_2 | Microsoft Susan | Karen | notify.wav |
+| profile_3 | Microsoft Sean | Moira | ding.wav |
+| profile_4 | Microsoft Heera | Rishi | tada.wav |
+
+WSL voices are placeholders — re-select via `tts-studio.py` on WSL. The DB `tts_voice` column stores the Mac voice name (no schema change). The `PROFILES` dict in `main.py` maps both.
+
+### TTS Routing
+
+- **Queue path** (`tts_queue_worker`): Looks up WSL voice from PROFILES, tries satellite first, falls back to Mac
+- **Direct path** (`/api/notify/tts`, `/api/notify`): Mac-only (no profile context)
+- **Mobile path** (`device_id == "Token-S24"`): Webhook to phone, no TTS queue
+- **Skip**: Routes to satellite `/tts/skip` or kills local `say` process based on `TTS_BACKEND["current"]`
+- **Satellite down**: Health probe cached 30s, re-detected within 30s of PC coming online
+
+## CLI Tools
+
+### Token-API Specific
+
+| Command | Purpose |
+|---------|---------|
+| `agents-db` | Query local agents.db database |
+| `token-status` | Quick server status check |
+| `token-restart` | Multi-device restart orchestrator (Mac + WSL + phone) |
+| `notify-test` | Send test notifications |
+| `tts-skip` | Skip current TTS (--all to clear queue) |
+| `instance-name` | Rename current session |
+| `instance-stop` | Stop/unstick/kill instance by name (fuzzy match) |
+| `instances-clear` | Bulk clear stopped instances |
+| `token-ping` | Hit any endpoint (fuzzy match, auto-restart, OpenAPI-aware) |
+| `timer-status` | Quick timer status (mode, break time, work time) |
+| `timer-mode` | Switch timer mode (break, pause, resume) |
+
+### General (also useful here)
+
+| Command | Purpose |
+|---------|---------|
+| `deploy local` | Run local dev server with ngrok |
+| `test` | Send test messages to local server |
+
+### Examples
+
+```bash
+# Quick status check
+token-status
+
+# Multi-device restart (git push → Mac → WSL → phone)
+token-restart                    # Full restart: push, Mac, WSL satellite, phone TUI
+token-restart --mac-only         # Mac token-api only (launchctl + TUI signals)
+token-restart --wsl-only         # WSL satellite only (HTTP or SSH fallback)
+token-restart --tui-only         # TUI restart signals only (no server restart)
+token-restart --no-push          # Skip git push step
+token-restart --kill             # Kill Mac server (launchd auto-restarts)
+token-restart --watch            # Full restart + tail logs
+token-restart --status           # Multi-device status (Mac + WSL + phone)
+
+# Stop/unstick/kill instances
+instance-stop "auth-refactor"    # Stop by name
+instance-stop --unstick "auth"   # Nudge stuck instance (L1, SIGWINCH)
+instance-stop --unstick=2 "auth" # Interrupt stuck instance (L2, SIGINT)
+instance-stop --kill "auth"      # Kill frozen instance (SIGKILL, shows resume cmd)
+instance-stop --diagnose "auth"  # Show process state, wchan, children, FDs
+instance-stop --list             # List active instances
+instances-clear                  # Preview stopped instances
+instances-clear --confirm        # Delete stopped instances
+
+# Test TTS
+notify-test "Hello from Token-API"
+
+# Test sound only
+notify-test --sound-only
+
+# Skip TTS
+tts-skip                         # Skip current TTS
+tts-skip --all                   # Skip and clear queue
+
+# Timer
+timer-status                     # One-line: mode, break, work time
+timer-status --watch             # Live updating (1s refresh)
+timer-status --json              # Raw JSON
+timer-mode break                 # Enter break mode
+timer-mode pause                 # Enter pause mode
+timer-mode resume                # Back to work_silence
+timer-mode status                # Show mode + lock state
+
+# Hit any endpoint
+token-ping                       # List all endpoints (from OpenAPI)
+token-ping health                # GET /health
+token-ping timer/break           # POST /api/timer/break (prefix match)
+token-ping break                 # POST /api/timer/break (suffix match)
+token-ping zap type=beep value=75  # POST with query params
+token-ping notify message=hello  # POST with JSON body (schema-aware)
+token-ping --raw health | jq .   # Pipe-friendly raw JSON
+token-ping --no-restart health   # Skip auto-restart if server down
+
+# Query database
+agents-db events --limit 5
+```
+
+## Known Issues & Fixes
+
+### Display Name Priority (Fixed 2026-01-26)
+The `format_instance_name()` function in the TUI now correctly prioritizes custom `tab_name` over `working_dir`. Previously, renamed instances still showed the directory path.
+
+Location: `token-api-tui.py:280` - `is_custom_tab_name()` and `format_instance_name()`
+
+### Backspace in TUI Rename
+The TUI rename input captures raw terminal characters. Backspace (`\x7f`) may appear in names if terminal handling is imperfect. Workaround: use `instance-name` CLI instead.
+
+### is_processing Flag Not Persisting (Fixed 2026-01-26)
+Three bugs caused the green arrow (processing indicator) to not display properly:
+
+1. **PostToolUse clearing flag**: The `handle_post_tool_use()` was setting `is_processing=0` on every tool use, immediately clearing the flag set by `prompt_submit`. Fixed to only update `last_activity` as a heartbeat.
+
+2. **Timezone mismatch in stale worker**: The `clear_stale_processing_flags()` worker compared Python local timestamps against SQLite UTC time, causing a 7-hour offset. All flags appeared "stale" immediately. Fixed by adding `'localtime'` to the SQLite datetime comparison.
+
+3. **Todos endpoint wrong path**: The `/api/instances/{id}/todos` endpoint looked in `~/.claude/todos/` (old format) instead of `~/.claude/tasks/{id}/` (new TaskCreate format). Fixed to read individual task JSON files from the correct location.
+
+Location: `main.py` - `handle_post_tool_use()`, `clear_stale_processing_flags()`, `get_instance_todos()`
+
+### TUI Todo Caching (Added 2026-01-26)
+The TUI now caches todo data per instance. When `is_processing=0`, it displays cached data instead of empty values. This prevents progress/task columns from disappearing between prompts.
+
+Location: `token-api-tui.py` - `todos_cache` global, `get_instance_todos()` with `use_cache` parameter
+
+## Development Notes
+
+- Server runs on port 7777 (hardcoded in `main.py`)
+- TUI polls database directly, not via API (for speed)
+- TUI refresh interval: 2 seconds
+- Database changes from CLI/API are picked up on next TUI refresh
+
+## Potential Future Tools/Skills
+
+- **/token-debug skill**: Interactive debugging workflow
