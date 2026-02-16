@@ -1,49 +1,6 @@
 #Requires AutoHotkey v2.0
 
 ; ========================================
-; JSON Parser for Timer State
-; ========================================
-; Simple JSON parser for the timer-state.json structure
-; Handles: strings, numbers, booleans, null
-
-class JSON {
-    static Parse(jsonStr) {
-        ; Remove whitespace and newlines for easier parsing
-        jsonStr := Trim(jsonStr)
-
-        ; Create object to hold parsed data
-        obj := {}
-
-        ; Extract key-value pairs using regex
-        ; Match: "key": value pattern
-        pos := 1
-        while (pos := RegExMatch(jsonStr, '"([^"]+)":\s*([^,}]+)', &match, pos)) {
-            key := match[1]
-            value := Trim(match[2])
-
-            ; Parse value based on type
-            if (value == "true")
-                obj.%key% := true
-            else if (value == "false")
-                obj.%key% := false
-            else if (value == "null")
-                obj.%key% := ""
-            else if (SubStr(value, 1, 1) == '"') {
-                ; String value - remove quotes
-                obj.%key% := SubStr(value, 2, StrLen(value) - 2)
-            } else {
-                ; Numeric value
-                obj.%key% := Number(value)
-            }
-
-            pos += match.Len
-        }
-
-        return obj
-    }
-}
-
-; ========================================
 ; Audio Monitor for Timer Automation
 ; ========================================
 ; Monitors audio playback state and automatically triggers
@@ -90,7 +47,8 @@ global AM_STATE := {
     lastTrigger: 0,                  ; Last time we triggered a mode change
     lastWindowTitle: "",             ; Last detected window title (for token-api)
     lastBlockNotify: 0,              ; Timestamp of last block notification
-    blockNotifyCooldown: 60000       ; 60 second cooldown for block notifications
+    blockNotifyCooldown: 60000,      ; 60 second cooldown for block notifications
+    pollCount: 0                     ; Poll counter for heartbeat interval
 }
 
 ; ========================================
@@ -160,10 +118,10 @@ DetectAudioState() {
     }
 
     ; Check for Spotify
-    if (WinExist("ahk_exe spotify.exe")) {
+    if (WinExist("ahk_exe Spotify.exe")) {
         ; Additional check: Spotify window title changes when playing
         ; Format: "Artist - Song Title" vs just "Spotify Free" or "Spotify Premium"
-        spotifyTitle := WinGetTitle("ahk_exe spotify.exe")
+        spotifyTitle := WinGetTitle("ahk_exe Spotify.exe")
 
         ; If title contains " - ", it's likely playing a song
         ; This helps reduce false positives from idle Spotify
@@ -529,12 +487,22 @@ MonitorLoop() {
     detectedMode := DetectAudioState()
     ProcessDetection(detectedMode)
 
-    ; Note: Enforcement is now handled by token-api (push-based)
-    ; When token-api blocks a mode change, it immediately closes distraction windows
-    ; No polling needed from AHK side
+    ; Send heartbeat every 6th poll (~30s at 5s interval)
+    AM_STATE.pollCount++
+    if (Mod(AM_STATE.pollCount, 6) == 0) {
+        SendHeartbeat()
+    }
 
     ; Update tray menu to show current status
     SetupTrayMenu()
+}
+
+SendHeartbeat() {
+    jsonBody := '{"mode": "' . AM_STATE.currentMode . '", "source": "ahk"}'
+    response := PostToTokenApi("/desktop/heartbeat", jsonBody)
+    if (response.success) {
+        LogMessage("💓 Heartbeat sent (mode=" . AM_STATE.currentMode . ")")
+    }
 }
 
 ; ========================================
@@ -547,7 +515,7 @@ LogMessage("Polling interval: " . (AM_CONFIG.pollingInterval / 1000) . " seconds
 LogMessage("Debounce count: " . AM_CONFIG.debounceCount)
 LogMessage("token-api: ENABLED (" . AM_CONFIG.tokenApiUrl . ")")
 LogMessage("  - Mode changes: POST /desktop")
-LogMessage("  - Window enforcement: GET /api/window/enforce")
+LogMessage("  - Heartbeat: POST /desktop/heartbeat (every ~30s)")
 
 SetupTrayMenu()
 
