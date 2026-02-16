@@ -36,7 +36,7 @@ import subprocess
 import time
 import threading
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -626,6 +626,20 @@ def _read_timer() -> dict:
     except Exception:
         pass
     return _timer_cache
+
+
+def utc_to_local_timestr(utc_str: str) -> str:
+    """Convert UTC timestamp string (from SQLite CURRENT_TIMESTAMP) to local HH:MM."""
+    try:
+        # SQLite format: "2026-02-16 19:47:00"
+        dt_utc = datetime.strptime(utc_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        dt_local = dt_utc.astimezone()
+        return dt_local.strftime("%H:%M")
+    except Exception:
+        # Fallback: return raw time portion
+        if " " in utc_str:
+            return utc_str.split(" ")[1][:5]
+        return utc_str[:5] if utc_str else "??:??"
 
 
 def format_break_time(seconds: int) -> str:
@@ -1298,10 +1312,7 @@ def create_events_panel(events: list) -> Panel:
     for event in events:
         try:
             created = event.get("created_at", "")
-            if created:
-                time_str = created.split(" ")[1][:5] if " " in created else created[:5]
-            else:
-                time_str = "??:??"
+            time_str = utc_to_local_timestr(created) if created else "??:??"
 
             event_type = event.get("event_type", "unknown")
             details = event.get("details", {}) if isinstance(event.get("details"), dict) else {}
@@ -1363,7 +1374,7 @@ def create_mobile_events_panel(events: list) -> Panel:
     for event in events[:4]:
         try:
             created = event.get("created_at", "")
-            time_str = created.split(" ")[1][:5] if " " in created else "??:??"
+            time_str = utc_to_local_timestr(created) if created else "??:??"
 
             event_type = event.get("event_type", "unknown")
             details = event.get("details", {}) if isinstance(event.get("details"), dict) else {}
