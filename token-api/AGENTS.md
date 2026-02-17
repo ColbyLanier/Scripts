@@ -195,20 +195,34 @@ token-ping notify/test           # or: curl -s http://localhost:7777/api/notify/
 
 ## Profile System
 
-4 static profiles assigned round-robin to new instances. Each profile has dual voices for WSL-first TTS with Mac fallback:
+### Voice Pool (9 foreign accents + 3 fallback)
 
-| Profile | WSL Voice (Windows SAPI) | Mac Voice (fallback) | Sound |
-|---------|--------------------------|---------------------|-------|
-| profile_1 | Microsoft George | Daniel | chimes.wav |
-| profile_2 | Microsoft Susan | Karen | notify.wav |
-| profile_3 | Microsoft Sean | Moira | ding.wav |
-| profile_4 | Microsoft Heera | Rishi | tada.wav |
+Voices assigned via **random-start linear probe** (open addressing): one random call per slot, increment on collision. Only active instances (`processing`/`idle`) hold a voice — stopped instances release theirs.
 
-WSL voices are placeholders — re-select via `tts-studio.py` on WSL. The DB `tts_voice` column stores the Mac voice name (no schema change). The `PROFILES` dict in `main.py` maps both.
+**Primary pool** (foreign accents, distinct and identifiable):
+
+| Profile | WSL Voice | Mac Fallback | Region | Sound |
+|---------|-----------|-------------|--------|-------|
+| profile_1 | Microsoft George | Daniel | UK M | chimes.wav |
+| profile_2 | Microsoft Susan | Karen | UK F | notify.wav |
+| profile_3 | Microsoft Catherine | Karen | AU F | ding.wav |
+| profile_4 | Microsoft James | Daniel | AU M | tada.wav |
+| profile_5 | Microsoft Sean | Moira | IE M | chord.wav |
+| profile_6 | Microsoft Hazel | Moira | IE F | recycle.wav |
+| profile_7 | Microsoft Heera | Rishi | IN F | chimes.wav |
+| profile_8 | Microsoft Ravi | Rishi | IN M | notify.wav |
+| profile_9 | Microsoft Linda | Karen | CA F | ding.wav |
+
+**Fallback pool** (US English, used when primary is exhausted):
+- David, Zira, Mark → less distinct, but functional
+
+**Ultimate fallback**: Microsoft David (if 12+ concurrent instances somehow)
+
+Re-select voices via `tts-studio.py` on WSL. The DB `tts_voice` column stores the WSL voice name. Profile lookup derives mac_voice for fallback.
 
 ### TTS Routing
 
-- **Queue path** (`tts_queue_worker`): Looks up WSL voice from PROFILES, tries satellite first, falls back to Mac
+- **Queue path** (`tts_queue_worker`): Looks up profile by WSL voice, tries satellite first, falls back to Mac
 - **Direct path** (`/api/notify/tts`, `/api/notify`): Mac-only (no profile context)
 - **Mobile path** (`device_id == "Token-S24"`): Webhook to phone, no TTS queue
 - **Skip**: Routes to satellite `/tts/skip` or kills local `say` process based on `TTS_BACKEND["current"]`

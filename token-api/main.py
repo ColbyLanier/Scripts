@@ -151,14 +151,30 @@ DEVICE_IPS = {
     "127.0.0.1": "Mac-Mini",         # Mac Mini (localhost)
 }
 
-# Profile pool for voice/sound assignment
-# WSL voices via Windows SAPI, Mac voices via macOS `say` (fallback)
+# Voice pool: foreign-accent voices are the primary pool, assigned via linear probe.
+# US English voices (David, Zira, Mark) are fallback-only when pool is exhausted.
+# Ultimate fallback if everything is taken: David.
 PROFILES = [
-    {"name": "profile_1", "wsl_voice": "Microsoft George", "wsl_rate": 2, "mac_voice": "Daniel", "notification_sound": "chimes.wav", "color": "#0099ff"},
-    {"name": "profile_2", "wsl_voice": "Microsoft Susan", "wsl_rate": 1, "mac_voice": "Karen", "notification_sound": "notify.wav", "color": "#00cc66"},
-    {"name": "profile_3", "wsl_voice": "Microsoft Sean", "wsl_rate": 0, "mac_voice": "Moira", "notification_sound": "ding.wav", "color": "#ff9900"},
-    {"name": "profile_4", "wsl_voice": "Microsoft Heera", "wsl_rate": 1, "mac_voice": "Rishi", "notification_sound": "tada.wav", "color": "#cc66ff"},
+    {"name": "profile_1", "wsl_voice": "Microsoft George",   "wsl_rate": 2, "mac_voice": "Daniel", "notification_sound": "chimes.wav", "color": "#0099ff"},   # UK M
+    {"name": "profile_2", "wsl_voice": "Microsoft Susan",    "wsl_rate": 1, "mac_voice": "Karen",  "notification_sound": "notify.wav", "color": "#00cc66"},   # UK F
+    {"name": "profile_3", "wsl_voice": "Microsoft Catherine", "wsl_rate": 1, "mac_voice": "Karen", "notification_sound": "ding.wav",   "color": "#ff9900"},   # AU F
+    {"name": "profile_4", "wsl_voice": "Microsoft James",    "wsl_rate": 1, "mac_voice": "Daniel", "notification_sound": "tada.wav",   "color": "#cc66ff"},   # AU M
+    {"name": "profile_5", "wsl_voice": "Microsoft Sean",     "wsl_rate": 0, "mac_voice": "Moira",  "notification_sound": "chord.wav",  "color": "#ff6666"},   # IE M
+    {"name": "profile_6", "wsl_voice": "Microsoft Hazel",    "wsl_rate": 1, "mac_voice": "Moira",  "notification_sound": "recycle.wav","color": "#66cccc"},   # IE F
+    {"name": "profile_7", "wsl_voice": "Microsoft Heera",    "wsl_rate": 1, "mac_voice": "Rishi",  "notification_sound": "chimes.wav", "color": "#ffcc00"},   # IN F
+    {"name": "profile_8", "wsl_voice": "Microsoft Ravi",     "wsl_rate": 1, "mac_voice": "Rishi",  "notification_sound": "notify.wav", "color": "#cc99ff"},   # IN M
+    {"name": "profile_9", "wsl_voice": "Microsoft Linda",    "wsl_rate": 1, "mac_voice": "Karen",  "notification_sound": "ding.wav",   "color": "#0099ff"},   # CA F
 ]
+
+# Fallback voices when all foreign accents are exhausted (US English, less distinct)
+FALLBACK_VOICES = [
+    {"name": "fallback_1", "wsl_voice": "Microsoft David", "wsl_rate": 1, "mac_voice": "Daniel", "notification_sound": "tada.wav",   "color": "#888888"},
+    {"name": "fallback_2", "wsl_voice": "Microsoft Zira",  "wsl_rate": 1, "mac_voice": "Karen",  "notification_sound": "chord.wav",  "color": "#999999"},
+    {"name": "fallback_3", "wsl_voice": "Microsoft Mark",  "wsl_rate": 1, "mac_voice": "Daniel", "notification_sound": "recycle.wav","color": "#aaaaaa"},
+]
+
+# Ultimate fallback when even fallback voices are exhausted
+ULTIMATE_FALLBACK = {"name": "fallback_david", "wsl_voice": "Microsoft David", "wsl_rate": 1, "mac_voice": "Daniel", "notification_sound": "chimes.wav", "color": "#666666"}
 
 # Scheduler instance
 scheduler = AsyncIOScheduler()
@@ -672,20 +688,35 @@ def is_local_device(device_id: str) -> bool:
     return device_id in LOCAL_DEVICES
 
 
-def get_next_available_profile(used_voices: set) -> dict:
-    """Get a random available profile from the pool.
+def get_next_available_profile(used_wsl_voices: set) -> tuple[dict, bool]:
+    """Assign a profile using random-start linear probe (open addressing).
+
+    One random call per slot. If the randomly chosen index is taken, increment
+    and check again (wrapping). Guarantees uniform distribution with no wasted
+    random calls.
 
     Args:
-        used_voices: Set of voice names currently in use by registered instances.
+        used_wsl_voices: Set of WSL voice names currently held by active instances.
 
     Returns:
-        A random profile whose voice is not in use, or a random profile if all are used.
+        (profile_dict, pool_exhausted) — pool_exhausted is True if we had to
+        dip into fallback voices (David/Zira/Mark) or the ultimate fallback.
     """
-    available = [p for p in PROFILES if p["mac_voice"] not in used_voices]
-    if available:
-        return random.choice(available)
-    # If all voices used, return random profile anyway
-    return random.choice(PROFILES)
+    # 1. Try foreign-accent pool with linear probe
+    n = len(PROFILES)
+    start = random.randint(0, n - 1)
+    for i in range(n):
+        idx = (start + i) % n
+        if PROFILES[idx]["wsl_voice"] not in used_wsl_voices:
+            return PROFILES[idx], False
+
+    # 2. Foreign pool exhausted — try fallback voices (David, Zira, Mark)
+    for fb in FALLBACK_VOICES:
+        if fb["wsl_voice"] not in used_wsl_voices:
+            return fb, True
+
+    # 3. Everything exhausted — ultimate fallback (David, will duplicate)
+    return ULTIMATE_FALLBACK, True
 
 
 # ============ Scheduled Task System ============
@@ -1123,16 +1154,15 @@ async def register_instance(request: InstanceRegisterRequest):
         device_id = "Mac-Mini"  # Default for local sessions on Mac Mini
 
     async with aiosqlite.connect(DB_PATH) as db:
-        # Get currently used voices (from all registered instances, not just active)
-        # Voices are locked for the duration of a session until deleted
+        # Get WSL voices held by active instances only (stopped instances release their voice)
         cursor = await db.execute(
-            "SELECT tts_voice FROM claude_instances"
+            "SELECT tts_voice FROM claude_instances WHERE status IN ('processing', 'idle')"
         )
         rows = await cursor.fetchall()
-        used_voices = {row[0] for row in rows if row[0]}
+        used_wsl_voices = {row[0] for row in rows if row[0]}
 
-        # Assign random available profile
-        profile = get_next_available_profile(used_voices)
+        # Assign profile via linear probe
+        profile, pool_exhausted = get_next_available_profile(used_wsl_voices)
 
         # Insert instance
         now = datetime.now().isoformat()
@@ -1151,7 +1181,7 @@ async def register_instance(request: InstanceRegisterRequest):
                 request.source_ip,
                 device_id,
                 profile["name"],
-                profile["mac_voice"],
+                profile["wsl_voice"],
                 profile["notification_sound"],
                 request.pid,
                 now,
@@ -1159,6 +1189,9 @@ async def register_instance(request: InstanceRegisterRequest):
             )
         )
         await db.commit()
+
+    if pool_exhausted:
+        logger.warning(f"Voice pool exhausted — assigned fallback voice {profile['wsl_voice']}")
 
     # Log event
     await log_event(
@@ -1172,7 +1205,7 @@ async def register_instance(request: InstanceRegisterRequest):
         session_id=session_id,
         profile={
             "name": profile["name"],
-            "tts_voice": profile["mac_voice"],
+            "tts_voice": profile["wsl_voice"],
             "notification_sound": profile["notification_sound"],
             "color": profile.get("color", "#0099ff")
         }
@@ -1927,35 +1960,43 @@ class VoiceChangeRequest(BaseModel):
 @app.get("/api/voices")
 async def list_voices():
     """List all available TTS voices from the profile pool."""
+    all_profiles = PROFILES + FALLBACK_VOICES
     voices = []
-    for profile in PROFILES:
-        mac_voice = profile["mac_voice"]
-        wsl_voice = profile.get("wsl_voice", "")
+    for profile in all_profiles:
+        wsl_voice = profile["wsl_voice"]
+        short_name = wsl_voice.replace("Microsoft ", "")
+        is_fallback = profile in FALLBACK_VOICES
         voices.append({
-            "voice": mac_voice,
-            "wsl_voice": wsl_voice,
-            "short_name": mac_voice,
-            "profile_name": profile["name"]
+            "voice": wsl_voice,
+            "mac_voice": profile["mac_voice"],
+            "short_name": short_name,
+            "profile_name": profile["name"],
+            "fallback": is_fallback,
         })
     return {"voices": voices}
 
 
 def find_voice_linear_probe(used_voices: set) -> str | None:
-    """Find an available voice using random offset + linear probe.
+    """Find an available WSL voice using random offset + linear probe.
 
-    Picks a random starting index in PROFILES, then iterates circularly
-    until finding a voice not in used_voices. Returns None if all are used.
+    Picks a random starting index in PROFILES (foreign accents), then iterates
+    circularly until finding a voice not in used_voices. Falls back to
+    FALLBACK_VOICES, then returns None if everything is taken.
     """
     n = len(PROFILES)
-    if n == 0:
-        return None
+    if n > 0:
+        start = random.randint(0, n - 1)
+        for i in range(n):
+            idx = (start + i) % n
+            voice = PROFILES[idx]["wsl_voice"]
+            if voice not in used_voices:
+                return voice
 
-    start = random.randint(0, n - 1)
-    for i in range(n):
-        idx = (start + i) % n
-        voice = PROFILES[idx]["mac_voice"]
-        if voice not in used_voices:
-            return voice
+    # Try fallback voices
+    for fb in FALLBACK_VOICES:
+        if fb["wsl_voice"] not in used_voices:
+            return fb["wsl_voice"]
+
     return None
 
 
@@ -1967,7 +2008,7 @@ async def change_instance_voice(instance_id: str, request: VoiceChangeRequest):
     gets bumped using random offset + linear probe to find an open slot.
     No cascade - bumped instance just finds the next available voice.
     """
-    all_voices = {p["mac_voice"] for p in PROFILES}
+    all_voices = {p["wsl_voice"] for p in PROFILES + FALLBACK_VOICES}
     if request.voice not in all_voices:
         raise HTTPException(
             status_code=400,
@@ -2644,7 +2685,9 @@ def send_pavlok_stimulus(
     respect_cooldown: bool = True,
 ) -> dict:
     """Send a stimulus (zap/beep/vibe) to the Pavlok watch."""
-    if not PAVLOK_CONFIG["enabled"] or not PAVLOK_CONFIG["token"]:
+    if not PAVLOK_CONFIG["token"]:
+        return {"skipped": True, "reason": "no_token", "hint": "Set PAVLOK_API_TOKEN in .env"}
+    if not PAVLOK_CONFIG["enabled"]:
         return {"skipped": True, "reason": "disabled"}
 
     now = datetime.now()
@@ -4798,21 +4841,23 @@ async def tts_queue_worker():
                         logger.warning(f"Sound failed: {sound_result.get('error')}")
                     await asyncio.sleep(0.3)  # Brief pause after sound
 
-                # Look up WSL voice from profile matching this mac voice
-                wsl_voice = None
-                wsl_rate = None
-                for p in PROFILES:
-                    if p["mac_voice"] == tts_current.voice:
-                        wsl_voice = p.get("wsl_voice")
+                # Look up profile by WSL voice (DB tts_voice stores WSL voice name)
+                # to get mac_voice fallback and wsl_rate
+                wsl_voice = tts_current.voice
+                mac_voice = "Daniel"  # default fallback
+                wsl_rate = 0
+                for p in PROFILES + FALLBACK_VOICES:
+                    if p["wsl_voice"] == wsl_voice:
+                        mac_voice = p.get("mac_voice", "Daniel")
                         wsl_rate = p.get("wsl_rate", 0)
                         break
 
                 # Speak the message (run in executor to allow skip API to interrupt)
-                logger.info(f"TTS worker: speaking {len(tts_current.message)} chars with {tts_current.voice} (wsl={wsl_voice})")
+                logger.info(f"TTS worker: speaking {len(tts_current.message)} chars with {wsl_voice} (mac={mac_voice})")
                 loop = asyncio.get_event_loop()
                 tts_result = await loop.run_in_executor(
                     None, functools.partial(
-                        speak_tts, tts_current.message, tts_current.voice,
+                        speak_tts, tts_current.message, mac_voice,
                         0, tts_current.instance_id, wsl_voice, wsl_rate
                     )
                 )
@@ -5079,7 +5124,7 @@ async def queue_tts(instance_id: str, message: str) -> dict:
     if not row:
         return {"success": False, "error": f"Instance {instance_id} not found"}
 
-    voice = row["tts_voice"] or "Daniel"
+    voice = row["tts_voice"] or "Microsoft David"
     sound = row["notification_sound"] or "chimes.wav"
     tab_name = row["tab_name"] or instance_id
 
@@ -5142,6 +5187,10 @@ def get_tts_queue_status() -> dict:
         "queue_length": len(queue_list),
         "backend": TTS_BACKEND["current"],
         "satellite_available": TTS_BACKEND["satellite_available"],
+        "voice_pool": {
+            "total": len(PROFILES),
+            "fallback_count": len(FALLBACK_VOICES),
+        },
     }
 
 
@@ -5418,15 +5467,15 @@ async def handle_session_start(payload: dict) -> dict:
         if await cursor.fetchone():
             return {"success": True, "action": "already_registered", "instance_id": session_id}
 
-        # Get currently used profiles
+        # Get WSL voices held by active instances
         cursor = await db.execute(
-            "SELECT profile_name FROM claude_instances WHERE status IN ('processing', 'idle')"
+            "SELECT tts_voice FROM claude_instances WHERE status IN ('processing', 'idle')"
         )
         rows = await cursor.fetchall()
-        used_profiles = {row[0] for row in rows if row[0]}
+        used_wsl_voices = {row[0] for row in rows if row[0]}
 
-        # Assign profile
-        profile = get_next_available_profile(used_profiles)
+        # Assign profile via linear probe
+        profile, pool_exhausted = get_next_available_profile(used_wsl_voices)
 
         # Insert instance
         now = datetime.now().isoformat()
@@ -5446,7 +5495,7 @@ async def handle_session_start(payload: dict) -> dict:
                 source_ip,
                 device_id,
                 profile["name"],
-                profile["mac_voice"],
+                profile["wsl_voice"],
                 profile["notification_sound"],
                 payload.get("pid"),
                 now,
@@ -5600,7 +5649,7 @@ async def handle_stop(payload: dict) -> dict:
     instance = dict(instance)
     device_id = instance.get("device_id", "Mac-Mini")
     tab_name = instance.get("tab_name", "Claude")
-    tts_voice = instance.get("tts_voice", "Daniel")
+    tts_voice = instance.get("tts_voice", "Microsoft David")
     notification_sound = instance.get("notification_sound", "chimes.wav")
 
     # Mark as no longer processing
