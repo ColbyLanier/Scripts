@@ -2439,8 +2439,9 @@ class CheckinSubmit(BaseModel):
 def send_discord_checkin(message: str):
     """Send check-in prompt to Discord via openclaw CLI."""
     try:
+        # Use full path to avoid PATH issues when running as service
         cmd = [
-            "openclaw", "message", "send",
+            "/opt/homebrew/bin/openclaw", "message", "send",
             "--channel", "discord",
             "--target", DISCORD_CHECKIN_CHANNEL,
             "--message", message,
@@ -4252,6 +4253,56 @@ async def cancel_shutdown():
         return {"success": False, "message": str(e)}
 
 
+# ============ KVM (Deskflow) Endpoints ============
+
+@app.post("/api/kvm/start")
+async def kvm_start():
+    """Start Deskflow client (software KVM) on this Mac."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "Deskflow.app"],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            return {"success": True, "message": "Deskflow already running", "already_running": True}
+
+        subprocess.Popen(["open", "/Applications/Deskflow.app"])
+        logger.info("KVM: Started Deskflow client")
+        return {"success": True, "message": "Deskflow started", "already_running": False}
+    except Exception as e:
+        logger.error(f"KVM: Failed to start Deskflow: {e}")
+        return {"success": False, "message": str(e)}
+
+
+@app.post("/api/kvm/stop")
+async def kvm_stop():
+    """Stop Deskflow client on this Mac."""
+    try:
+        result = subprocess.run(
+            ["pkill", "-f", "Deskflow"],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            logger.info("KVM: Stopped Deskflow")
+            return {"success": True, "message": "Deskflow stopped"}
+        else:
+            return {"success": True, "message": "Deskflow was not running"}
+    except Exception as e:
+        logger.error(f"KVM: Failed to stop Deskflow: {e}")
+        return {"success": False, "message": str(e)}
+
+
+@app.get("/api/kvm/status")
+async def kvm_status():
+    """Check if Deskflow is running on this Mac."""
+    result = subprocess.run(
+        ["pgrep", "-f", "Deskflow.app"],
+        capture_output=True, text=True
+    )
+    running = result.returncode == 0
+    return {"running": running, "pids": result.stdout.strip().split("\n") if running else []}
+
+
 # ============ Task Endpoints ============
 
 @app.get("/api/tasks", response_model=List[TaskResponse])
@@ -5120,8 +5171,19 @@ async def detect_stuck_instances():
             await asyncio.sleep(300)
 
 
+def _is_quiet_hours() -> bool:
+    """Return True if current time is in quiet hours (11 PM - 9 AM). No TTS during sleep."""
+    hour = datetime.now().hour
+    return hour >= 23 or hour < 9
+
+
 async def queue_tts(instance_id: str, message: str) -> dict:
     """Queue a TTS message for an instance, using their profile's voice/sound."""
+    # Silence TTS during quiet hours (11 PM - 9 AM)
+    if _is_quiet_hours():
+        logger.info(f"TTS suppressed (quiet hours): {message[:80]}")
+        return {"success": True, "queued": False, "reason": "quiet_hours"}
+
     # Look up instance to get their profile
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -5327,15 +5389,21 @@ async def send_notification(request: NotifyRequest):
     method = device.get("notification_method", "tts_sound")
 
     if method == "tts_sound":
-        # Desktop: play sound and speak
-        await log_event(
-            "tts_starting",
-            instance_id=request.instance_id,
-            device_id=device_id,
-            details={"message": request.message[:100], "voice": request.voice or "default"}
-        )
-        results["sound"] = play_sound(request.sound)
-        results["tts"] = speak_tts(request.message, request.voice)
+        # Suppress sound + TTS during quiet hours (11 PM - 9 AM)
+        if _is_quiet_hours():
+            logger.info(f"Notification suppressed (quiet hours): {request.message[:80]}")
+            results["sound"] = {"success": True, "suppressed": True, "reason": "quiet_hours"}
+            results["tts"] = {"success": True, "suppressed": True, "reason": "quiet_hours"}
+        else:
+            # Desktop: play sound and speak
+            await log_event(
+                "tts_starting",
+                instance_id=request.instance_id,
+                device_id=device_id,
+                details={"message": request.message[:100], "voice": request.voice or "default"}
+            )
+            results["sound"] = play_sound(request.sound)
+            results["tts"] = speak_tts(request.message, request.voice)
     elif method == "webhook":
         # Mobile: send webhook
         webhook_url = device.get("webhook_url")
@@ -5361,6 +5429,10 @@ async def send_notification(request: NotifyRequest):
 @app.post("/api/notify/tts")
 async def notify_tts(request: TTSRequest):
     """Speak a message using TTS only."""
+    if _is_quiet_hours():
+        logger.info(f"TTS suppressed (quiet hours): {request.message[:80]}")
+        return {"success": True, "suppressed": True, "reason": "quiet_hours"}
+
     # Log TTS starting
     await log_event(
         "tts_starting",
@@ -5385,6 +5457,10 @@ async def notify_tts(request: TTSRequest):
 @app.post("/api/notify/sound")
 async def notify_sound(request: SoundRequest):
     """Play a notification sound only."""
+    if _is_quiet_hours():
+        logger.info(f"Sound suppressed (quiet hours): {request.sound_file}")
+        return {"success": True, "suppressed": True, "reason": "quiet_hours"}
+
     result = play_sound(request.sound_file)
 
     await log_event(
@@ -5781,6 +5857,16 @@ async def handle_stop(payload: dict) -> dict:
         logger.info(f"Hook: Stop no TTS text (tts_enabled={tts_enabled}, has_text={bool(tts_text)})")
         play_sound(notification_sound)
         result["sound"] = {"played": notification_sound}
+
+    # Pavlok vibe notification (skip for subagents)
+    if not instance.get("is_subagent"):
+        vibe_result = send_pavlok_stimulus(
+            stimulus_type="vibe",
+            value=30,
+            reason="claude_finished",
+            respect_cooldown=False,
+        )
+        result["pavlok_vibe"] = vibe_result
 
     logger.info(f"Hook: Stop {session_id[:12]}... -> desktop notification")
     await log_event("hook_stop", instance_id=session_id, details={"tts_enabled": tts_enabled, "tts_length": len(tts_text) if tts_text else 0})

@@ -17,7 +17,11 @@
 
 set -euo pipefail
 
-API_URL="http://localhost:7777"
+if [[ "$(uname -r)" == *microsoft* ]]; then
+    API_URL="http://100.95.109.23:7777"
+else
+    API_URL="http://localhost:7777"
+fi
 
 # Platform clipboard helpers
 _clip_copy() {
