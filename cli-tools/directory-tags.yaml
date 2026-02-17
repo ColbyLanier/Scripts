@@ -1,0 +1,18 @@
+# Directory-to-tag mapping for Claude session tool injection
+# Matches are prefix-based (subdirs inherit). ~ expands to $HOME.
+# "all" includes every tool.
+
+~/ProcAgentDir:
+  tags: [deploy, db, git, pr, worktree, instance, workflow, system]
+
+~/Scripts/token-api:
+  tags: [token-api, deploy, instance]
+
+~/Scripts/mobile:
+  tags: [mobile, macrodroid]
+
+~/Scripts/cli-tools:
+  tags: [all]
+
+~/Scripts:
+  tags: [git, workflow, system, instance]
