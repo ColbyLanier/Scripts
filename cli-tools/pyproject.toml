@@ -18,6 +18,7 @@ time-convert = "cli_tools.timezone.cli:main"
 db-query = "cli_tools.db_query.cli:main"
 db-migrate = "cli_tools.db_migrate.cli:main"
 cloud-logs = "cli_tools.cloud_logs.cli:main"
+followup = "cli_tools.followup.cli:main"
 
 [build-system]
 requires = ["hatchling"]

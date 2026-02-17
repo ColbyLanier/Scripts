@@ -69,7 +69,7 @@ run_in_venv() {
 }
 
 # Main execution
-AVAILABLE_COMMANDS="subagent, time-convert, google-chat-message, db-query, cloud-logs"
+AVAILABLE_COMMANDS="subagent, time-convert, google-chat-message, db-query, cloud-logs, followup"
 
 if [ $# -eq 0 ]; then
     echo "Usage: $0 <command> [args...]" >&2
@@ -95,6 +95,9 @@ case "$COMMAND" in
         ;;
     cloud-logs)
         run_in_venv cli_tools.cloud_logs.cli "$@"
+        ;;
+    followup)
+        run_in_venv cli_tools.followup.cli "$@"
         ;;
     *)
         echo "Unknown command: $COMMAND" >&2
