@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-API_URL="http://localhost:7777"
+API_URL="${TOKEN_API_URL:-http://100.95.109.23:7777}"
 
 # Help
 if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then

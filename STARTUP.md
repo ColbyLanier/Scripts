@@ -1,0 +1,126 @@
+# Windows Startup Audit
+
+> Last updated: 2026-02-17
+
+Central reference for all custom startup automations on this machine.
+Everything runs at logon unless noted otherwise.
+
+---
+
+## Task Scheduler (All Custom Tasks)
+
+| # | Task Name | RunLevel | Delay | What It Does |
+|---|-----------|----------|-------|-------------|
+| 1 | **WSL Keep-Alive** | Limited | 5s | `wsl.exe -d Ubuntu -- bash -lc "exec sleep infinity"` — keeps WSL alive for SSH (Tailscale) and systemd services even when no terminals are open |
+| 2 | **Deskflow** | Limited | 3s | Starts Deskflow KVM minimized, waits 10s, then curls Mac token-api (`POST http://100.95.109.23:7777/api/kvm/start`) to signal KVM is ready |
+| 3 | **ahk_init** | Limited | — | Runs `script-compiler.ahk` — the main AHK suite (see AHK Architecture below) |
+| 4 | **ahk_admin** | Highest | — | Runs `ring-remap.ahk` — Bluetooth ring button remapping via AutoHotInterception (needs admin for driver access) |
+| 5 | **AHK startup mode** | Limited | — | Runs `startup-launcher.ahk` — 10-second quick app launcher (V=Vivaldi, S=Spotify, etc.) |
+| 6 | **fast_task** | Highest | — | Starts Fast! app (`C:\Program Files (x86)\Fast!\fast!.exe`) |
+| 7 | **Dual Monitor Tools** | Limited | — | Starts DMT.exe for multi-monitor management |
+| 8 | **Autorun for colby** | Limited | 3s | Starts PowerToys |
+
+### On-Demand Only (No Logon Trigger)
+
+These have no triggers — invoked manually via `schtasks /Run /TN "<name>"` or from AHK/token-satellite.
+
+| Task Name | RunLevel | What It Does |
+|-----------|----------|-------------|
+| **HeadlessDisable** | Highest | `Toggle-Headless.ps1 -Disable` — disables headless display |
+| **HeadlessEnable** | Highest | `Toggle-Headless.ps1 -Enable` — enables headless display |
+| **HeadlessToggle** | Highest | `Toggle-Headless.ps1` — toggles headless display state |
+
+---
+
+## WSL Systemd Services
+
+### User Services (`systemctl --user`)
+
+| Service | State | What It Does |
+|---------|-------|-------------|
+| **token-satellite.service** | enabled | FastAPI on `:7777` — TTS, enforcement, process control, headless toggle. Auto-starts when WSL is running (depends on `WSL Keep-Alive` task above) |
+| **mem-watchdog.service** | static (timer disabled) | One-shot memory check via `mem-watchdog` CLI tool. Timer currently inactive |
+
+### System Services (Stale / Disabled)
+
+| Service | State | Notes |
+|---------|-------|-------|
+| **token-api.service** | disabled | Old version — superseded by token-satellite |
+| **mesh-pipe.service** | disabled | No longer in use |
+
+---
+
+## AHK Script Architecture
+
+All AHK scripts live at `~/Scripts/ahk/` (accessed from Windows via `\\wsl.localhost\Ubuntu\home\token\Scripts\ahk\`).
+
+```
+script-compiler.ahk          <- ahk_init task (main entry point)
+  #Include audio-monitor.ahk    Audio device monitoring
+  #Include discord-ipc-mute.ahk Discord mute via IPC
+  #Include hotkeys.ahk           Global hotkeys
+
+ring-remap.ahk               <- ahk_admin task (standalone, needs admin)
+startup-launcher.ahk          <- AHK startup mode task (standalone)
+```
+
+> **Note**: Old copies exist at `Documents/Obsidian/Personal-ENV/Scripts/ahk/` — these are superseded by `~/Scripts/ahk/` but kept for historical reference in the Obsidian vault.
+
+---
+
+## Third-Party Autostart (Registry / Installer-Managed)
+
+Not managed by us. Includes: Steam, Discord, Docker Desktop, Spotify, Figma Agent, Medal, Stream Deck, Wispr Flow, Epic Games, NVIDIA Broadcast, Wooting, Tailscale.
+
+---
+
+## Boot Sequence
+
+1. Windows logon
+2. Task Scheduler fires all logon-triggered tasks (with respective delays)
+3. **WSL Keep-Alive** (5s delay) starts WSL Ubuntu, which triggers systemd
+4. systemd starts **token-satellite** on `:7777`
+5. **Deskflow** (3s delay) starts KVM, then notifies Mac token-api after 10s
+6. AHK scripts, PowerToys, DMT, Fast! all start in parallel
+
+---
+
+## How to Add New Startup Items
+
+**Preferred method: Task Scheduler** — all custom startup items should use Task Scheduler for consistency.
+
+### Create via PowerShell
+```powershell
+$action = New-ScheduledTaskAction -Execute "program.exe" -Argument "args"
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User "colby"
+$trigger.Delay = "PT5S"  # optional delay
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+$principal = New-ScheduledTaskPrincipal -UserId "colby" -LogonType Interactive -RunLevel Limited
+Register-ScheduledTask -TaskName "MyTask" -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description "What it does"
+```
+
+Use `-RunLevel Highest` only if the program needs admin privileges.
+
+### Create On-Demand Task (No Trigger)
+```powershell
+# Same as above but omit the $trigger and -Trigger parameter
+Register-ScheduledTask -TaskName "MyTask" -Action $action -Settings $settings -Principal $principal
+# Invoke with: schtasks /Run /TN "MyTask"
+```
+
+### WSL Systemd Service
+```bash
+# Create service file
+nano ~/.config/systemd/user/my-service.service
+# Enable and start
+systemctl --user enable --now my-service.service
+```
+
+---
+
+## Removed Items
+
+| Item | Date | Reason |
+|------|------|--------|
+| **TokenAPI** (Task Scheduler) | 2026-02-17 | token-api moved to Mac Mini; token-satellite replaced it on this machine |
+| **Deskflow.bat** (Startup Folder) | 2026-02-17 | Migrated to Task Scheduler for consistency |

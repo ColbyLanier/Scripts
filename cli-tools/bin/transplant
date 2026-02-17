@@ -192,6 +192,15 @@ if [[ -z "$pane_target" ]]; then
 fi
 log_success "Tmux pane: $pane_target"
 
+# Capture old instance name for transfer to new session
+old_tab_name=""
+old_instance_id="$session_id"
+if command -v curl &>/dev/null && command -v jq &>/dev/null; then
+    old_tab_name=$(curl -s "http://localhost:7777/api/instances" 2>/dev/null | \
+        jq -r --arg id "$old_instance_id" \
+        '.[] | select(.id == $id) | .tab_name // empty' 2>/dev/null || true)
+fi
+
 echo ""
 log_info "Transplanting session..."
 echo ""
@@ -215,6 +224,29 @@ echo ""
     tmux send-keys -t "$pane_target" \
         "cd '$TARGET_DIR' && /home/token/.local/bin/claude --dangerously-skip-permissions --resume '$session_id' --fork-session" \
         Enter
+
+    # Transfer instance name and clean up old instance
+    if [[ -n "$old_tab_name" && -n "$old_instance_id" ]]; then
+        # Wait for new instance to register (up to 30s)
+        new_id=""
+        for attempt in $(seq 1 30); do
+            sleep 1
+            new_id=$(curl -s "http://localhost:7777/api/instances" 2>/dev/null | \
+                jq -r --arg dir "$TARGET_DIR" \
+                '.[] | select(.working_dir == $dir and (.status == "processing" or .status == "idle")) | .id' 2>/dev/null | head -1 || true)
+            [[ -n "$new_id" ]] && break
+        done
+
+        if [[ -n "$new_id" ]]; then
+            # Transfer tab_name to new instance
+            curl -s -X PATCH "http://localhost:7777/api/instances/${new_id}/rename" \
+                -H "Content-Type: application/json" \
+                -d "{\"tab_name\": \"${old_tab_name}\"}" >/dev/null 2>&1 || true
+        fi
+
+        # Delete old instance (belt + suspenders — SessionEnd may not fire on SIGKILL)
+        curl -s -X DELETE "http://localhost:7777/api/instances/${old_instance_id}" >/dev/null 2>&1 || true
+    fi
 ) &
 disown
 
