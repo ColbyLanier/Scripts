@@ -105,6 +105,7 @@ layout_mode = "full"  # "mobile", "vertical", "compact", or "full"
 layout_mode_forced = False  # True if user used --mobile, --vertical, --compact, or --no-mobile
 sort_mode = "recent_activity"  # "status", "recent_activity", "recent_stopped", "created"
 filter_mode = "all"  # "all", "active", "stopped"
+show_subagents = False  # Hide subagents by default, toggle with 'a'
 table_mode = "instances"  # "instances" or "cron"
 cron_selected_index = 0
 panel_page = 0  # 0 = events view, 1 = server logs view, 2 = deploy logs view
@@ -270,7 +271,11 @@ def format_duration_colored(start_time_str: str, end_time_str: str = None) -> st
 
 
 def filter_instances(instances: list) -> list:
-    """Filter instances based on current filter_mode."""
+    """Filter instances based on current filter_mode and subagent visibility."""
+    # First filter by subagent visibility
+    if not show_subagents:
+        instances = [i for i in instances if not i.get("is_subagent")]
+
     if filter_mode == "all":
         return instances
     elif filter_mode == "active":
@@ -752,10 +757,13 @@ def create_instances_table(instances: list, selected_idx: int) -> Table:
     table.add_column("Time", width=6, justify="right")
 
     for i, instance in enumerate(instances):
+        is_sub = instance.get("is_subagent")
         selector = "[yellow]>[/yellow]" if i == selected_idx else " "
         name = format_instance_name(instance, max_len=30)
         if i == selected_idx:
             name = f"[bold yellow]{name}[/bold yellow]"
+        elif is_sub:
+            name = f"[dim]@ {name}[/dim]"
 
         device = instance.get("device_id", "?")
         instance_id = instance.get("id", "")
@@ -792,6 +800,13 @@ def create_instances_table(instances: list, selected_idx: int) -> Table:
 
         end_time = instance.get("stopped_at") if instance["status"] == "stopped" else None
         duration = format_duration_colored(instance.get("registered_at", ""), end_time)
+
+        # Dim all columns for subagent rows
+        if is_sub and i != selected_idx:
+            device = f"[dim]{device}[/dim]"
+            progress_text = "[dim]-[/dim]"
+            current_task = "[dim]-[/dim]"
+            duration = f"[dim]{duration}[/dim]"
 
         table.add_row(selector, status_icon, name, device, progress_text, current_task, duration)
 
@@ -2054,6 +2069,13 @@ def create_status_bar(instances: list, selected_idx: int) -> Text:
     if filter_mode != "all":
         filter_indicator = f"  [magenta]F:{filter_mode}[/magenta]"
 
+    # Subagent count (from unfiltered cache)
+    subagent_indicator = ""
+    if not show_subagents:
+        hidden_sub_count = sum(1 for i in instances_cache if i.get("is_subagent"))
+        if hidden_sub_count > 0:
+            subagent_indicator = f"  [dim]+{hidden_sub_count} sub[/dim]"
+
     # Table mode indicator
     if table_mode == "cron":
         table_indicator = "[yellow bold]\\[Cron][/yellow bold]"
@@ -2068,6 +2090,8 @@ def create_status_bar(instances: list, selected_idx: int) -> Text:
     text.append_text(Text.from_markup(f"[cyan]{page_name}[/cyan] [dim](h/l)[/dim]"))
     if filter_indicator:
         text.append_text(Text.from_markup(filter_indicator))
+    if subagent_indicator:
+        text.append_text(Text.from_markup(subagent_indicator))
     text.append("  |  ", style="white")
 
     # Check for feedback messages (show for 3 seconds)
@@ -2461,7 +2485,7 @@ def get_dashboard(instances: list, selected_idx: int) -> Layout:
 
 def main():
     """Main entry point."""
-    global selected_index, instances_cache, api_healthy, api_error_message, layout_mode, layout_mode_forced, sort_mode, filter_mode, panel_page
+    global selected_index, instances_cache, api_healthy, api_error_message, layout_mode, layout_mode_forced, sort_mode, filter_mode, show_subagents, panel_page
     global deploy_active, deploy_log_path, deploy_metadata, deploy_previous_page, deploy_auto_switched
     global table_mode, cron_selected_index
 
@@ -2621,6 +2645,10 @@ def main():
                     elif key == 'K':
                         with action_lock:
                             action_queue.append('kill')
+                        update_flag.set()
+                    elif key == 'a':
+                        with action_lock:
+                            action_queue.append('toggle_subagents')
                         update_flag.set()
                     elif key == 'f':
                         with action_lock:
@@ -2991,6 +3019,11 @@ def main():
                                 update_flag.set()
 
                             threading.Thread(target=_do_kill, args=(instance_id, instance_name, working_dir), daemon=True).start()
+
+                    elif action == 'toggle_subagents':
+                        show_subagents = not show_subagents
+                        _clamp_selection()
+                        _refresh(live)
 
                     elif action == 'filter':
                         # Cycle filter: all -> active -> stopped -> all

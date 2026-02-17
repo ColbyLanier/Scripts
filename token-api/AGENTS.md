@@ -59,6 +59,8 @@ Core instance registry. Key columns:
 - `status` - 'active' or 'stopped'
 - `is_processing` - 1 when actively processing a prompt
 - `device_id` - 'desktop', 'Token-S24', etc.
+- `is_subagent` - 1 if spawned by `subagent` CLI or headless `claude -p` (0 for interactive)
+- `spawner` - Origin tag, e.g. `"subagent:claude"`, `"cron:task-worker"` (NULL for interactive)
 
 ### events
 Event log for instance lifecycle, renames, TTS, notifications.
@@ -142,6 +144,28 @@ Rename via:
 - CLI: `instance-name "my-name"`
 - API: `PATCH /api/instances/{id}/rename` with `{"tab_name": "..."}`
 
+## Subagent Tagging
+
+Headless Claude instances spawned by `subagent --claude`, cron jobs, or scripts are tagged at registration to reduce TUI clutter.
+
+**How it works:**
+1. The `subagent` CLI exports `TOKEN_API_SUBAGENT="subagent:claude"` before invoking `claude -p`
+2. The Claude Code hook (`~/.claude/hooks/generic-hook.sh`) forwards this env var in the `.env` payload
+3. The server reads `TOKEN_API_SUBAGENT` from the hook payload and sets `is_subagent=1`, `spawner=<value>`
+4. Subagents are auto-named `"sub: <spawner>"` and **skip TTS profile assignment** (no voice slot consumed)
+
+**TUI behavior:**
+- Subagents are **hidden by default** — press `a` to toggle visibility
+- When visible, subagent rows are dimmed with an `@` prefix
+- Status bar shows `+N sub` count when subagents are hidden
+
+**Extending to other spawners:**
+To tag cron jobs or watchdog scripts, export `TOKEN_API_SUBAGENT` before the `claude -p` call:
+```bash
+export TOKEN_API_SUBAGENT="cron:task-worker"
+claude -p "do the thing"
+```
+
 ## TUI Controls
 
 ```
@@ -154,6 +178,7 @@ y        - Copy resume command to clipboard (yank)
 U        - Unstick frozen instance (SIGWINCH, gentle nudge)
 I        - Interrupt frozen instance (SIGINT, cancel current op)
 K        - Kill frozen instance (SIGKILL, auto-copies resume cmd)
+a        - Toggle subagent visibility (hidden by default)
 c        - Clear all stopped
 o        - Change sort order
 R        - Restart server
@@ -245,6 +270,7 @@ Re-select voices via `tts-studio.py` on WSL. The DB `tts_voice` column stores th
 | `token-ping` | Hit any endpoint (fuzzy match, auto-restart, OpenAPI-aware) |
 | `timer-status` | Quick timer status (mode, break time, work time) |
 | `timer-mode` | Switch timer mode (break, pause, resume) |
+| `subagent` | Multi-backend sub-agent launcher (--claude, --codex, --blocking) |
 
 ### General (also useful here)
 

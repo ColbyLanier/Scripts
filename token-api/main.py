@@ -27,7 +27,8 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
 import aiosqlite
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 import subprocess
 import requests
@@ -84,6 +85,8 @@ fastapi_logger.addHandler(buffer_handler)
 DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
 SERVER_PORT = 7777  # Authoritative port for Token API
 CRASH_LOG_PATH = Path.home() / ".claude" / "token-api-crash.log"
+STASH_DIR = Path.home() / ".claude" / "stash"
+STASH_MAX_AGE_HOURS = 24
 
 
 # ============ Crash Logging ============
@@ -329,6 +332,10 @@ class WindowEnforceResponse(BaseModel):
     should_close_distractions: bool
     distraction_apps: List[str]  # Apps that should be closed if should_close_distractions is True
     reason: str
+
+
+class StashContentRequest(BaseModel):
+    content: str
 
 
 class DesktopDetectionRequest(BaseModel):
@@ -1073,6 +1080,9 @@ async def lifespan(app: FastAPI):
     if timer_engine.current_mode != expected_timer_mode and timer_engine.current_mode.value.startswith("work_"):
         print(f"TIMER: Syncing timer mode {timer_engine.current_mode.value} -> {expected_timer_mode.value} (from desktop state)")
         timer_engine.set_mode(expected_timer_mode, is_automatic=False, now_mono_ms=now_ms)
+    # Stash cleanup on startup + hourly
+    stash_cleanup()
+    scheduler.add_job(stash_cleanup, IntervalTrigger(hours=1), id="stash_cleanup", replace_existing=True)
     scheduler.start()
     print("Scheduler started")
     # Start TTS queue worker
@@ -5455,6 +5465,15 @@ async def handle_session_start(payload: dict) -> dict:
     working_dir = payload.get("cwd") or os.getcwd()
     tab_name = payload.get("env", {}).get("CLAUDE_TAB_NAME") or f"Claude {datetime.now().strftime('%H:%M')}"
 
+    # Detect subagent from env var
+    subagent_env = payload.get("env", {}).get("TOKEN_API_SUBAGENT", "")
+    is_subagent = 1 if subagent_env else 0
+    spawner = subagent_env or None
+
+    # Auto-name subagents
+    if is_subagent and not payload.get("env", {}).get("CLAUDE_TAB_NAME"):
+        tab_name = f"sub: {spawner}"
+
     # Resolve device_id from source_ip
     device_id = resolve_device_from_ip(source_ip) if source_ip else "Mac-Mini"
 
@@ -5467,15 +5486,20 @@ async def handle_session_start(payload: dict) -> dict:
         if await cursor.fetchone():
             return {"success": True, "action": "already_registered", "instance_id": session_id}
 
-        # Get WSL voices held by active instances
-        cursor = await db.execute(
-            "SELECT tts_voice FROM claude_instances WHERE status IN ('processing', 'idle')"
-        )
-        rows = await cursor.fetchall()
-        used_wsl_voices = {row[0] for row in rows if row[0]}
+        # Skip TTS profile assignment for subagents (headless, no voice needed)
+        if is_subagent:
+            profile = {"name": None, "wsl_voice": None, "notification_sound": None}
+            pool_exhausted = False
+        else:
+            # Get WSL voices held by active instances
+            cursor = await db.execute(
+                "SELECT tts_voice FROM claude_instances WHERE status IN ('processing', 'idle')"
+            )
+            rows = await cursor.fetchall()
+            used_wsl_voices = {row[0] for row in rows if row[0]}
 
-        # Assign profile via linear probe
-        profile, pool_exhausted = get_next_available_profile(used_wsl_voices)
+            # Assign profile via linear probe
+            profile, pool_exhausted = get_next_available_profile(used_wsl_voices)
 
         # Insert instance
         now = datetime.now().isoformat()
@@ -5484,8 +5508,9 @@ async def handle_session_start(payload: dict) -> dict:
             """INSERT INTO claude_instances
                (id, session_id, tab_name, working_dir, origin_type, source_ip, device_id,
                 profile_name, tts_voice, notification_sound, pid, status,
+                is_subagent, spawner,
                 registered_at, last_activity)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?)""",
             (
                 session_id,
                 internal_session_id,
@@ -5498,21 +5523,24 @@ async def handle_session_start(payload: dict) -> dict:
                 profile["wsl_voice"],
                 profile["notification_sound"],
                 payload.get("pid"),
+                is_subagent,
+                spawner,
                 now,
                 now
             )
         )
         await db.commit()
 
-    logger.info(f"Hook: SessionStart registered {session_id[:12]}... ({working_dir})")
+    logger.info(f"Hook: SessionStart registered {session_id[:12]}... ({working_dir}){' [subagent]' if is_subagent else ''}")
     await log_event("instance_registered", instance_id=session_id, device_id=device_id,
-                    details={"tab_name": tab_name, "origin_type": origin_type, "source": "hook"})
+                    details={"tab_name": tab_name, "origin_type": origin_type, "source": "hook",
+                             "is_subagent": is_subagent, "spawner": spawner})
 
     return {
         "success": True,
         "action": "registered",
         "instance_id": session_id,
-        "profile": profile["name"]
+        "profile": profile["name"] if not is_subagent else None
     }
 
 
@@ -5863,6 +5891,116 @@ async def dispatch_hook(action_type: str, payload: dict) -> dict:
         logger.error(f"Hook handler error ({action_type}): {e}")
         await log_event("hook_error", details={"action_type": action_type, "error": str(e)})
         return {"success": False, "action": "handler_error", "error": str(e)}
+
+
+# ============ Stash: Cross-Machine Clipboard & File Sharing ============
+
+import mimetypes
+
+def stash_cleanup():
+    """Delete stash items older than STASH_MAX_AGE_HOURS."""
+    if not STASH_DIR.exists():
+        return
+    cutoff = time.time() - (STASH_MAX_AGE_HOURS * 3600)
+    removed = 0
+    for f in STASH_DIR.iterdir():
+        if f.is_file() and f.stat().st_mtime < cutoff:
+            f.unlink()
+            removed += 1
+    if removed:
+        print(f"STASH: Cleaned up {removed} expired item(s)")
+
+
+@app.get("/api/stash")
+async def stash_list():
+    """List all stash items."""
+    STASH_DIR.mkdir(parents=True, exist_ok=True)
+    items = []
+    now = time.time()
+    for f in sorted(STASH_DIR.iterdir()):
+        if not f.is_file():
+            continue
+        stat = f.stat()
+        age_secs = now - stat.st_mtime
+        items.append({
+            "name": f.name,
+            "size": stat.st_size,
+            "age_seconds": int(age_secs),
+            "age_human": f"{int(age_secs // 3600)}h{int((age_secs % 3600) // 60)}m" if age_secs >= 3600 else f"{int(age_secs // 60)}m",
+        })
+    return {"items": items, "count": len(items)}
+
+
+@app.get("/api/stash/{name:path}")
+async def stash_get(name: str):
+    """Get a stash item. Returns JSON for text, file download for binary."""
+    path = STASH_DIR / name
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail=f"Stash item '{name}' not found")
+    # Safety: ensure path is within STASH_DIR
+    if not path.resolve().is_relative_to(STASH_DIR.resolve()):
+        raise HTTPException(status_code=400, detail="Invalid stash name")
+    mime, _ = mimetypes.guess_type(name)
+    # If it looks like text, return as JSON
+    try:
+        content = path.read_text(encoding="utf-8")
+        return {"name": name, "content": content, "size": len(content)}
+    except (UnicodeDecodeError, ValueError):
+        return FileResponse(path, filename=name, media_type=mime or "application/octet-stream")
+
+
+@app.put("/api/stash/{name:path}")
+async def stash_put(name: str, body: StashContentRequest):
+    """Set a stash item from JSON body {"content": "..."}."""
+    STASH_DIR.mkdir(parents=True, exist_ok=True)
+    path = STASH_DIR / name
+    if not path.resolve().is_relative_to(STASH_DIR.resolve()):
+        raise HTTPException(status_code=400, detail="Invalid stash name")
+    path.write_text(body.content, encoding="utf-8")
+    return {"status": "stored", "name": name, "size": len(body.content), "type": "text"}
+
+
+@app.post("/api/stash/{name:path}/upload")
+async def stash_upload(name: str, file: UploadFile = File(...)):
+    """Upload a file to stash."""
+    STASH_DIR.mkdir(parents=True, exist_ok=True)
+    path = STASH_DIR / name
+    if not path.resolve().is_relative_to(STASH_DIR.resolve()):
+        raise HTTPException(status_code=400, detail="Invalid stash name")
+    data = await file.read()
+    path.write_bytes(data)
+    return {"status": "stored", "name": name, "size": len(data), "type": "file"}
+
+
+@app.delete("/api/stash/{name:path}")
+async def stash_delete(name: str):
+    """Delete a stash item."""
+    path = STASH_DIR / name
+    if not path.resolve().is_relative_to(STASH_DIR.resolve()):
+        raise HTTPException(status_code=400, detail="Invalid stash name")
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"Stash item '{name}' not found")
+    path.unlink()
+    return {"status": "deleted", "name": name}
+
+
+@app.put("/api/stash")
+async def stash_put_clipboard(body: StashContentRequest):
+    """Shorthand: set the _clipboard item."""
+    return await stash_put("_clipboard", body)
+
+
+@app.delete("/api/stash")
+async def stash_clear_all():
+    """Clear all stash items."""
+    if not STASH_DIR.exists():
+        return {"status": "cleared", "removed": 0}
+    removed = 0
+    for f in STASH_DIR.iterdir():
+        if f.is_file():
+            f.unlink()
+            removed += 1
+    return {"status": "cleared", "removed": removed}
 
 
 if __name__ == "__main__":
