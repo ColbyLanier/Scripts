@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Stash - Cross-machine clipboard & file sharing via Token-API
+#
+# Usage:
+#   stash                        Get clipboard → stdout
+#   stash "hello world"          Set clipboard from argument
+#   echo "data" | stash push     Set clipboard from stdin
+#   stash push file.env          Upload file (stored as "file.env")
+#   stash pull file.env          Download file to current dir
+#   stash pull file.env -o /tmp/ Download to specific path
+#   stash list                   List all items
+#   stash clear                  Clear all items
+#   stash cp                     Copy local OS clipboard → stash
+#   stash paste                  Stash → local OS clipboard
+
+set -euo pipefail
+
+API_URL="http://localhost:7777"
+
+# Platform clipboard helpers
+_clip_copy() {
+    if command -v pbcopy &>/dev/null; then
+        pbcopy
+    elif command -v clip.exe &>/dev/null; then
+        clip.exe
+    else
+        return 1
+    fi
+}
+
+_clip_paste() {
+    if command -v pbpaste &>/dev/null; then
+        pbpaste
+    elif command -v powershell.exe &>/dev/null; then
+        powershell.exe -NoProfile -Command "Get-Clipboard" | tr -d '\r'
+    else
+        return 1
+    fi
+}
+
+# Help
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    cat << 'EOF'
+Stash - Cross-machine clipboard & file sharing via Token-API
+
+Usage:
+  stash                        Get clipboard → stdout
+  stash "hello world"          Set clipboard from argument
+  echo "data" | stash push     Set clipboard from stdin
+  stash push file.env          Upload file (stored as "file.env")
+  stash pull file.env          Download file to current dir
+  stash pull file.env -o /tmp/ Download to specific path
+  stash list                   List all items
+  stash clear                  Clear all items
+  stash cp                     Copy local OS clipboard → stash
+  stash paste                  Stash → local OS clipboard
+EOF
+    exit 0
+fi
+
+CMD="${1:-}"
+
+case "$CMD" in
+    list|ls)
+        curl -sf "$API_URL/api/stash" | jq -r '.items[] | "\(.name)\t\(.size) bytes\t\(.age_human) ago"' | column -t -s $'\t'
+        ;;
+    clear)
+        curl -sf -X DELETE "$API_URL/api/stash" | jq -r '"Cleared \(.removed) item(s)"'
+        ;;
+    push)
+        shift
+        if [[ $# -gt 0 && -f "$1" ]]; then
+            # File upload
+            FNAME="$(basename "$1")"
+            curl -sf -X POST "$API_URL/api/stash/$FNAME/upload" -F "file=@$1" | jq -r '"Stored \(.name) (\(.size) bytes)"'
+        else
+            # Stdin → clipboard
+            CONTENT="$(cat)"
+            PAYLOAD=$(jq -n --arg c "$CONTENT" '{content: $c}')
+            curl -sf -X PUT "$API_URL/api/stash" -H "Content-Type: application/json" -d "$PAYLOAD" | jq -r '"Stored \(.size) bytes to clipboard"'
+        fi
+        ;;
+    pull)
+        shift
+        NAME="${1:?Usage: stash pull <name> [-o <dir>]}"
+        shift
+        OUTDIR="."
+        if [[ "${1:-}" == "-o" ]]; then
+            OUTDIR="${2:?Missing output directory}"
+        fi
+        mkdir -p "$OUTDIR"
+        curl -sf "$API_URL/api/stash/$NAME" | jq -r '.content' > "$OUTDIR/$NAME"
+        echo "Downloaded $NAME → $OUTDIR/$NAME"
+        ;;
+    cp)
+        # Local clipboard → stash
+        CONTENT="$(_clip_paste)" || { echo "No clipboard tool available" >&2; exit 1; }
+        PAYLOAD=$(jq -n --arg c "$CONTENT" '{content: $c}')
+        curl -sf -X PUT "$API_URL/api/stash" -H "Content-Type: application/json" -d "$PAYLOAD" | jq -r '"Copied clipboard to stash (\(.size) bytes)"'
+        ;;
+    paste)
+        # Stash → local clipboard
+        CONTENT=$(curl -sf "$API_URL/api/stash/_clipboard" | jq -r '.content')
+        echo -n "$CONTENT" | _clip_copy || { echo "$CONTENT"; exit 0; }
+        echo "Pasted stash to clipboard ($(echo -n "$CONTENT" | wc -c | tr -d ' ') bytes)"
+        ;;
+    *)
+        if [[ -z "$CMD" ]]; then
+            # No args: get clipboard → stdout
+            curl -sf "$API_URL/api/stash/_clipboard" | jq -r '.content'
+        elif [[ -n "$CMD" && "$CMD" != -* ]]; then
+            # Positional arg: set clipboard
+            PAYLOAD=$(jq -n --arg c "$CMD" '{content: $c}')
+            curl -sf -X PUT "$API_URL/api/stash" -H "Content-Type: application/json" -d "$PAYLOAD" >/dev/null
+            echo "Stashed $(echo -n "$CMD" | wc -c | tr -d ' ') bytes"
+        else
+            echo "Unknown command: $CMD" >&2
+            echo "Run 'stash --help' for usage" >&2
+            exit 1
+        fi
+        ;;
+esac

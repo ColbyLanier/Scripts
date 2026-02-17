@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Convenience shim for followup command
+exec "$HOME/Scripts/cli-tools/bin/cli-wrapper" followup "$@"
