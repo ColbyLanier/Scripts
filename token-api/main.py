@@ -81,7 +81,7 @@ fastapi_logger.addHandler(buffer_handler)
 
 
 # Configuration
-DB_PATH = Path.home() / ".claude" / "agents.db"
+DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
 SERVER_PORT = 7777  # Authoritative port for Token API
 CRASH_LOG_PATH = Path.home() / ".claude" / "token-api-crash.log"
 

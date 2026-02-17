@@ -4,10 +4,11 @@ Initialize the SQLite database with required tables and seed data.
 Run this script standalone or let the FastAPI app initialize on startup.
 """
 
+import os
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path.home() / ".claude" / "agents.db"
+DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
 
 
 def init_database():
