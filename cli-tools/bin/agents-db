@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# agents-db - Query the local agents.db database
+# TAGS: instance
+# AUDIENCE: agent
 """Query the local agents.db database (Token-API instance registry).
 
 Usage:

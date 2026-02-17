@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # subagent - Multi-backend sub-agent launcher
+# TAGS: instance
+# AUDIENCE: agent
 #
 # Backends: openclaw (default), codex, claude
 # Modes: async (default), --blocking, --persona

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# macrodroid-read - Parse and display MacroDroid .mdr backup files
+# TAGS: mobile, macrodroid
+# AUDIENCE: human
 """
 macrodroid-read - Parse and display MacroDroid .mdr backup files
 

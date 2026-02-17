@@ -1,5 +1,7 @@
 #!/bin/bash
 # tasker-push - Push scripts to phone's ~/.termux/tasker/ via SSH
+# TAGS: mobile
+# AUDIENCE: human, agent
 #
 # Usage:
 #   tasker-push <script>              # Push single script

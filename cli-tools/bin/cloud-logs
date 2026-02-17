@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
 # Fetch and tail Cloud Run logs
+# TAGS: deploy
+# AUDIENCE: human, agent
 set -euo pipefail
 exec uv run --project "$HOME/Scripts/cli-tools" python -m cli_tools.cloud_logs.cli "$@"

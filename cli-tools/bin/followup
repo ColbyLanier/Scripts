@@ -1,3 +1,5 @@
 #!/usr/bin/env bash
 # Convenience shim for followup command
+# TAGS: workflow
+# AUDIENCE: human
 exec "$HOME/Scripts/cli-tools/bin/cli-wrapper" followup "$@"

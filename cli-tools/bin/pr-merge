@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # PR Merge with Complete Cleanup
+# TAGS: git, pr
+# AUDIENCE: human, agent
 #
 # Merges a PR and cleans up the remote branch, local branch, worktree,
 # and bash aliases. The final step after a PR is approved.

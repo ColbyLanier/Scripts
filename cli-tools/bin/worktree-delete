@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Worktree Delete - remove git worktrees and clean up associated resources
+# TAGS: git, worktree
+# AUDIENCE: human, agent
 #
 # Usage: worktree-delete <branch-name> [options]
 #
@@ -129,6 +131,39 @@ echo ""
 if [[ "$DRY_RUN" == "true" ]]; then
     log_warn "Dry run - no changes made"
     exit 0
+fi
+
+# Kill any Claude session running from the worktree (ghost prevention)
+if [[ -d "$WORKTREE_DIR" ]]; then
+    GHOST_PID=""
+    for entry in /proc/[0-9]*; do
+        pid=$(basename "$entry")
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
+        [[ "$comm" == "claude" ]] || continue
+        cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || continue
+        if [[ "${cwd%/}" == "${WORKTREE_DIR%/}" ]]; then
+            GHOST_PID="$pid"
+            break
+        fi
+    done
+
+    if [[ -n "$GHOST_PID" ]]; then
+        log_warn "Claude session running from worktree (PID $GHOST_PID)"
+        log_info "Sending SIGINT to gracefully stop..."
+        kill -INT "$GHOST_PID" 2>/dev/null || true
+        sleep 1
+        if kill -0 "$GHOST_PID" 2>/dev/null; then
+            kill -INT "$GHOST_PID" 2>/dev/null || true
+            sleep 2
+        fi
+        if kill -0 "$GHOST_PID" 2>/dev/null; then
+            log_warn "Force killing PID $GHOST_PID"
+            kill -KILL "$GHOST_PID" 2>/dev/null || true
+        fi
+        log_success "Claude session terminated"
+        # Clean up session PID cache
+        rm -f "${HOME}/.claude/session-pids/${GHOST_PID}" 2>/dev/null || true
+    fi
 fi
 
 # Remove worktree

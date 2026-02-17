@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Memory Watchdog - monitors system memory and spawns claude to investigate leaks
+# TAGS: system
+# AUDIENCE: agent
 #
 # Usage: mem-watchdog [options]
 #   mem-watchdog              # Single check (for use with cron/systemd timer)

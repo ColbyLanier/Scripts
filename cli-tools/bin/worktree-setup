@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Worktree Setup - create git worktrees with environment files and dependencies
+# TAGS: git, worktree
+# AUDIENCE: human, agent
 #
 # Usage: worktree-setup <branch-name> [options]
 #
@@ -24,6 +26,7 @@ NC='\033[0m' # No Color
 DRY_RUN=false
 USE_EXISTING_BRANCH=false
 SKIP_SYNC=false
+NO_TRANSPLANT=false
 
 usage() {
     cat << 'EOF'
@@ -35,10 +38,11 @@ Arguments:
   branch-name         Name for the new branch and worktree directory
 
 Options:
-  -e, --existing      Use an existing branch instead of creating new one
-  -n, --dry-run       Show what would happen without making changes
-  -s, --skip-sync     Skip running uv sync / npm install
-  -h, --help          Show this help message
+  -e, --existing        Use an existing branch instead of creating new one
+  -n, --dry-run         Show what would happen without making changes
+  -s, --skip-sync       Skip running uv sync / npm install
+  --no-transplant       Skip session transplant (for subagents or non-interactive use)
+  -h, --help            Show this help message
 
 Description:
   Creates a new git worktree as a sibling directory (../repo-branch-name),
@@ -90,6 +94,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -s|--skip-sync)
             SKIP_SYNC=true
+            shift
+            ;;
+        --no-transplant)
+            NO_TRANSPLANT=true
             shift
             ;;
         -*)
@@ -212,17 +220,24 @@ elif [[ -f "$REPO_ROOT/requirements.txt" ]]; then
     PKG_MANAGER="pip"
 fi
 
-# Check for widget or frontend with their own package.json
+# Check for npm dependencies (root and subdirectories)
+HAS_NPM=false
+if [[ -f "$REPO_ROOT/package.json" ]]; then
+    HAS_NPM=true
+fi
 for dir in widget frontend; do
     if [[ -d "$REPO_ROOT/$dir" ]] && [[ -f "$REPO_ROOT/$dir/package.json" ]]; then
-        if [[ -n "$PKG_MANAGER" ]]; then
-            PKG_MANAGER="$PKG_MANAGER + npm"
-        else
-            PKG_MANAGER="npm"
-        fi
-        break  # Only add npm once
+        HAS_NPM=true
+        break
     fi
 done
+if [[ "$HAS_NPM" == "true" ]]; then
+    if [[ -n "$PKG_MANAGER" ]]; then
+        PKG_MANAGER="$PKG_MANAGER + npm"
+    else
+        PKG_MANAGER="npm"
+    fi
+fi
 
 if [[ -n "$PKG_MANAGER" ]] && [[ "$SKIP_SYNC" == "false" ]]; then
     echo "  Package sync:  $PKG_MANAGER"
@@ -288,7 +303,14 @@ if [[ -n "$PKG_MANAGER" ]] && [[ "$SKIP_SYNC" == "false" ]]; then
     fi
 
     if [[ "$PKG_MANAGER" == *"npm"* ]]; then
-        # Check for widget or frontend directories
+        # Root package.json (e.g., puppeteer, dotenv for E2E tests)
+        if [[ -f "$WORKTREE_DIR/package.json" ]]; then
+            cd "$WORKTREE_DIR"
+            npm install
+            log_success "Node dependencies synced (root)"
+        fi
+
+        # Subdirectory package.json (widget, frontend)
         for dir in widget frontend; do
             if [[ -d "$WORKTREE_DIR/$dir" ]] && [[ -f "$WORKTREE_DIR/$dir/package.json" ]]; then
                 cd "$WORKTREE_DIR/$dir"
@@ -315,5 +337,167 @@ echo "════════════════════════�
 echo -e " ${GREEN}Worktree ready!${NC}"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
-echo "  cd $WORKTREE_DIR"
+
+# ═══════════════════════════════════════════════════════════════
+# Session Transplant: kill Claude and restart in the worktree
+# ═══════════════════════════════════════════════════════════════
+
+# Encode a path the way Claude Code does (/ and . become -)
+encode_claude_path() {
+    echo "$1" | tr '/.' '-'
+}
+
+# Walk /proc to find the Claude ancestor process
+find_claude_pid() {
+    local current="$PPID"
+    for _ in 1 2 3 4 5 6 7 8; do
+        [[ -z "$current" || "$current" == "1" || "$current" == "0" ]] && break
+        local comm
+        comm=$(cat "/proc/$current/comm" 2>/dev/null) || break
+        if [[ "$comm" == "claude" ]]; then
+            echo "$current"
+            return 0
+        fi
+        current=$(awk '{print $4}' "/proc/$current/stat" 2>/dev/null) || break
+    done
+    return 1
+}
+
+# Find the tmux pane containing a given PID (walks ancestry)
+find_tmux_pane() {
+    local target_pid=$1
+    tmux list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null | while read -r pane_id pane_pid; do
+        local check_pid=$target_pid
+        while [[ -n "$check_pid" && "$check_pid" != "1" && "$check_pid" != "0" ]]; do
+            if [[ "$check_pid" == "$pane_pid" ]]; then
+                echo "$pane_id"
+                return 0
+            fi
+            check_pid=$(awk '{print $4}' "/proc/$check_pid/stat" 2>/dev/null) || break
+        done
+    done | head -1
+}
+
+transplant_session() {
+    # Check preconditions
+    if [[ "$NO_TRANSPLANT" == "true" ]]; then
+        return 1
+    fi
+    # Claude strips $TMUX from tool env, so detect via tmux command
+    if ! tmux display-message -p '#{session_name}' &>/dev/null; then
+        log_info "Not in tmux — transplant skipped"
+        echo "  For auto-transplant, run Claude from tmux (or use the claude wrapper)"
+        echo ""
+        echo "  Manual: cd $WORKTREE_DIR && claude --continue --fork-session"
+        return 1
+    fi
+
+    # Find parent Claude process
+    local claude_pid
+    claude_pid=$(find_claude_pid) || {
+        log_warn "Claude PID not found — transplant skipped"
+        echo "  cd $WORKTREE_DIR"
+        return 1
+    }
+
+    # Find session ID from cache (written by SessionStart hook)
+    local session_id=""
+    if [[ -f "${HOME}/.claude/session-pids/${claude_pid}" ]]; then
+        session_id=$(cat "${HOME}/.claude/session-pids/${claude_pid}" 2>/dev/null)
+    fi
+
+    # Fallback: most recent JSONL in source project dir
+    local source_encoded
+    source_encoded=$(encode_claude_path "$REPO_ROOT")
+    local source_project_dir="${HOME}/.claude/projects/${source_encoded}"
+    if [[ -z "$session_id" && -d "$source_project_dir" ]]; then
+        local latest_jsonl
+        latest_jsonl=$(ls -t "$source_project_dir"/*.jsonl 2>/dev/null | head -1)
+        if [[ -n "$latest_jsonl" ]]; then
+            session_id=$(basename "$latest_jsonl" .jsonl)
+            log_warn "Session ID cache miss — using most recent JSONL: ${session_id:0:8}..."
+        fi
+    fi
+
+    if [[ -z "$session_id" ]]; then
+        log_warn "No session ID found — transplant skipped"
+        echo "  cd $WORKTREE_DIR"
+        return 1
+    fi
+
+    # Copy JSONL to target project directory
+    local target_encoded
+    target_encoded=$(encode_claude_path "$WORKTREE_DIR")
+    local target_project_dir="${HOME}/.claude/projects/${target_encoded}"
+    local source_jsonl="${source_project_dir}/${session_id}.jsonl"
+
+    if [[ ! -f "$source_jsonl" ]]; then
+        log_warn "Session JSONL not found: $source_jsonl"
+        echo "  cd $WORKTREE_DIR"
+        return 1
+    fi
+
+    mkdir -p "$target_project_dir"
+    cp "$source_jsonl" "$target_project_dir/"
+    log_success "Session transcript copied to worktree project dir"
+
+    # Find tmux pane (Claude strips $TMUX_PANE, always use PID-based lookup)
+    local pane_target
+    pane_target=$(find_tmux_pane "$claude_pid")
+    if [[ -z "$pane_target" ]]; then
+        log_warn "Could not identify tmux pane — transplant skipped"
+        echo "  cd $WORKTREE_DIR && claude --resume $session_id --fork-session"
+        return 1
+    fi
+
+    log_info "Transplanting session to worktree..."
+
+    # Spawn a detached restart daemon that:
+    # 1. Waits for Claude to exit
+    # 2. Sends the restart command to the tmux pane's shell
+    (
+        exec 0</dev/null 1>/dev/null 2>/dev/null
+
+        # Wait for Claude to fully exit
+        local wait_count=0
+        while kill -0 "$claude_pid" 2>/dev/null; do
+            sleep 0.5
+            wait_count=$((wait_count + 1))
+            if [[ $wait_count -ge 20 ]]; then
+                # 10 seconds max wait — give up
+                break
+            fi
+        done
+        sleep 0.5  # Grace period for shell to regain control
+
+        # Send restart command to the tmux pane
+        tmux send-keys -t "$pane_target" \
+            "cd '$WORKTREE_DIR' && /home/token/.local/bin/claude --dangerously-skip-permissions --resume '$session_id' --fork-session" \
+            Enter
+    ) &
+    disown
+
+    # Ignore signals during shutdown — we must complete the kill
+    trap '' INT HUP TERM
+
+    # Kill Claude (SIGINT for graceful shutdown)
+    kill -INT "$claude_pid" 2>/dev/null || true
+    sleep 1.5
+
+    # Double-SIGINT if still alive (matches token-api pattern)
+    if kill -0 "$claude_pid" 2>/dev/null; then
+        kill -INT "$claude_pid" 2>/dev/null || true
+        sleep 2
+    fi
+
+    # Force kill as last resort
+    if kill -0 "$claude_pid" 2>/dev/null; then
+        kill -KILL "$claude_pid" 2>/dev/null || true
+    fi
+
+    exit 0
+}
+
+# Attempt transplant; if it fails or is skipped, show manual command
+transplant_session || echo "  cd $WORKTREE_DIR"
 echo ""

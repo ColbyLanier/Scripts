@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Save current break time, load a test value, and restore later.
+# TAGS: token-api
+# AUDIENCE: agent
 #
 # Usage:
 #   timer-test 60       # Save real break time, set to 60 minutes

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# instances-clear - Clear all stopped Claude instances from the registry
+# TAGS: instance
+# AUDIENCE: agent
 """Clear all stopped Claude instances from the registry.
 
 Usage:

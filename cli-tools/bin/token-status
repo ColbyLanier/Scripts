@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# token-status - Quick Token-API status check
+# TAGS: token-api
+# AUDIENCE: human, agent
 """Quick Token-API status check without launching full TUI.
 
 Usage:

@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# transplant - Move the current Claude session to a different directory
+# TAGS: instance
+# AUDIENCE: human, agent
+#
+# Usage: transplant <target-directory>
+#
+# Kills the current Claude session and restarts it in the target directory
+# with conversation history preserved via --resume --fork-session.
+# Requires tmux. This is the same mechanism used by worktree-setup.
+#
+# Examples:
+#   transplant /home/token/ProcAgentDir/ProcurementAgentAI
+#   transplant /tmp/transplant-test
+
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log_info()    { echo -e "${BLUE}→${NC} $1"; }
+log_success() { echo -e "${GREEN}✓${NC} $1"; }
+log_warn()    { echo -e "${YELLOW}!${NC} $1"; }
+log_error()   { echo -e "${RED}✗${NC} $1"; }
+
+usage() {
+    cat << 'EOF'
+transplant - Move the current Claude session to a different directory
+
+Usage: transplant <target-directory>
+
+Kills the current Claude session and restarts it in the target directory
+with conversation history preserved via --resume --fork-session.
+
+Requires tmux (the claude wrapper auto-creates tmux sessions).
+
+Options:
+  -h, --help    Show this help message
+
+Examples:
+  transplant /home/token/ProcAgentDir/ProcurementAgentAI
+  transplant /tmp/transplant-test
+EOF
+    exit 0
+}
+
+# Encode a path the way Claude Code does (/ and . become -)
+encode_claude_path() {
+    echo "$1" | tr '/.' '-'
+}
+
+# Walk /proc to find the Claude ancestor process
+find_claude_pid() {
+    local current="$PPID"
+    for _ in 1 2 3 4 5 6 7 8; do
+        [[ -z "$current" || "$current" == "1" || "$current" == "0" ]] && break
+        local comm
+        comm=$(cat "/proc/$current/comm" 2>/dev/null) || break
+        if [[ "$comm" == "claude" ]]; then
+            echo "$current"
+            return 0
+        fi
+        current=$(awk '{print $4}' "/proc/$current/stat" 2>/dev/null) || break
+    done
+    return 1
+}
+
+# Find the tmux pane containing a given PID (walks ancestry)
+find_tmux_pane() {
+    local target_pid=$1
+    tmux list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null | while read -r pane_id pane_pid; do
+        local check_pid=$target_pid
+        while [[ -n "$check_pid" && "$check_pid" != "1" && "$check_pid" != "0" ]]; do
+            if [[ "$check_pid" == "$pane_pid" ]]; then
+                echo "$pane_id"
+                return 0
+            fi
+            check_pid=$(awk '{print $4}' "/proc/$check_pid/stat" 2>/dev/null) || break
+        done
+    done | head -1
+}
+
+# Parse args
+TARGET_DIR=""
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help) usage ;;
+        -*)
+            log_error "Unknown option: $1"
+            exit 1
+            ;;
+        *)
+            if [[ -z "$TARGET_DIR" ]]; then
+                TARGET_DIR="$1"
+            else
+                log_error "Too many arguments"
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$TARGET_DIR" ]]; then
+    log_error "Target directory required"
+    echo "Usage: transplant <target-directory>"
+    exit 1
+fi
+
+# Resolve to absolute path
+TARGET_DIR=$(cd "$TARGET_DIR" 2>/dev/null && pwd) || {
+    log_error "Target directory does not exist: $TARGET_DIR"
+    exit 1
+}
+
+SOURCE_DIR="$PWD"
+
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo " Session Transplant"
+echo "═══════════════════════════════════════════════════════════════"
+echo ""
+echo "  From: $SOURCE_DIR"
+echo "  To:   $TARGET_DIR"
+echo ""
+
+# Check tmux (Claude strips $TMUX from tool env, so use tmux command)
+if ! tmux display-message -p '#{session_name}' &>/dev/null; then
+    log_error "Not in tmux — transplant requires tmux"
+    echo ""
+    echo "  Manual: cd '$TARGET_DIR' && claude --continue --fork-session"
+    exit 1
+fi
+log_success "tmux detected (session: $(tmux display-message -p '#{session_name}'))"
+
+# Find Claude PID
+claude_pid=$(find_claude_pid) || {
+    log_error "Claude PID not found (walked 8 levels from PPID=$PPID)"
+    exit 1
+}
+log_success "Claude PID: $claude_pid"
+
+# Find session ID from cache
+session_id=""
+if [[ -f "${HOME}/.claude/session-pids/${claude_pid}" ]]; then
+    session_id=$(cat "${HOME}/.claude/session-pids/${claude_pid}" 2>/dev/null)
+fi
+
+# Fallback: most recent JSONL in source project dir
+source_encoded=$(encode_claude_path "$SOURCE_DIR")
+source_project_dir="${HOME}/.claude/projects/${source_encoded}"
+
+if [[ -z "$session_id" && -d "$source_project_dir" ]]; then
+    latest_jsonl=$(ls -t "$source_project_dir"/*.jsonl 2>/dev/null | head -1)
+    if [[ -n "$latest_jsonl" ]]; then
+        session_id=$(basename "$latest_jsonl" .jsonl)
+        log_warn "Session ID cache miss — using most recent JSONL: ${session_id:0:8}..."
+    fi
+fi
+
+if [[ -z "$session_id" ]]; then
+    log_error "No session ID found"
+    echo "  Cache dir: ${HOME}/.claude/session-pids/"
+    echo "  Source project dir: $source_project_dir"
+    exit 1
+fi
+log_success "Session ID: ${session_id:0:12}..."
+
+# Copy JSONL to target project directory
+target_encoded=$(encode_claude_path "$TARGET_DIR")
+target_project_dir="${HOME}/.claude/projects/${target_encoded}"
+source_jsonl="${source_project_dir}/${session_id}.jsonl"
+
+if [[ ! -f "$source_jsonl" ]]; then
+    log_error "Session JSONL not found: $source_jsonl"
+    exit 1
+fi
+
+mkdir -p "$target_project_dir"
+cp "$source_jsonl" "$target_project_dir/"
+log_success "Transcript copied → ${target_project_dir}/"
+
+# Find tmux pane (Claude strips $TMUX_PANE, always use PID-based lookup)
+pane_target=$(find_tmux_pane "$claude_pid")
+if [[ -z "$pane_target" ]]; then
+    log_error "Could not identify tmux pane"
+    echo "  Fallback: cd '$TARGET_DIR' && claude --resume '$session_id' --fork-session"
+    exit 1
+fi
+log_success "Tmux pane: $pane_target"
+
+echo ""
+log_info "Transplanting session..."
+echo ""
+
+# Spawn detached restart daemon
+(
+    exec 0</dev/null 1>/dev/null 2>/dev/null
+
+    # Wait for Claude to exit
+    wait_count=0
+    while kill -0 "$claude_pid" 2>/dev/null; do
+        sleep 0.5
+        wait_count=$((wait_count + 1))
+        if [[ $wait_count -ge 20 ]]; then
+            break
+        fi
+    done
+    sleep 0.5
+
+    # Send restart command
+    tmux send-keys -t "$pane_target" \
+        "cd '$TARGET_DIR' && /home/token/.local/bin/claude --dangerously-skip-permissions --resume '$session_id' --fork-session" \
+        Enter
+) &
+disown
+
+# Ignore signals during shutdown
+trap '' INT HUP TERM
+
+# Kill Claude (SIGINT for graceful shutdown)
+kill -INT "$claude_pid" 2>/dev/null || true
+sleep 1.5
+
+# Double-SIGINT if still alive
+if kill -0 "$claude_pid" 2>/dev/null; then
+    kill -INT "$claude_pid" 2>/dev/null || true
+    sleep 2
+fi
+
+# Force kill as last resort
+if kill -0 "$claude_pid" 2>/dev/null; then
+    kill -KILL "$claude_pid" 2>/dev/null || true
+fi
+
+exit 0

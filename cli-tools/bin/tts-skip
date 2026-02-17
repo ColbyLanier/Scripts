@@ -1,5 +1,7 @@
 #!/bin/bash
 # Skip current TTS playback
+# TAGS: token-api
+# AUDIENCE: human
 #
 # Usage:
 #   tts-skip         Skip current TTS, queue continues

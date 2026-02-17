@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Stash - Cross-machine clipboard & file sharing via Token-API
+# TAGS: workflow
+# AUDIENCE: human
 #
 # Usage:
 #   stash                        Get clipboard → stdout

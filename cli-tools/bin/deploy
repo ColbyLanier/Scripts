@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Deploy CLI - wrapper for Claude Code deployment system
+# TAGS: deploy
+# AUDIENCE: human, agent
 #
 # Usage: deploy [service] [target] [options]
 #

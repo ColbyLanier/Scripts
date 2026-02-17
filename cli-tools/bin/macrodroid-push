@@ -1,5 +1,7 @@
 #!/bin/bash
 # macrodroid-push - Push .macro files to phone via sshp (Tailscale SSH)
+# TAGS: mobile, macrodroid
+# AUDIENCE: human, agent
 #
 # Usage:
 #   macrodroid-push <macro-file>              # Push to default location

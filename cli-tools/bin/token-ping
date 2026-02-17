@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# token-ping - Hit any Token-API endpoint from the terminal
+# TAGS: token-api
+# AUDIENCE: human, agent
 """Hit any Token-API endpoint from the terminal.
 
 Usage:

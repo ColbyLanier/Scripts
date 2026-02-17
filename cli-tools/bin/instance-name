@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Instance Name - Rename current session in Token-API registry
+# TAGS: instance
+# AUDIENCE: agent
 #
 # Usage: instance-name <name> [--id <instance-id>]
 #

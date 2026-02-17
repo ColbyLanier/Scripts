@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# macrodroid-gen - Generate MacroDroid .macro files from YAML/JSON specs
+# TAGS: mobile, macrodroid
+# AUDIENCE: human, agent
 """
 macrodroid-gen - Generate MacroDroid .macro files from YAML/JSON specs
 

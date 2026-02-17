@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
 # Query Cloud SQL databases
+# TAGS: db
+# AUDIENCE: human, agent
 set -euo pipefail
 exec uv run --project "$HOME/Scripts/cli-tools" python -m cli_tools.db_query.cli "$@"

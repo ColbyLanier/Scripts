@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # token-restart - Multi-device restart orchestrator
+# TAGS: token-api
+# AUDIENCE: human, agent
 #
 # Usage:
 #   token-restart              # Full restart: git push, Mac, WSL, phone TUI

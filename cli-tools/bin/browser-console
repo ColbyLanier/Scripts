@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# browser-console - Browser Console Capture Tool
+# TAGS: system
+# AUDIENCE: human, agent
 """
 Browser Console Capture Tool
 

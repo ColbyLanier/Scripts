@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# instance-stop - Stop a Claude instance by name or ID
+# TAGS: instance
+# AUDIENCE: agent
 """Stop a Claude instance by name or ID.
 
 Usage:

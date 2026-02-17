@@ -1,5 +1,7 @@
 #!/bin/bash
 # macrodroid-state - Fetch current MacroDroid state from phone
+# TAGS: mobile, macrodroid
+# AUDIENCE: human, agent
 #
 # Usage:
 #   macrodroid-state              # Pull latest export and show summary

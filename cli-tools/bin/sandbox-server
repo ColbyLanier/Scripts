@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Sandbox Server - Start the LangGraph sandbox server
+# TAGS: system
+# AUDIENCE: agent
 #
 # Usage: sandbox-server [options]
 #

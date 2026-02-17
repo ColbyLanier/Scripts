@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# timer-mode - Switch timer mode from the command line
+# TAGS: token-api
+# AUDIENCE: human, agent
 """Switch timer mode from the command line.
 
 Usage:

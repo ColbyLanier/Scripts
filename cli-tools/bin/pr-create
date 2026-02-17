@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # PR Create with Review Polling
+# TAGS: git, pr, workflow
+# AUDIENCE: human, agent
 #
 # Creates a pull request and waits for Greptile/Bugbot reviews to complete,
 # then outputs the review comments for the caller to address.

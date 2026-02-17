@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# timer-status - Quick timer status display
+# TAGS: token-api
+# AUDIENCE: human, agent
 """Quick timer status display.
 
 Usage:

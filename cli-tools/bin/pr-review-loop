@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # PR Review Loop
+# TAGS: git, pr
+# AUDIENCE: agent
 #
 # Automates the "push, request re-review, wait for results" cycle after
 # fixing PR review comments. Companion to pr-create.

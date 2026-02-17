@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Test CLI - wrapper for Claude Code testing system
+# TAGS: workflow
+# AUDIENCE: human, agent
 #
 # Usage: test [input] [options]
 #

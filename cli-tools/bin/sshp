@@ -1,5 +1,7 @@
 #!/bin/bash
 # sshp - SSH to phone (Termux via Tailscale)
+# TAGS: mobile
+# AUDIENCE: human
 # Usage: sshp [command] - runs command and exits, or starts interactive session
 
 set -e
