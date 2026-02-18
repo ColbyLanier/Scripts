@@ -1,0 +1,40 @@
+#!/bin/bash
+# token-voices - List available TTS voices from Token API
+
+API_URL="${API_URL:-http://localhost:7777}"
+
+case "${1:-list}" in
+  list|--list|-l)
+    echo "Available TTS Voices:"
+    echo ""
+    curl -s "${API_URL}/api/voices" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+print('Primary Voices:')
+for v in data.get('voices', []):
+    if not v.get('fallback'):
+        print(f\"  {v['short_name']:12} → macOS: {v['mac_voice']:8} (profile: {v['profile_name']})\")
+print()
+print('Fallback Voices:')
+for v in data.get('voices', []):
+    if v.get('fallback'):
+        print(f\"  {v['short_name']:12} → macOS: {v['mac_voice']:8}\")
+"
+    ;;
+  --json|-j)
+    curl -s "${API_URL}/api/voices"
+    ;;
+  --help|-h|help)
+    echo "Usage: token-voices [command]"
+    echo ""
+    echo "Commands:"
+    echo "  list, --list, -l   List voices with macOS equivalents (default)"
+    echo "  --json, -j        Output raw JSON"
+    echo "  --help, -h        Show this help"
+    ;;
+  *)
+    echo "Unknown command: $1"
+    echo "Run token-voices --help for usage"
+    exit 1
+    ;;
+esac
