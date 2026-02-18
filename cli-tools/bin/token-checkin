@@ -1,0 +1,67 @@
+#!/bin/bash
+# Token Check-in CLI - Interact with Token API check-in system
+# Usage: token-checkin [status|submit] [options]
+
+API="http://localhost:7777"
+
+case "${1:-status}" in
+    status)
+        curl -s "$API/api/checkin/status" | jq '.'
+        ;;
+    today)
+        curl -s "$API/api/checkin/today" | jq '.'
+        ;;
+    submit)
+        TYPE="${2:-}"
+        if [[ -z "$TYPE" ]]; then
+            echo "Usage: token-checkin submit <type> [energy] [focus] [mood] [plan]"
+            echo "Types: morning_start, mid_morning, decision_point, afternoon, afternoon_check"
+            exit 1
+        fi
+        ENERGY="${3:-}"
+        FOCUS="${4:-}"
+        MOOD="${5:-}"
+        PLAN="${6:-}"
+        
+        # Build JSON payload
+        PAYLOAD="{\"type\":\"$TYPE\""
+        [[ -n "$ENERGY" ]] && PAYLOAD="$PAYLOAD,\"energy\":$ENERGY"
+        [[ -n "$FOCUS" ]] && PAYLOAD="$PAYLOAD,\"focus\":$FOCUS"
+        [[ -n "$MOOD" ]] && PAYLOAD="$PAYLOAD,\"mood\":\"$MOOD\""
+        [[ -n "$PLAN" ]] && PAYLOAD="$PAYLOAD,\"plan\":\"$PLAN\""
+        PAYLOAD="$PAYLOAD}"
+        
+        curl -s -X POST "$API/api/checkin/submit" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" | jq '.'
+        ;;
+    trigger)
+        TYPE="${2:-}"
+        if [[ -z "$TYPE" ]]; then
+            echo "Usage: token-checkin trigger <type>"
+            exit 1
+        fi
+        curl -s -X POST "$API/api/checkin/trigger/$TYPE" | jq '.'
+        ;;
+    help|--help|-h)
+        echo "Token Check-in CLI"
+        echo ""
+        echo "Usage: token-checkin <command> [options]"
+        echo ""
+        echo "Commands:"
+        echo "  status           Show check-in status (pending, completed, next)"
+        echo "  today            Show today's check-ins"
+        echo "  submit <type>    Submit a check-in"
+        echo "  trigger <type>   Trigger a check-in prompt"
+        echo ""
+        echo "Examples:"
+        echo "  token-checkin status"
+        echo "  token-checkin submit morning_start 8 9 \"focused\" \"Finish API docs\""
+        echo "  token-checkin trigger afternoon"
+        ;;
+    *)
+        echo "Unknown command: $1"
+        echo "Run 'token-checkin help' for usage"
+        exit 1
+        ;;
+esac
