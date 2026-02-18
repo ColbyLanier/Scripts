@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# discord-send - Send Discord message and refresh context cache
+# TAGS: claw, discord
+# AUDIENCE: agent, human
+#
+# Usage: discord-send --target <channel_id> --message "text" [--channel discord] [--dry-run] [...]
+# Thin wrapper around `openclaw message send` that refreshes discord-recent.md after sending.
+
+set -euo pipefail
+
+# Pass all args to openclaw message send (channel discord is the default)
+openclaw message send --channel discord "$@"
+
+# Refresh context in background (only if not a dry-run)
+DRY=0
+for arg in "$@"; do
+  [[ "$arg" == "--dry-run" ]] && DRY=1
+done
+
+if [[ "$DRY" -eq 0 ]]; then
+  discord-context --limit 10 >/dev/null 2>&1 &
+fi
