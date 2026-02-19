@@ -2175,19 +2175,27 @@ async def get_instance_todos(instance_id: str):
 
 
 @app.get("/api/instances", response_model=List[dict])
-async def list_instances(status: Optional[str] = None):
-    """List all instances, optionally filtered by status."""
+async def list_instances(status: Optional[str] = None, sort: Optional[str] = None):
+    """List all instances, optionally filtered by status and sorted."""
+    order_clauses = {
+        "status": "status ASC, last_activity DESC",
+        "recent_activity": "last_activity DESC",
+        "recent_stopped": "stopped_at DESC NULLS LAST, last_activity DESC",
+        "created": "registered_at DESC",
+    }
+    order_by = order_clauses.get(sort, "registered_at DESC")
+
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
 
         if status:
             cursor = await db.execute(
-                "SELECT * FROM claude_instances WHERE status = ? ORDER BY registered_at DESC",
+                f"SELECT * FROM claude_instances WHERE status = ? ORDER BY {order_by}",
                 (status,)
             )
         else:
             cursor = await db.execute(
-                "SELECT * FROM claude_instances ORDER BY registered_at DESC"
+                f"SELECT * FROM claude_instances ORDER BY {order_by}"
             )
 
         rows = await cursor.fetchall()
@@ -4019,6 +4027,33 @@ async def log_debug_event(request: LogEventRequest):
     return {"status": "logged", "event_type": request.event_type}
 
 
+@app.get("/api/events/recent")
+async def get_recent_events(limit: int = 10):
+    """Get recent events with instance name data (LEFT JOIN)."""
+    limit = min(limit, 100)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT e.*, ci.tab_name as instance_tab_name, ci.working_dir as instance_working_dir
+            FROM events e
+            LEFT JOIN claude_instances ci ON e.instance_id = ci.id
+            ORDER BY e.created_at DESC
+            LIMIT ?
+        """, (limit,))
+        rows = await cursor.fetchall()
+
+        events = []
+        for row in rows:
+            event = dict(row)
+            if event.get("details"):
+                try:
+                    event["details"] = json.loads(event["details"])
+                except Exception:
+                    pass
+            events.append(event)
+        return events
+
+
 # Device Endpoints
 @app.get("/api/devices")
 async def list_devices():
@@ -4562,6 +4597,177 @@ async def get_task_history(task_id: str, limit: int = 20):
             ))
 
         return result
+
+
+# ============ Cron & Heartbeat Endpoints ============
+# Expose Mac-local data (openclaw cron, log files) for remote TUI access
+
+OPENCLAW_WORKSPACE = Path.home() / ".openclaw" / "workspace"
+HEARTBEAT_LOG_PATH = OPENCLAW_WORKSPACE / "memory" / "heartbeat_log.md"
+WATCHDOG_LOG_PATH = OPENCLAW_WORKSPACE / "memory" / "watchdog_log.md"
+HEARTBEAT_STATE_PATH = OPENCLAW_WORKSPACE / "memory" / "heartbeat-state.json"
+CRON_RUNS_DIR = Path.home() / ".openclaw" / "cron" / "runs"
+HEARTBEAT_INTERVAL_SECONDS = 15 * 60  # 15 minutes
+
+
+@app.get("/api/cron/jobs")
+async def list_cron_jobs():
+    """List openclaw cron jobs (wraps `openclaw cron list --json`)."""
+    try:
+        result = subprocess.run(
+            ["openclaw", "cron", "list", "--json"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            parsed = json.loads(result.stdout)
+            if isinstance(parsed, list):
+                return {"jobs": parsed}
+            elif isinstance(parsed, dict) and isinstance(parsed.get("jobs"), list):
+                return parsed
+            return {"jobs": []}
+        return {"jobs": []}
+    except Exception:
+        return {"jobs": []}
+
+
+@app.get("/api/cron/jobs/{job_id}/runs")
+async def get_cron_job_runs(job_id: str, limit: int = 5):
+    """Get recent run history for a cron job from its JSONL log."""
+    run_file = CRON_RUNS_DIR / f"{job_id}.jsonl"
+    if not run_file.exists():
+        return {"runs": []}
+    try:
+        entries = []
+        for line in run_file.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            entries.append(json.loads(line))
+        # Most recent first, take last N
+        return {"runs": entries[-limit:][::-1]}
+    except Exception:
+        return {"runs": []}
+
+
+def _parse_heartbeat_entries(max_entries: int = 20) -> list:
+    """Parse structured entries from heartbeat_log.md."""
+    entries = []
+    try:
+        lines = HEARTBEAT_LOG_PATH.read_text().splitlines()
+        for line in lines:
+            line = line.strip()
+            if not line.startswith("- ["):
+                continue
+            bracket_end = line.find("]", 3)
+            if bracket_end == -1:
+                continue
+            timestamp = line[3:bracket_end]
+            body = line[bracket_end + 1:].strip()
+
+            entry_type = "idle"
+            detail = body
+            if body.upper().startswith("ACTION:"):
+                entry_type = "action"
+                detail = body[7:].strip()
+            elif body.upper().startswith("IDLE:"):
+                entry_type = "idle"
+                detail = body[5:].strip()
+            elif "heartbeat_ok" in body.lower():
+                entry_type = "idle"
+                detail = body
+
+            entries.append({"timestamp": timestamp, "type": entry_type, "detail": detail})
+    except Exception:
+        pass
+    return entries[-max_entries:]
+
+
+@app.get("/api/system/heartbeat")
+async def get_heartbeat_status():
+    """Get combined heartbeat status from log, watchdog, and state files."""
+    entries = _parse_heartbeat_entries(20)
+
+    # Count consecutive idle from end
+    consecutive_idle = 0
+    for entry in reversed(entries):
+        if entry["type"] == "idle":
+            consecutive_idle += 1
+        else:
+            break
+
+    # Count action vs idle in recent entries for activity ratio
+    recent = entries[-10:] if len(entries) >= 10 else entries
+    action_count = sum(1 for e in recent if e["type"] == "action")
+    total_recent = len(recent)
+
+    # Last heartbeat time
+    last_hb_time = entries[-1]["timestamp"] if entries else None
+
+    # Parse watchdog status
+    watchdog_status = "unknown"
+    watchdog_last_check = None
+    try:
+        wdog_lines = WATCHDOG_LOG_PATH.read_text().splitlines()
+        for line in reversed(wdog_lines):
+            line = line.strip()
+            if not line.startswith("- ["):
+                continue
+            bracket_end = line.find("]", 3)
+            if bracket_end == -1:
+                continue
+            watchdog_last_check = line[3:bracket_end]
+            body = line[bracket_end + 1:].strip()
+            if "STATUS OK" in body:
+                watchdog_status = "ok"
+            elif "TIER 1" in body:
+                watchdog_status = "nudge"
+            elif "TIER 2" in body:
+                watchdog_status = "escalation"
+            elif "WATCHDOG CHECK" in body:
+                continue
+            break
+    except Exception:
+        pass
+
+    # Parse state file
+    last_task = None
+    try:
+        state = json.loads(HEARTBEAT_STATE_PATH.read_text())
+        last_task = state.get("last_task_worked")
+    except Exception:
+        pass
+
+    # Get openclaw heartbeat status
+    openclaw_status = None
+    try:
+        result = subprocess.run(
+            ["openclaw", "system", "heartbeat", "last"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            openclaw_status = json.loads(result.stdout)
+            if not isinstance(openclaw_status, dict):
+                openclaw_status = None
+    except Exception:
+        pass
+
+    # Compute last heartbeat epoch for countdown timer
+    last_hb_epoch = None
+    if openclaw_status and openclaw_status.get("ts"):
+        last_hb_epoch = openclaw_status["ts"] / 1000.0
+
+    return {
+        "entries": entries,
+        "consecutive_idle": consecutive_idle,
+        "action_count": action_count,
+        "total_recent": total_recent,
+        "last_hb_time": last_hb_time,
+        "last_hb_epoch": last_hb_epoch,
+        "watchdog_status": watchdog_status,
+        "watchdog_last_check": watchdog_last_check,
+        "last_task": last_task,
+        "openclaw_status": openclaw_status,
+    }
 
 
 # Health check

@@ -31,7 +31,6 @@ import os
 import re
 import argparse
 import json
-import sqlite3
 import subprocess
 import time
 import threading
@@ -52,20 +51,16 @@ from rich.live import Live
 from rich.text import Text
 from rich.prompt import Prompt
 from rich.highlighter import JSONHighlighter
+from dotenv import load_dotenv
 
-# API configuration — server runs on Mac Mini, reached via Tailscale
-API_URL = "http://100.95.109.23:7777"
+# Load .env from same directory as this script (TOKEN_API_URL, etc.)
+load_dotenv(Path(__file__).parent / ".env")
+
+# API configuration — reads from env, defaults to localhost (Mac)
+API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
 SERVER_PORT = 7777
 
 # Configuration
-DB_PATH = Path.home() / ".claude" / "agents.db"
-OPENCLAW_WORKSPACE = Path.home() / ".openclaw" / "workspace"
-HEARTBEAT_LOG_PATH = OPENCLAW_WORKSPACE / "memory" / "heartbeat_log.md"
-WATCHDOG_LOG_PATH = OPENCLAW_WORKSPACE / "memory" / "watchdog_log.md"
-HEARTBEAT_STATE_PATH = OPENCLAW_WORKSPACE / "memory" / "heartbeat-state.json"
-CRON_WORKER_LOG_PATH = OPENCLAW_WORKSPACE / "memory" / "cron_worker_log.md"
-SECURITY_LOG_PATH = OPENCLAW_WORKSPACE / "memory" / "security_log.md"
-CRON_RUNS_DIR = Path.home() / ".openclaw" / "cron" / "runs"
 REFRESH_INTERVAL = 2  # seconds
 
 
@@ -222,11 +217,6 @@ def check_api_health() -> tuple[bool, str | None]:
         return False, f"Health check failed: {str(e)}"
 
 
-def get_db_connection():
-    """Get a database connection."""
-    return sqlite3.connect(DB_PATH)
-
-
 def format_duration(start_time_str: str, end_time_str: str = None) -> str:
     """Format duration from start time to now or end time."""
     try:
@@ -327,29 +317,11 @@ def format_instance_name(instance: dict, max_len: int = 20) -> str:
 
 
 def get_instances():
-    """Fetch all instances from the database with current sort order."""
+    """Fetch all instances from the API with current sort order."""
     try:
-        conn = get_db_connection()
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-
-        # Build ORDER BY based on sort_mode
-        order_clauses = {
-            "status": "status ASC, last_activity DESC",
-            "recent_activity": "last_activity DESC",
-            "recent_stopped": "stopped_at DESC NULLS LAST, last_activity DESC",
-            "created": "registered_at DESC"
-        }
-        order_by = order_clauses.get(sort_mode, "status ASC, last_activity DESC")
-
-        cursor.execute(f"""
-            SELECT * FROM claude_instances
-            ORDER BY {order_by}
-        """)
-        rows = cursor.fetchall()
-        conn.close()
-
-        return [dict(row) for row in rows]
+        req = urllib.request.Request(f"{API_URL}/api/instances?sort={sort_mode}")
+        with urllib.request.urlopen(req, timeout=3) as response:
+            return json.loads(response.read().decode())
     except Exception:
         return []
 
@@ -536,32 +508,11 @@ def delete_all_instances() -> tuple[bool, int]:
 
 
 def get_recent_events(limit: int = 5):
-    """Fetch recent events from the database with instance names."""
+    """Fetch recent events from the API with instance names."""
     try:
-        conn = get_db_connection()
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            SELECT e.*, ci.tab_name as instance_tab_name, ci.working_dir as instance_working_dir
-            FROM events e
-            LEFT JOIN claude_instances ci ON e.instance_id = ci.id
-            ORDER BY e.created_at DESC
-            LIMIT ?
-        """, (limit,))
-        rows = cursor.fetchall()
-        conn.close()
-
-        events = []
-        for row in rows:
-            event = dict(row)
-            if event.get("details"):
-                try:
-                    event["details"] = json.loads(event["details"])
-                except:
-                    pass
-            events.append(event)
-        return events
+        req = urllib.request.Request(f"{API_URL}/api/events/recent?limit={limit}")
+        with urllib.request.urlopen(req, timeout=3) as response:
+            return json.loads(response.read().decode())
     except Exception:
         return []
 
@@ -1034,23 +985,12 @@ def create_mobile_cron_table(jobs: list, selected_idx: int) -> Table:
 
 
 def get_cron_run_history(job_id: str, max_runs: int = 5) -> list[dict]:
-    """Load recent run records from ~/.openclaw/cron/runs/<job_id>.jsonl.
-
-    Returns list of dicts with keys: ts, status, summary, error, durationMs
-    (most recent first).
-    """
-    run_file = CRON_RUNS_DIR / f"{job_id}.jsonl"
-    if not run_file.exists():
-        return []
+    """Fetch recent run records for a cron job from the API."""
     try:
-        entries = []
-        for line in run_file.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            entries.append(json.loads(line))
-        # Most recent first, take last N
-        return entries[-max_runs:][::-1]
+        req = urllib.request.Request(f"{API_URL}/api/cron/jobs/{job_id}/runs?limit={max_runs}")
+        with urllib.request.urlopen(req, timeout=3) as response:
+            data = json.loads(response.read().decode())
+            return data.get("runs", [])
     except Exception:
         return []
 
@@ -1699,130 +1639,23 @@ def create_server_status_panel() -> Panel:
     return Panel(content, title="API Server", border_style=border)
 
 
-def parse_heartbeat_entries(max_entries: int = 20) -> list[dict]:
-    """Parse structured entries from heartbeat_log.md."""
-    entries = []
-    try:
-        lines = HEARTBEAT_LOG_PATH.read_text().splitlines()
-        for line in lines:
-            line = line.strip()
-            if not line.startswith("- ["):
-                continue
-            # Parse: - [YYYY-MM-DD HH:MM:SS] ACTION: ... | NEXT: ...
-            # or:    - [YYYY-MM-DD HH:MM:SS] IDLE: ...
-            # or:    - [YYYY-MM-DD HH:MM:SS] heartbeat_ok ...
-            bracket_end = line.find("]", 3)
-            if bracket_end == -1:
-                continue
-            timestamp = line[3:bracket_end]
-            body = line[bracket_end + 1:].strip()
-
-            entry_type = "idle"
-            detail = body
-            if body.upper().startswith("ACTION:"):
-                entry_type = "action"
-                detail = body[7:].strip()
-            elif body.upper().startswith("IDLE:"):
-                entry_type = "idle"
-                detail = body[5:].strip()
-            elif "heartbeat_ok" in body.lower():
-                entry_type = "idle"
-                detail = body
-
-            entries.append({"timestamp": timestamp, "type": entry_type, "detail": detail})
-    except Exception:
-        pass
-    return entries[-max_entries:]
-
-
 HEARTBEAT_INTERVAL_SECONDS = 15 * 60  # 15 minutes
 
 
 def get_heartbeat_status() -> dict:
-    """Get combined heartbeat status from log, watchdog, and state files."""
-    entries = parse_heartbeat_entries(20)
-
-    # Count consecutive idle from end
-    consecutive_idle = 0
-    for entry in reversed(entries):
-        if entry["type"] == "idle":
-            consecutive_idle += 1
-        else:
-            break
-
-    # Count action vs idle in recent entries for activity ratio
-    recent = entries[-10:] if len(entries) >= 10 else entries
-    action_count = sum(1 for e in recent if e["type"] == "action")
-    total_recent = len(recent)
-
-    # Last heartbeat time
-    last_hb_time = entries[-1]["timestamp"] if entries else None
-
-    # Parse watchdog status
-    watchdog_status = "unknown"
-    watchdog_last_check = None
-    try:
-        wdog_lines = WATCHDOG_LOG_PATH.read_text().splitlines()
-        for line in reversed(wdog_lines):
-            line = line.strip()
-            if not line.startswith("- ["):
-                continue
-            bracket_end = line.find("]", 3)
-            if bracket_end == -1:
-                continue
-            watchdog_last_check = line[3:bracket_end]
-            body = line[bracket_end + 1:].strip()
-            if "STATUS OK" in body:
-                watchdog_status = "ok"
-            elif "TIER 1" in body:
-                watchdog_status = "nudge"
-            elif "TIER 2" in body:
-                watchdog_status = "escalation"
-            elif "WATCHDOG CHECK" in body:
-                continue  # Skip the CHECK line, look for the result line
-            break
-    except Exception:
-        pass
-
-    # Parse state file
-    last_task = None
-    try:
-        state = json.loads(HEARTBEAT_STATE_PATH.read_text())
-        last_task = state.get("last_task_worked")
-    except Exception:
-        pass
-
-    # Get openclaw heartbeat status
-    openclaw_status = None
-    try:
-        result = subprocess.run(
-            ["openclaw", "system", "heartbeat", "last"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            openclaw_status = json.loads(result.stdout)
-            if not isinstance(openclaw_status, dict):
-                openclaw_status = None
-    except Exception:
-        pass
-
-    # Compute last heartbeat epoch for countdown timer
-    last_hb_epoch = None
-    if openclaw_status and openclaw_status.get("ts"):
-        last_hb_epoch = openclaw_status["ts"] / 1000.0  # ms to seconds
-
-    return {
-        "entries": entries,
-        "consecutive_idle": consecutive_idle,
-        "action_count": action_count,
-        "total_recent": total_recent,
-        "last_hb_time": last_hb_time,
-        "last_hb_epoch": last_hb_epoch,
-        "watchdog_status": watchdog_status,
-        "watchdog_last_check": watchdog_last_check,
-        "last_task": last_task,
-        "openclaw_status": openclaw_status,
+    """Fetch combined heartbeat status from the API."""
+    default = {
+        "entries": [], "consecutive_idle": 0, "action_count": 0,
+        "total_recent": 0, "last_hb_time": None, "last_hb_epoch": None,
+        "watchdog_status": "unknown", "watchdog_last_check": None,
+        "last_task": None, "openclaw_status": None,
     }
+    try:
+        req = urllib.request.Request(f"{API_URL}/api/system/heartbeat")
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return json.loads(response.read().decode())
+    except Exception:
+        return default
 
 
 # Cache heartbeat data (refresh every 10 seconds, not every frame)
@@ -1960,67 +1793,24 @@ _cron_jobs_cache_time: float = 0
 
 
 def get_cached_cron_jobs() -> list:
-    """Fetch cron jobs from openclaw cron list --json, cached."""
+    """Fetch cron jobs from the API, cached."""
     global _cron_jobs_cache, _cron_jobs_cache_time
     now = time.time()
     if now - _cron_jobs_cache_time > 15:
         try:
-            result = subprocess.run(
-                ["openclaw", "cron", "list", "--json"],
-                capture_output=True, text=True, timeout=10
-            )
-            if result.returncode == 0:
-                parsed = json.loads(result.stdout)
-                if isinstance(parsed, list):
-                    _cron_jobs_cache = parsed
-                elif isinstance(parsed, dict) and isinstance(parsed.get("jobs"), list):
-                    _cron_jobs_cache = parsed["jobs"]
+            req = urllib.request.Request(f"{API_URL}/api/cron/jobs")
+            with urllib.request.urlopen(req, timeout=5) as response:
+                data = json.loads(response.read().decode())
+                if isinstance(data, dict) and isinstance(data.get("jobs"), list):
+                    _cron_jobs_cache = data["jobs"]
+                elif isinstance(data, list):
+                    _cron_jobs_cache = data
                 else:
                     _cron_jobs_cache = []
-            else:
-                _cron_jobs_cache = []
         except Exception:
             _cron_jobs_cache = []
         _cron_jobs_cache_time = now
     return _cron_jobs_cache
-
-
-def parse_log_entries(log_path: Path, max_entries: int = 5) -> list[dict]:
-    """Parse structured entries from a cron worker/security log file."""
-    entries = []
-    try:
-        lines = log_path.read_text().splitlines()
-        for line in lines:
-            line = line.strip()
-            if not line.startswith("- ["):
-                continue
-            bracket_end = line.find("]", 3)
-            if bracket_end == -1:
-                continue
-            timestamp = line[3:bracket_end]
-            body = line[bracket_end + 1:].strip()
-
-            entry_type = "info"
-            if body.upper().startswith("ACTION:"):
-                entry_type = "action"
-            elif body.upper().startswith("IDLE:"):
-                entry_type = "idle"
-            elif body.upper().startswith("ALERT:"):
-                entry_type = "alert"
-            elif body.upper().startswith("CHECK:"):
-                entry_type = "check"
-
-            entries.append({"timestamp": timestamp, "type": entry_type, "body": body})
-    except Exception:
-        pass
-    return entries[-max_entries:]
-
-
-def get_last_log_entry(log_path: Path) -> Optional[dict]:
-    """Get the most recent entry from a log file."""
-    entries = parse_log_entries(log_path, max_entries=1)
-    return entries[-1] if entries else None
-
 
 
 def create_info_panel(max_lines: int = 8) -> Panel:
@@ -2525,12 +2315,7 @@ def main():
     api_healthy, api_error_message = check_api_health()
     if not api_healthy:
         console.print(f"[yellow]Warning:[/yellow] {api_error_message}")
-
-    # Check database
-    if not DB_PATH.exists():
-        console.print(f"[red]Error:[/red] Database not found at {DB_PATH}")
-        console.print("Run the Token-API server first to initialize the database.")
-        sys.exit(1)
+        console.print("[dim]TUI will retry API calls — data panels may be empty until server is reachable.[/dim]")
 
     console.print("[dim]Controls: jk=nav, gG=top/btm, []=table, h/l=page, Enter=open, r=rename, f=filter, s=stop, d=del, R=restart, q=quit[/dim]\n")
 

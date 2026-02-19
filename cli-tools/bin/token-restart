@@ -79,6 +79,13 @@ EOF
 remote_restart() {
     echo -e "${BOLD}=== Token Restart (remote → Mac) ===${NC}"
     echo ""
+
+    # Push local changes first so Mac can pull them
+    if [[ "${NO_PUSH}" != true ]]; then
+        git_push || true
+        echo ""
+    fi
+
     echo -e "${BLUE}→${NC} Proxying restart to Mac ($MAC_HOST)..."
 
     # Pass through relevant flags
@@ -338,8 +345,10 @@ full_restart() {
     echo -e "${BOLD}=== Token Restart ===${NC}"
     echo ""
 
-    # 1. Git push
+    # 1. Git sync (pull remote changes, then push local)
     if [[ "$no_push" == false ]]; then
+        echo -e "${BLUE}→${NC} Syncing git repo..."
+        git -C ~/Scripts pull --ff-only 2>/dev/null || true
         git_push || true
         echo ""
     fi

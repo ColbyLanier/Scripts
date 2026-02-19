@@ -1,6 +1,6 @@
 # Windows Startup Audit
 
-> Last updated: 2026-02-17
+> Last updated: 2026-02-19
 
 Central reference for all custom startup automations on this machine.
 Everything runs at logon unless noted otherwise.
@@ -11,7 +11,7 @@ Everything runs at logon unless noted otherwise.
 
 | # | Task Name | RunLevel | Delay | What It Does |
 |---|-----------|----------|-------|-------------|
-| 1 | **WSL Keep-Alive** | Limited | 5s | `wsl.exe -d Ubuntu -- bash -lc "exec sleep infinity"` — keeps WSL alive for SSH (Tailscale) and systemd services even when no terminals are open |
+| 1 | ~~**WSL Keep-Alive**~~ | Limited | 5s | **DISABLED 2026-02-19** — `wsl.exe -d Ubuntu -- bash -lc "exec sleep infinity"` — kept WSL alive but opened a visible cmd.exe/conhost window. Redundant now that MonitorLauncher (task #9) keeps WSL running via Windows Terminal |
 | 2 | **Deskflow** | Limited | 3s | Starts Deskflow KVM minimized, waits 10s, then curls Mac token-api (`POST http://100.95.109.23:7777/api/kvm/start`) to signal KVM is ready |
 | 3 | **ahk_init** | Limited | — | Runs `script-compiler.ahk` — the main AHK suite (see AHK Architecture below) |
 | 4 | **ahk_admin** | Highest | — | Runs `ring-remap.ahk` — Bluetooth ring button remapping via AutoHotInterception (needs admin for driver access) |
@@ -19,6 +19,7 @@ Everything runs at logon unless noted otherwise.
 | 6 | **fast_task** | Highest | — | Starts Fast! app (`C:\Program Files (x86)\Fast!\fast!.exe`) |
 | 7 | **Dual Monitor Tools** | Limited | — | Starts DMT.exe for multi-monitor management |
 | 8 | **Autorun for colby** | Limited | 3s | Starts PowerToys |
+| 9 | **MonitorLauncher** | Limited | 15s | Runs `monitor-launcher.ahk` — launches Windows Terminal with `monitor` TUI on leftmost monitor |
 
 ### On-Demand Only (No Logon Trigger)
 
@@ -38,7 +39,7 @@ These have no triggers — invoked manually via `schtasks /Run /TN "<name>"` or 
 
 | Service | State | What It Does |
 |---------|-------|-------------|
-| **token-satellite.service** | enabled | FastAPI on `:7777` — TTS, enforcement, process control, headless toggle. Auto-starts when WSL is running (depends on `WSL Keep-Alive` task above) |
+| **token-satellite.service** | enabled | FastAPI on `:7777` — TTS, enforcement, process control, headless toggle. Auto-starts when WSL is running (depends on `MonitorLauncher` keeping WSL alive) |
 | **mem-watchdog.service** | static (timer disabled) | One-shot memory check via `mem-watchdog` CLI tool. Timer currently inactive |
 
 ### System Services (Stale / Disabled)
@@ -62,6 +63,7 @@ script-compiler.ahk          <- ahk_init task (main entry point)
 
 ring-remap.ahk               <- ahk_admin task (standalone, needs admin)
 startup-launcher.ahk          <- AHK startup mode task (standalone)
+monitor-launcher.ahk          <- MonitorLauncher task (standalone, 15s delay)
 ```
 
 > **Note**: Old copies exist at `Documents/Obsidian/Personal-ENV/Scripts/ahk/` — these are superseded by `~/Scripts/ahk/` but kept for historical reference in the Obsidian vault.
@@ -78,10 +80,10 @@ Not managed by us. Includes: Steam, Discord, Docker Desktop, Spotify, Figma Agen
 
 1. Windows logon
 2. Task Scheduler fires all logon-triggered tasks (with respective delays)
-3. **WSL Keep-Alive** (5s delay) starts WSL Ubuntu, which triggers systemd
-4. systemd starts **token-satellite** on `:7777`
-5. **Deskflow** (3s delay) starts KVM, then notifies Mac token-api after 10s
-6. AHK scripts, PowerToys, DMT, Fast! all start in parallel
+3. **Deskflow** (3s delay) starts KVM, then notifies Mac token-api after 10s
+4. AHK scripts, PowerToys, DMT, Fast! all start in parallel
+5. **MonitorLauncher** (15s delay) opens Windows Terminal with `monitor` TUI on leftmost screen — this starts WSL Ubuntu and triggers systemd
+6. systemd starts **token-satellite** on `:7777`
 
 ---
 
@@ -124,3 +126,4 @@ systemctl --user enable --now my-service.service
 |------|------|--------|
 | **TokenAPI** (Task Scheduler) | 2026-02-17 | token-api moved to Mac Mini; token-satellite replaced it on this machine |
 | **Deskflow.bat** (Startup Folder) | 2026-02-17 | Migrated to Task Scheduler for consistency |
+| **WSL Keep-Alive** (Task Scheduler) | 2026-02-19 | Disabled (not deleted) — opened visible cmd.exe/conhost window on boot. Redundant now that MonitorLauncher keeps WSL alive via Windows Terminal |
