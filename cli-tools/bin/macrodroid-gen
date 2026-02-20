@@ -636,18 +636,26 @@ def build_wait_action(config):
 @action_builder("shell")
 def build_shell_action(config):
     """Shell Script action."""
-    return {
-        "m_command": config.get("command", ""),
-        "m_useRoot": config.get("root", False),
-        "m_outputVariable": config.get("output_var", ""),
-        "m_blockExecution": config.get("block", True),
+    result = {
+        "m_script": config.get("command", ""),
+        "m_nonRoot": not config.get("root", False),
+        "blockNextAction": config.get("block", True),
+        "timeoutSeconds": config.get("timeout_seconds", 600),
+        "useHelper": config.get("use_helper", False),
+        "m_variableToSaveResponse": None,
+        "varDictionaryKeys": None,
         "disableLogging": config.get("disable_logging", False),
         "m_SIGUID": generate_guid(),
-        "m_classType": "ShellCommandAction",
+        "m_classType": "ShellScriptAction",
         "m_constraintList": [],
         "m_isDisabled": config.get("disabled", False),
         "m_isOrCondition": False
     }
+    # If output_var specified, build variable reference
+    output_var = config.get("output_var", "")
+    if output_var:
+        result["m_variableToSaveResponse"] = build_local_variable({"name": output_var, "type": "string"})
+    return result
 
 
 def _build_termux_tasker_bundle(executable, arguments=None, workdir=None, stdin=None,

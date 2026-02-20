@@ -1,8 +1,6 @@
-# YouTube Open Tracker with Fallback and Reconnection
+# YouTube Open Tracker with Fallback + Logging
 # Reports to /phone when YouTube is opened
-# Clears background flag, sends open event
-# If server unreachable: triggers local enforcement
-# If server reconnected: disables local fallback
+# If server unreachable, triggers local enforcement
 
 name: "YouTube Open"
 category: "Telemetry"
@@ -12,12 +10,7 @@ enabled: true
 variables:
   - name: response_code
     type: integer
-    value: 200
-
-global_variables:
-  - name: yt_bg
-    type: boolean
-    value: false
+    value: 0
 
 triggers:
   - type: app_launched
@@ -26,14 +19,11 @@ triggers:
     launched: true
 
 actions:
-  # Clear background flag — YouTube is now in foreground
-  - type: set_variable
-    name: yt_bg
-    var_type: boolean
-    value: false
-    local: false
+  # Log: macro triggered
+  - type: shell
+    command: 'mkdir -p /storage/emulated/0/MacroDroid/logs && echo "{system_time} INFO youtube-open TRIGGERED" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false
 
-  # Report open to server
   - type: http_request
     url: "http://100.95.109.23:7777/phone"
     method: POST
@@ -42,6 +32,11 @@ actions:
     code_var: "response_code"
     block_next: true
     timeout: 5
+
+  # Log: HTTP result
+  - type: shell
+    command: 'echo "{system_time} INFO youtube-open HTTP_RESULT code={lv=response_code}" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false
 
   # If server unreachable (code != 200), trigger local fallback
   - type: if
@@ -53,20 +48,17 @@ actions:
         value: 200
         local_var: true
 
+  # Log: fallback activated
+  - type: shell
+    command: 'echo "{system_time} WARN youtube-open FALLBACK server_unreachable" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false
+
+  # Force run local management for this app
+  - type: run_macro
+    macro_name: "Youtube management"
+
+  # Enable all local fallbacks for future events
   - type: run_macro
     macro_name: "Enable Local Fallback"
-
-  # Else if server just came back (Connection global matches response_code)
-  - type: else_if
-    conditions:
-      - type: variable
-        variable: "Connection"
-        var_type: boolean
-        comparison: equals
-        value: false
-        local_var: false
-
-  - type: run_macro
-    macro_name: "Disable Local Fallback"
 
   - type: end_if

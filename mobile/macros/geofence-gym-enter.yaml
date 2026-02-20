@@ -1,5 +1,5 @@
-# Geofence Gym Enter Telemetry
-# Reports when entering the gym - pure location tracking
+# Geofence Gym Enter Telemetry + Logging
+# Reports when entering the gym
 
 name: "Geofence Gym Enter"
 category: "Geofence"
@@ -12,6 +12,11 @@ triggers:
     enter: true
 
 actions:
+  # Log: macro triggered
+  - type: shell
+    command: 'mkdir -p /storage/emulated/0/MacroDroid/logs && echo "{system_time} INFO geofence-gym ENTER" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false
+
   - type: http_request
     url: "http://100.95.109.23:7777/phone"
     method: POST

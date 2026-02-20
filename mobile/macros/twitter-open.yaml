@@ -1,4 +1,4 @@
-# Twitter Open Tracker with Fallback
+# Twitter Open Tracker with Fallback + Logging
 # Reports to /phone when Twitter is opened
 # If server unreachable, triggers local enforcement
 
@@ -19,6 +19,11 @@ triggers:
     launched: true
 
 actions:
+  # Log: macro triggered
+  - type: shell
+    command: 'mkdir -p /storage/emulated/0/MacroDroid/logs && echo "{system_time} INFO twitter-open TRIGGERED" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false
+
   - type: http_request
     url: "http://100.95.109.23:7777/phone"
     method: POST
@@ -27,6 +32,11 @@ actions:
     code_var: "response_code"
     block_next: true
     timeout: 5
+
+  # Log: HTTP result
+  - type: shell
+    command: 'echo "{system_time} INFO twitter-open HTTP_RESULT code={lv=response_code}" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false
 
   # If server unreachable (code != 200), trigger local fallback
   - type: if
@@ -37,6 +47,11 @@ actions:
         comparison: not_equals
         value: 200
         local_var: true
+
+  # Log: fallback activated
+  - type: shell
+    command: 'echo "{system_time} WARN twitter-open FALLBACK server_unreachable" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false
 
   # Force run local management for this app
   - type: run_macro

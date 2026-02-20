@@ -1,4 +1,4 @@
-# Geofence Home Enter Telemetry
+# Geofence Home Enter Telemetry + Logging
 # Reports when arriving home
 
 name: "Geofence Home Enter"
@@ -12,6 +12,11 @@ triggers:
     enter: true
 
 actions:
+  # Log: macro triggered
+  - type: shell
+    command: 'mkdir -p /storage/emulated/0/MacroDroid/logs && echo "{system_time} INFO geofence-home ENTER" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false
+
   - type: http_request
     url: "http://100.95.109.23:7777/phone"
     method: POST

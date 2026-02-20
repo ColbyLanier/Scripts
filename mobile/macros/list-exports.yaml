@@ -20,7 +20,7 @@ triggers:
 
 actions:
   - type: shell
-    command: "ls -la /data/data/com.termux/files/home/macros/*.mdr /data/data/com.termux/files/home/macros/*.macro 2>/dev/null || echo 'No exports found'"
+    command: "ls -la ~/macros/*.mdr ~/macros/*.macro 2>/dev/null || echo 'No exports found'"
     output_var: "file_list"
 
   - type: http_response

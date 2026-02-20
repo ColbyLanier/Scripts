@@ -4,14 +4,14 @@
 # AUDIENCE: human, agent
 #
 # Usage:
-#   token-restart              # Full restart: git push, Mac, WSL, phone TUI
+#   token-restart              # Full restart: scripts-sync, Mac, WSL, phone TUI
 #   token-restart --mac-only   # Mac token-api only (legacy behavior)
 #   token-restart --wsl-only   # WSL satellite only
 #   token-restart --tui-only   # Signal TUI restarts only (no server restart)
 #   token-restart --kill       # Just kill Mac server, don't restart
 #   token-restart --watch      # Restart and monitor startup logs
 #   token-restart --status     # All-device status
-#   token-restart --no-push    # Skip git push
+#   token-restart --no-push    # Skip scripts-sync
 #
 # When run from WSL or phone, proxies the restart to Mac via HTTP.
 
@@ -47,20 +47,20 @@ show_help() {
 token-restart - Multi-device restart orchestrator
 
 Usage:
-    token-restart              Full restart (git push → Mac → WSL → phone)
+    token-restart              Full restart (scripts-sync → Mac → WSL → phone)
     token-restart --mac-only   Mac token-api only (legacy)
     token-restart --wsl-only   WSL satellite only
     token-restart --tui-only   Signal TUI restarts only (no server restart)
     token-restart --kill       Kill Mac process (launchd auto-restarts)
     token-restart --watch      Restart and monitor startup logs
     token-restart --status     All-device status
-    token-restart --no-push    Skip git push step
+    token-restart --no-push    Skip scripts-sync step
     token-restart -h, --help   Show this help
 
     When run from a non-Mac device, proxies to Mac via HTTP.
 
 Flow:
-    1. git push (Mac → origin)
+    1. scripts-sync push (commit+push local, pull on remote)
     2. Restart Mac token-api (launchctl) + write Mac TUI signals
     3. Restart WSL satellite (HTTP → git pull + restart, SSH fallback)
     4. Signal phone TUI restart (SSH)
@@ -80,9 +80,9 @@ remote_restart() {
     echo -e "${BOLD}=== Token Restart (remote → Mac) ===${NC}"
     echo ""
 
-    # Push local changes first so Mac can pull them
+    # Sync local changes so Mac can pull them
     if [[ "${NO_PUSH}" != true ]]; then
-        git_push || true
+        scripts_sync --no-pull || true
         echo ""
     fi
 
@@ -126,15 +126,18 @@ remote_status() {
     }
 }
 
-# ============ Git ============
+# ============ Git Sync ============
 
-git_push() {
-    echo -e "${BLUE}→${NC} Pushing code to origin..."
-    if git -C ~/Scripts push --quiet 2>/dev/null; then
-        echo -e "  ${GREEN}✓${NC} Push succeeded"
+# Delegate git sync to scripts-sync
+# Args: [extra_flags...]  e.g. "--no-pull"
+scripts_sync() {
+    local flags=("push" "--message" "token-restart: pre-restart sync")
+    flags+=("$@")
+    echo -e "${BLUE}→${NC} Syncing code via scripts-sync..."
+    if scripts-sync "${flags[@]}" 2>&1 | sed 's/^/  /'; then
         return 0
     else
-        echo -e "  ${YELLOW}⚠${NC} Push failed (WSL will get stale code)"
+        echo -e "  ${YELLOW}⚠${NC} scripts-sync failed (WSL may get stale code)"
         return 1
     fi
 }
@@ -345,11 +348,9 @@ full_restart() {
     echo -e "${BOLD}=== Token Restart ===${NC}"
     echo ""
 
-    # 1. Git sync (pull remote changes, then push local)
+    # 1. Git sync (commit+push local, pull on remote)
     if [[ "$no_push" == false ]]; then
-        echo -e "${BLUE}→${NC} Syncing git repo..."
-        git -C ~/Scripts pull --ff-only 2>/dev/null || true
-        git_push || true
+        scripts_sync || true
         echo ""
     fi
 

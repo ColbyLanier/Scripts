@@ -4,9 +4,10 @@ Current state of macros deployed to the phone.
 
 ## Summary
 
-- **Total Macros:** 33
-- **Enabled:** 31
+- **Total Macros:** 35
+- **Enabled:** 33
 - **Disabled:** 2 (Twitter Management, Games Management - local fallback only)
+- **Logging:** All telemetry/geofence/enforce/heartbeat macros log to `/storage/emulated/0/MacroDroid/logs/telemetry.log`
 
 ## Global Variables
 
@@ -86,11 +87,41 @@ Accepts `?action=disable&app=<name>` or `?action=enable&app=<name>`:
 | List Exports API | `/list-exports` | Export .mdr and respond |
 | Pavlok Endpoint | `/pavlok` | Trigger Pavlok stimulus |
 
-## System (1 macro)
+## System (3 macros)
 
 | Macro | Trigger | Purpose |
 |-------|---------|---------|
 | Boot Start SSHD | Device boot | Start Termux sshd via Termux:Tasker plugin |
+| Log Viewer | HTTP `/logs` | Serve last 200 lines of telemetry log |
+| Log Rotate | Daily 3 AM | Trim telemetry.log to 1000 lines if >2000 |
+
+## Telemetry Logging
+
+All telemetry, geofence, enforce, and heartbeat macros append structured log lines via shell actions.
+
+**Log file:** `/storage/emulated/0/MacroDroid/logs/telemetry.log`
+
+**Format:** `<unix_epoch> <LEVEL> <macro-name> <EVENT> [detail]`
+
+**Examples:**
+```
+1740067200 INFO twitter-open TRIGGERED
+1740067200 INFO twitter-open HTTP_RESULT code=200
+1740067200 WARN twitter-open FALLBACK server_unreachable
+1740067200 INFO enforce RECEIVED action=disable app=twitter
+1740067200 INFO heartbeat PING
+1740067200 INFO geofence-home ENTER
+1740067200 INFO log-rotate ROTATED from=2500 to=1000
+```
+
+**Retrieval:**
+```bash
+# Via SSH
+sshp "tail -50 /storage/emulated/0/MacroDroid/logs/telemetry.log"
+
+# Via HTTP endpoint (last 200 lines)
+curl http://<phone-ip>:7777/logs
+```
 
 ## Music & Audio (2 macros)
 
@@ -124,7 +155,7 @@ Accepts `?action=disable&app=<name>` or `?action=enable&app=<name>`:
 
 ## YAML Sources
 
-All macro specs are in `/home/token/Scripts/mobile/macros/*.yaml`:
+All macro specs are in `~/Scripts/mobile/macros/*.yaml` (Mac) or `/home/token/Scripts/mobile/macros/*.yaml` (WSL):
 - `twitter-open.yaml`, `twitter-close.yaml`
 - `youtube-open.yaml`, `youtube-close.yaml`
 - `youtube-play.yaml`, `youtube-pause.yaml`
@@ -136,3 +167,4 @@ All macro specs are in `/home/token/Scripts/mobile/macros/*.yaml`:
 - `enable-local-fallback.yaml`, `disable-local-fallback.yaml`
 - `list-exports.yaml`
 - `heartbeat.yaml`, `pavlok.yaml`, `boot-sshd.yaml`
+- `log-viewer.yaml`, `log-rotate.yaml`

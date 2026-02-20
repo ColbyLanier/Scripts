@@ -1,4 +1,4 @@
-# Enforcement Endpoint
+# Enforcement Endpoint + Logging
 # Listens for commands from desktop server to enable/disable apps
 # Server pushes enforcement decisions here
 
@@ -24,6 +24,11 @@ triggers:
     send_response: true
 
 actions:
+  # Log: enforcement command received
+  - type: shell
+    command: 'mkdir -p /storage/emulated/0/MacroDroid/logs && echo "{system_time} INFO enforce RECEIVED action={lv=action} app={lv=app}" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false
+
   # Parse the request - action and app come from query params or body
   # {action: "disable", app: "twitter"}
 

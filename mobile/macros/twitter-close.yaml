@@ -1,4 +1,4 @@
-# Twitter Close Tracker
+# Twitter Close Tracker + Logging
 # Reports to /phone when Twitter is closed
 
 name: "Twitter Close"
@@ -13,6 +13,11 @@ triggers:
     launched: false  # App closed
 
 actions:
+  # Log: macro triggered
+  - type: shell
+    command: 'mkdir -p /storage/emulated/0/MacroDroid/logs && echo "{system_time} INFO twitter-close TRIGGERED" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false
+
   - type: http_request
     url: "http://100.95.109.23:7777/phone"
     method: POST
