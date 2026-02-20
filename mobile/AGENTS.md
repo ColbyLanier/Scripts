@@ -70,13 +70,49 @@ See `macros/MACRODROID.md` for full macro inventory.
 
 ## Connection
 
+All devices use `ssh-connect` (standardized SSH with redirect-on-exit).
+Commands: `ssh-mac`, `ssh-wsl`, `ssh-phone` (each wraps `ssh-connect <target>`).
+
 ```bash
 ssh-phone               # Interactive SSH to phone
 ssh-phone "command"     # Run command on phone and exit
 ssh-phone --proxy       # Nest SSH instead of redirecting (when already in SSH)
 ```
 
-All devices use `ssh-connect` (standardized SSH with redirect-on-exit). See `~/Scripts/cli-tools/bin/ssh-connect`.
+### Redirect-on-Exit Flow
+
+When SSH'd into host A and you switch to host B, instead of nesting
+(origin→A→B), the session redirects so you connect directly (origin→B).
+
+```
+  Phone                    Mac                      WSL
+    │                       │                        │
+    │──── ssh-mac ─────────>│                        │
+    │     (wrapper loop)    │ (interactive session)  │
+    │                       │                        │
+    │                  user runs ssh-wsl             │
+    │                       │                        │
+    │                       │── reverse SSH ─────────│
+    │<── "echo wsl > ──────"│   (not to WSL, back   │
+    │     ~/.ssh-next"      │    to phone/origin)    │
+    │                       │                        │
+    │   (file written)      │── kill -HUP $PPID     │
+    │                       ╳  (session closes)      │
+    │                                                │
+    │   wrapper loop wakes                           │
+    │   reads ~/.ssh-next = "wsl"                    │
+    │   rm ~/.ssh-next                               │
+    │                                                │
+    │──── ssh wsl (direct) ─────────────────────────>│
+    │     (no nesting!)     │                        │
+```
+
+**Key mechanisms:**
+- `$SSH_CLIENT` IP → `ip_to_host()` → identifies origin device
+- Reverse SSH writes `~/.ssh-next` on origin (not `/tmp`, Termux can't write there)
+- `kill -HUP $PPID` auto-closes the SSH session
+- Origin's wrapper loop picks up the redirect file and connects directly
+- `--proxy` skips all of this and nests normally
 
 ## MacroDroid Automation
 
