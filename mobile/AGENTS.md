@@ -71,12 +71,12 @@ See `macros/MACRODROID.md` for full macro inventory.
 ## Connection
 
 ```bash
-sshp                    # Interactive SSH to phone
-sshp "command"          # Run command on phone
-ssh phone               # Direct SSH (same as sshp)
+ssh-phone               # Interactive SSH to phone
+ssh-phone "command"     # Run command on phone and exit
+ssh-phone --proxy       # Nest SSH instead of redirecting (when already in SSH)
 ```
 
-Connection details are in the global CLAUDE.md under "Phone Access with `sshp`".
+All devices use `ssh-connect` (standardized SSH with redirect-on-exit). See `~/Scripts/cli-tools/bin/ssh-connect`.
 
 ## MacroDroid Automation
 
@@ -270,7 +270,7 @@ To import in MacroDroid:
 2. Push: `macrodroid-push name.macro`
 3. Import in MacroDroid app
 4. Verify with `macrodroid-state --list`
-5. Delete: `rm name.macro` (local) and `sshp "rm ~/macros/name.macro"` (phone)
+5. Delete: `rm name.macro` (local) and `ssh-phone "rm ~/macros/name.macro"` (phone)
 
 **After importing**, delete the `.macro` file from the phone — it's just a staging file.
 
@@ -394,8 +394,9 @@ actions:
 ### Key Aliases (from bashrc)
 
 ```bash
-sshpc           # SSH back to desktop
-fetch-bashrc    # Pull latest bashrc from desktop
+ssh-mac         # SSH to Mac Mini (with redirect-on-exit)
+ssh-wsl         # SSH to WSL (with redirect-on-exit)
+fetch-bashrc    # Pull latest bashrc from Mac
 ```
 
 ### Storage Access

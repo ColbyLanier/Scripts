@@ -46,7 +46,7 @@ Each script gets a structured header:
 | `token-api` | token-restart, token-status, token-ping, tts-skip, timer-mode, timer-status, timer-test |
 | `deploy` | deploy, cloud-logs |
 | `db` | db-query, db-migrate |
-| `mobile` | sshp, macrodroid-gen, macrodroid-pull, macrodroid-push, macrodroid-read, macrodroid-state, tasker-push |
+| `mobile` | ssh-phone, macrodroid-gen, macrodroid-pull, macrodroid-push, macrodroid-read, macrodroid-state, tasker-push |
 | `macrodroid` | macrodroid-gen, macrodroid-pull, macrodroid-push, macrodroid-read, macrodroid-state |
 | `instance` | instance-name, instance-stop, instances-clear, subagent, agents-db |
 | `system` | mem-watchdog, time-convert, screenshot, browser-console, sandbox-server |
@@ -54,7 +54,7 @@ Each script gets a structured header:
 
 ### Audience Split
 
-- **Human-primary:** sshp, time-convert, stash, followup, screenshot
+- **Human-primary:** ssh-phone, time-convert, stash, followup, screenshot
 - **Agent-primary:** subagent, agents-db, instance-name, instance-stop, instances-clear, mem-watchdog, sandbox-server
 - **Both:** everything else
 

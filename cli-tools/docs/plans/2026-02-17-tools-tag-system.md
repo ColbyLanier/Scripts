@@ -29,7 +29,7 @@
 - Modify: `bin/cloud-logs` (line 2 area)
 - Modify: `bin/db-query` (line 2 area)
 - Modify: `bin/db-migrate` (line 2 area)
-- Modify: `bin/sshp` (line 2 area)
+- Modify: `bin/ssh-phone` (line 2 area)
 - Modify: `bin/macrodroid-gen` (line 2 area)
 - Modify: `bin/macrodroid-pull` (line 2 area)
 - Modify: `bin/macrodroid-push` (line 2 area)
@@ -77,7 +77,7 @@ deploy:           TAGS: deploy                      AUDIENCE: human, agent
 cloud-logs:       TAGS: deploy                      AUDIENCE: human, agent
 db-query:         TAGS: db                          AUDIENCE: human, agent
 db-migrate:       TAGS: db                          AUDIENCE: human, agent
-sshp:             TAGS: mobile                      AUDIENCE: human
+ssh-phone:        TAGS: mobile, ssh                  AUDIENCE: human
 macrodroid-gen:   TAGS: mobile, macrodroid          AUDIENCE: human, agent
 macrodroid-pull:  TAGS: mobile, macrodroid          AUDIENCE: human, agent
 macrodroid-push:  TAGS: mobile, macrodroid          AUDIENCE: human, agent
