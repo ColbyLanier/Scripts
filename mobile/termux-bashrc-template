@@ -61,7 +61,7 @@ ssh-connect() {
         if [[ -n "$origin_host" ]]; then
             echo "Redirecting: closing this session → connecting to $TARGET from origin..."
             if ssh -o ConnectTimeout=3 -o BatchMode=yes "$origin_host" \
-                "echo $TARGET > /tmp/.ssh-next" 2>/dev/null; then
+                "echo $TARGET > \$HOME/.ssh-next" 2>/dev/null; then
                 # Kill parent shell to close SSH session automatically
                 kill -HUP $PPID 2>/dev/null
                 exit 0
@@ -79,9 +79,9 @@ ssh-connect() {
         else
             ssh "$HOST"
         fi
-        if [[ -f /tmp/.ssh-next ]]; then
-            local next=$(cat /tmp/.ssh-next)
-            rm -f /tmp/.ssh-next
+        if [[ -f ~/.ssh-next ]]; then
+            local next=$(cat ~/.ssh-next)
+            rm -f ~/.ssh-next
             HOST=$(_ssh_target_to_host "$next")
             TARGET="$next"
             if [[ -z "$HOST" ]]; then

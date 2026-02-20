@@ -60,7 +60,7 @@ if [[ -n "$SSH_CONNECTION" ]] && ! $PROXY; then
     if [[ -n "$origin_host" ]]; then
         echo "Redirecting: closing this session → connecting to $TARGET from origin..."
         if ssh -o ConnectTimeout=3 -o BatchMode=yes "$origin_host" \
-            "echo $TARGET > /tmp/.ssh-next" 2>/dev/null; then
+            "echo $TARGET > \$HOME/.ssh-next" 2>/dev/null; then
             # Kill the parent shell to close the SSH session automatically.
             # $PPID is the interactive login shell spawned by sshd.
             kill -HUP $PPID 2>/dev/null
@@ -84,9 +84,9 @@ while true; do
     fi
 
     # Check for redirect from a nested session
-    if [[ -f /tmp/.ssh-next ]]; then
-        next=$(cat /tmp/.ssh-next)
-        rm -f /tmp/.ssh-next
+    if [[ -f ~/.ssh-next ]]; then
+        next=$(cat ~/.ssh-next)
+        rm -f ~/.ssh-next
         HOST=$(target_to_host "$next")
         TARGET="$next"
         if [[ -z "$HOST" ]]; then
