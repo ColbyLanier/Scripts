@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# push-mobile - Push Termux config and macros to phone
+# TAGS: mobile, sync, termux
+# AUDIENCE: human, agent
+#
+# Usage:
+#   push-mobile -b              # Push bashrc
+#   push-mobile -p              # Push termux.properties
+#   push-mobile -m              # Push macros folder
+#   push-mobile -bp             # Push bashrc + properties
+#   push-mobile -a              # Push everything
+#   push-mobile --sync -b       # Sync repo (WSL↔Mac) first, then push
+#
+# Works from either WSL or Mac - just needs SSH access to phone.
+
+set -euo pipefail
+
+SCRIPTS_DIR="$HOME/Scripts"
+MOBILE_DIR="${SCRIPTS_DIR}/mobile"
+SSH_OPTS="-o ConnectTimeout=5 -o BatchMode=yes"
+
+PUSH_BASHRC=false
+PUSH_PROPERTIES=false
+PUSH_MACROS=false
+DO_SYNC=false
+DRY_RUN=false
+
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+log_info()  { echo -e "${BLUE}->${NC} $*"; }
+log_ok()    { echo -e "  ${GREEN}OK${NC} $*"; }
+log_err()   { echo -e "  ${RED}ERR${NC} $*"; }
+log_dry()   { echo -e "  ${YELLOW}[dry-run]${NC} $*"; }
+
+show_help() {
+    cat << 'EOF'
+push-mobile - Push Termux config and macros to phone
+
+Usage:
+    push-mobile -b, --bashrc        Push bashrc
+    push-mobile -p, --properties    Push termux.properties
+    push-mobile -m, --macros        Push macros folder
+    push-mobile -a, --all           Push everything
+    push-mobile --sync              Sync repo (WSL↔Mac) before pushing
+    push-mobile --dry-run           Preview without doing anything
+
+Combine flags:  push-mobile -bp       (bashrc + properties)
+                push-mobile --sync -a (sync + everything)
+
+Files:
+    -b  mobile/termux-bashrc-template      → phone:~/.bashrc
+    -p  mobile/termux-properties-template   → phone:~/.termux/termux.properties
+    -m  mobile/macros/                      → phone:~/macros/
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) show_help; exit 0 ;;
+        --bashrc) PUSH_BASHRC=true; shift ;;
+        --properties) PUSH_PROPERTIES=true; shift ;;
+        --macros) PUSH_MACROS=true; shift ;;
+        --all) PUSH_BASHRC=true; PUSH_PROPERTIES=true; PUSH_MACROS=true; shift ;;
+        --sync) DO_SYNC=true; shift ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        -[bpma]*)
+            # Parse combined short flags: -bp, -bpm, -a, etc.
+            flags="${1#-}"
+            for (( i=0; i<${#flags}; i++ )); do
+                case "${flags:$i:1}" in
+                    b) PUSH_BASHRC=true ;;
+                    p) PUSH_PROPERTIES=true ;;
+                    m) PUSH_MACROS=true ;;
+                    a) PUSH_BASHRC=true; PUSH_PROPERTIES=true; PUSH_MACROS=true ;;
+                    *) echo -e "${RED}Unknown flag: -${flags:$i:1}${NC}" >&2; exit 1 ;;
+                esac
+            done
+            shift
+            ;;
+        *) echo -e "${RED}Unknown option: $1${NC}" >&2; exit 1 ;;
+    esac
+done
+
+# Require at least one target
+if ! $PUSH_BASHRC && ! $PUSH_PROPERTIES && ! $PUSH_MACROS; then
+    show_help
+    exit 1
+fi
+
+# Check phone is reachable
+if ! ssh $SSH_OPTS phone "true" 2>/dev/null; then
+    log_err "Phone unreachable via SSH"
+    exit 1
+fi
+
+# Optional: sync repo between WSL and Mac first
+if [[ "$DO_SYNC" == true ]]; then
+    log_info "Syncing Scripts repo..."
+    if [[ "$DRY_RUN" == true ]]; then
+        log_dry "Would run: scripts-sync push"
+    else
+        "${SCRIPTS_DIR}/cli-tools/bin/scripts-sync" push
+    fi
+    echo ""
+fi
+
+pushed=0
+
+if $PUSH_BASHRC; then
+    src="${MOBILE_DIR}/termux-bashrc-template"
+    if [[ ! -f "$src" ]]; then
+        log_err "Not found: ${src}"
+    elif [[ "$DRY_RUN" == true ]]; then
+        log_dry "bashrc → phone:~/.bashrc"
+    else
+        log_info "Pushing bashrc..."
+        if scp -q "$src" phone:~/.bashrc; then
+            log_ok "bashrc"; ((++pushed))
+        else
+            log_err "bashrc failed"
+        fi
+    fi
+fi
+
+if $PUSH_PROPERTIES; then
+    src="${MOBILE_DIR}/termux-properties-template"
+    if [[ ! -f "$src" ]]; then
+        log_err "Not found: ${src}"
+    elif [[ "$DRY_RUN" == true ]]; then
+        log_dry "properties → phone:~/.termux/termux.properties"
+    else
+        log_info "Pushing termux.properties..."
+        ssh $SSH_OPTS phone "mkdir -p ~/.termux" 2>/dev/null
+        if scp -q "$src" phone:~/.termux/termux.properties; then
+            log_ok "termux.properties"
+            ssh $SSH_OPTS phone "termux-reload-settings" 2>/dev/null && log_ok "settings reloaded" || true
+            ((pushed++))
+        else
+            log_err "termux.properties failed"
+        fi
+    fi
+fi
+
+if $PUSH_MACROS; then
+    src="${MOBILE_DIR}/macros"
+    if [[ ! -d "$src" ]]; then
+        log_err "Not found: ${src}/"
+    elif [[ "$DRY_RUN" == true ]]; then
+        count=$(find "$src" -type f 2>/dev/null | wc -l | tr -d ' ')
+        log_dry "macros/ (${count} files) → phone:~/macros/"
+    else
+        log_info "Pushing macros..."
+        ssh $SSH_OPTS phone "mkdir -p ~/macros" 2>/dev/null
+        if scp -q -r "$src"/* phone:~/macros/ 2>/dev/null; then
+            count=$(find "$src" -type f 2>/dev/null | wc -l | tr -d ' ')
+            log_ok "macros (${count} files)"
+            ((pushed++))
+        else
+            log_err "macros failed"
+        fi
+    fi
+fi
+
+echo ""
+if [[ "$DRY_RUN" == true ]]; then
+    echo -e "${YELLOW}Dry run complete.${NC}"
+elif [[ $pushed -gt 0 ]]; then
+    echo -e "${GREEN}${BOLD}Pushed ${pushed} target(s).${NC}"
+    $PUSH_BASHRC && echo -e "  Run ${BOLD}source ~/.bashrc${NC} on phone to reload."
+fi
