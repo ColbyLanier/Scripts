@@ -13,6 +13,27 @@
 
 set -e
 
+# Map target name to SSH host alias (from ~/.ssh/config)
+target_to_host() {
+    case "$1" in
+        mac)   echo "mini" ;;
+        wsl)   echo "wsl" ;;
+        phone) echo "phone" ;;
+        *)     echo "" ;;
+    esac
+}
+
+# Map Tailscale IP to host alias (for reverse SSH to origin)
+ip_to_host() {
+    case "$1" in
+        100.95.109.23)  echo "mini" ;;
+        100.69.198.87)  echo "desktop" ;;
+        100.66.10.74)   echo "wsl" ;;
+        100.102.92.24)  echo "phone" ;;
+        *)              echo "" ;;
+    esac
+}
+
 if [[ -z "$1" ]]; then
     echo "Usage: ssh-connect <mac|wsl|phone> [--proxy] [command...]"
     exit 1
@@ -26,22 +47,7 @@ if [[ "$1" == "--proxy" ]]; then
     shift
 fi
 
-# Map target names to SSH host aliases (from ~/.ssh/config)
-declare -A TARGET_HOST=(
-    [mac]=mini
-    [wsl]=wsl
-    [phone]=phone
-)
-
-# Map Tailscale IPs to host aliases (for reverse SSH to origin)
-declare -A IP_HOST=(
-    [100.95.109.23]=mini
-    [100.69.198.87]=desktop
-    [100.66.10.74]=wsl
-    [100.102.92.24]=phone
-)
-
-HOST="${TARGET_HOST[$TARGET]}"
+HOST=$(target_to_host "$TARGET")
 if [[ -z "$HOST" ]]; then
     echo "Unknown target: $TARGET (expected mac, wsl, or phone)"
     exit 1
@@ -50,12 +56,14 @@ fi
 # --- Redirect-on-exit: if in SSH session and not --proxy ---
 if [[ -n "$SSH_CONNECTION" ]] && ! $PROXY; then
     origin_ip="${SSH_CLIENT%% *}"
-    origin_host="${IP_HOST[$origin_ip]}"
+    origin_host=$(ip_to_host "$origin_ip")
     if [[ -n "$origin_host" ]]; then
         echo "Redirecting: closing this session → connecting to $TARGET from origin..."
-        ssh -o ConnectTimeout=3 -o BatchMode=yes "$origin_host" \
-            "echo $TARGET > /tmp/.ssh-next" 2>/dev/null
-        exit 0
+        if ssh -o ConnectTimeout=3 -o BatchMode=yes "$origin_host" \
+            "echo $TARGET > /tmp/.ssh-next" 2>/dev/null; then
+            exit 0
+        fi
+        echo "Reverse SSH to origin failed, falling back to direct connection..."
     fi
     # Fallback: if reverse SSH fails, replace session directly
     echo "Redirect failed, replacing session..."
@@ -76,7 +84,7 @@ while true; do
     if [[ -f /tmp/.ssh-next ]]; then
         next=$(cat /tmp/.ssh-next)
         rm -f /tmp/.ssh-next
-        HOST="${TARGET_HOST[$next]}"
+        HOST=$(target_to_host "$next")
         TARGET="$next"
         if [[ -z "$HOST" ]]; then
             echo "Invalid redirect target: $next"
