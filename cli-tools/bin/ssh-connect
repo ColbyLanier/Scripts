@@ -61,6 +61,9 @@ if [[ -n "$SSH_CONNECTION" ]] && ! $PROXY; then
         echo "Redirecting: closing this session → connecting to $TARGET from origin..."
         if ssh -o ConnectTimeout=3 -o BatchMode=yes "$origin_host" \
             "echo $TARGET > /tmp/.ssh-next" 2>/dev/null; then
+            # Kill the parent shell to close the SSH session automatically.
+            # $PPID is the interactive login shell spawned by sshd.
+            kill -HUP $PPID 2>/dev/null
             exit 0
         fi
         echo "Reverse SSH to origin failed, falling back to direct connection..."
