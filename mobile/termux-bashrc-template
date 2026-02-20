@@ -91,20 +91,21 @@ alias sshpc="ssh-wsl"
 alias sshmac="ssh-mac"
 alias sshmini="ssh-mac"
 
-# Fetch and update .bashrc from Mac (syncs git first, then copies)
+# Clear old aliases to prevent syntax errors when transitioning alias→function
+unalias fetch-bashrc fetch-properties 2>/dev/null
+
+# Fetch and update .bashrc from Mac (syncs WSL→Mac first, then copies)
 fetch-bashrc() {
-    echo "Syncing Scripts repo on Mac..."
-    ssh mac "cd ~/Scripts && git add -A && git diff --cached --quiet || git commit -m 'sync: pre-fetch from phone' && git push" 2>/dev/null
-    ssh mac "cd ~/Scripts && git pull --ff-only" 2>/dev/null
+    echo "Syncing Scripts repo (WSL → Mac)..."
+    ssh mac "~/Scripts/cli-tools/bin/scripts-sync pull" 2>/dev/null
     echo "Fetching bashrc from Mac..."
     scp mac:~/Scripts/mobile/termux-bashrc-template ~/.bashrc && source ~/.bashrc && echo "bashrc updated and reloaded"
 }
 
-# Fetch and update termux.properties from Mac (syncs git first, then copies)
+# Fetch and update termux.properties from Mac (syncs WSL→Mac first, then copies)
 fetch-properties() {
-    echo "Syncing Scripts repo on Mac..."
-    ssh mac "cd ~/Scripts && git add -A && git diff --cached --quiet || git commit -m 'sync: pre-fetch from phone' && git push" 2>/dev/null
-    ssh mac "cd ~/Scripts && git pull --ff-only" 2>/dev/null
+    echo "Syncing Scripts repo (WSL → Mac)..."
+    ssh mac "~/Scripts/cli-tools/bin/scripts-sync pull" 2>/dev/null
     echo "Fetching termux.properties from Mac..."
     scp mac:~/Scripts/mobile/termux-properties-template ~/.termux/termux.properties && termux-reload-settings && echo "termux properties updated and reloaded"
 }
@@ -358,6 +359,7 @@ shutdown-mini() {
 # Start in SSH session to Mac by default. Use 'exit' to access local phone.
 # Guard: only auto-SSH when opening Termux locally on the phone.
 # Skip if incoming SSH session (SSH_CONNECTION set) or non-interactive shell.
-if [[ -z "$SSH_CONNECTION" ]] && [[ $- == *i* ]]; then
+if [[ -z "$SSH_CONNECTION" ]] && [[ $- == *i* ]] && [[ -z "$__AUTO_SSH_DONE" ]]; then
+    export __AUTO_SSH_DONE=1
     ssh-connect mac
 fi
