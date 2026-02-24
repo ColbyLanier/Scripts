@@ -6837,10 +6837,16 @@ async def handle_stop_validate(payload: dict) -> dict:
     pid = payload.get("pid")
     log_prefix = f"StopValidate {session_id[:12]}..."
 
-    # ── Subagent detection: Task tool subagents fire Stop on every subtask completion.
-    # Suppress the validator for them — their exits don't need instruction-quality checks.
+    # ── Subagent detection ──
+    # Two signals: process tree (direct claude→claude spawn) or TOKEN_API_SUBAGENT
+    # env var (set by the subagent CLI before spawning claude -p).
     if pid and is_subagent_pid(pid):
         logger.info(f"{log_prefix} ALLOW: subagent (parent PID {get_parent_pid(pid)} is claude)")
+        return {}
+
+    token_api_subagent = payload.get("env", {}).get("TOKEN_API_SUBAGENT", "")
+    if token_api_subagent:
+        logger.info(f"{log_prefix} ALLOW: TOKEN_API_SUBAGENT={token_api_subagent}")
         return {}
 
     # ── Escape hatch: second attempt is always allowed ──
