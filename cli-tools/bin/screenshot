@@ -36,6 +36,7 @@ Flags (passed through to node script):
   --viewport <WxH>        Custom viewport (e.g. 375x812, 1920x1080)
   --output <path>         Custom output file path
   --wait-for <selector>   Wait for CSS selector before capture
+  --sleep <ms>            Sleep N ms before capture (e.g. 30000 for AI round-trip)
   --full-page             Full page capture
 
 Output:

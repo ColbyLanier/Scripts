@@ -6837,16 +6837,22 @@ async def handle_stop_validate(payload: dict) -> dict:
     pid = payload.get("pid")
     log_prefix = f"StopValidate {session_id[:12]}..."
 
-    # ── Subagent detection ──
-    # Two signals: process tree (direct claude→claude spawn) or TOKEN_API_SUBAGENT
-    # env var (set by the subagent CLI before spawning claude -p).
+    # ── Subagent detection: this instance IS a subagent ──
+    # Process tree (direct claude→claude spawn) or TOKEN_API_SUBAGENT env var.
     if pid and is_subagent_pid(pid):
-        logger.info(f"{log_prefix} ALLOW: subagent (parent PID {get_parent_pid(pid)} is claude)")
+        logger.info(f"{log_prefix} ALLOW: is subagent (parent PID {get_parent_pid(pid)} is claude)")
         return {}
 
     token_api_subagent = payload.get("env", {}).get("TOKEN_API_SUBAGENT", "")
     if token_api_subagent:
         logger.info(f"{log_prefix} ALLOW: TOKEN_API_SUBAGENT={token_api_subagent}")
+        return {}
+
+    # ── Active subagent detection: this instance HAS child subagents still running ──
+    # Background subagents returning one-by-one cause repeated Stop hooks on the parent.
+    # If child claude processes are alive, this is an intermediate stop — skip validation.
+    if payload.get("has_active_subagents"):
+        logger.info(f"{log_prefix} ALLOW: has active child subagents (intermediate stop)")
         return {}
 
     # ── Escape hatch: second attempt is always allowed ──
@@ -6955,6 +6961,13 @@ async def handle_stop(payload: dict) -> dict:
     if is_subagent_instance:
         result["action"] = "stop_processed_subagent"
         logger.info(f"Hook: Stop {session_id[:12]}... subagent — state updated, skipping notifications")
+        return result
+
+    # Intermediate stop: parent has background subagents still running.
+    # Update state but skip notifications — the "real" final stop comes after all subagents return.
+    if payload.get("has_active_subagents"):
+        result["action"] = "stop_processed_intermediate"
+        logger.info(f"Hook: Stop {session_id[:12]}... intermediate (child subagents still running) — skipping notifications")
         return result
 
     # Mobile path: send webhook notification
