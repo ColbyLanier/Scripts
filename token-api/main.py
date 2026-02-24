@@ -594,6 +594,47 @@ async def init_db():
             )
         """)
 
+        # Timer session logging - track work/break sessions
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS timer_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                start_time TIMESTAMP NOT NULL,
+                end_time TIMESTAMP,
+                mode TEXT NOT NULL,
+                duration_ms INTEGER DEFAULT 0,
+                break_earned_ms INTEGER DEFAULT 0,
+                break_used_ms INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Timer mode changes - track when mode changed
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS timer_mode_changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TIMESTAMP NOT NULL,
+                old_mode TEXT,
+                new_mode TEXT NOT NULL,
+                is_automatic INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Timer daily scores - track productivity over time
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS timer_daily_scores (
+                date TEXT PRIMARY KEY,
+                productivity_score INTEGER,
+                total_work_ms INTEGER DEFAULT 0,
+                total_break_used_ms INTEGER DEFAULT 0,
+                session_count INTEGER DEFAULT 0,
+                mode_change_count INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # Create checkins table (productivity check-in responses)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS checkins (
@@ -623,6 +664,24 @@ async def init_db():
                 idle_minutes REAL,
                 acknowledged INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Timer shifts analytics table (daily-wiped, rich metadata)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS timer_shifts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                old_mode TEXT,
+                new_mode TEXT NOT NULL,
+                trigger TEXT,
+                source TEXT,
+                break_balance_ms INTEGER,
+                break_backlog_ms INTEGER,
+                work_time_ms INTEGER,
+                active_instances INTEGER,
+                phone_app TEXT,
+                details TEXT
             )
         """)
 
@@ -1277,13 +1336,22 @@ async def stop_instance(instance_id: str):
 
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT id, device_id FROM claude_instances WHERE id = ?",
+            "SELECT id, device_id, COALESCE(is_subagent, 0) FROM claude_instances WHERE id = ?",
             (instance_id,)
         )
         row = await cursor.fetchone()
 
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
+
+        is_subagent = row[2]
+
+        # Count non-subagent active instances BEFORE stopping
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle') AND COALESCE(is_subagent, 0) = 0"
+        )
+        count_row = await cursor.fetchone()
+        was_active = count_row[0] if count_row else 0
 
         await db.execute(
             """UPDATE claude_instances
@@ -1293,12 +1361,19 @@ async def stop_instance(instance_id: str):
         )
         await db.commit()
 
-        # Check if this was the last active instance
+        # Check remaining active instances (all)
         cursor = await db.execute(
             "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle')"
         )
         count_row = await cursor.fetchone()
         remaining_active = count_row[0] if count_row else 0
+
+        # Count remaining non-subagent active instances
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle') AND COALESCE(is_subagent, 0) = 0"
+        )
+        count_row = await cursor.fetchone()
+        remaining_non_sub = count_row[0] if count_row else 0
 
     # Log event
     await log_event(
@@ -1306,6 +1381,10 @@ async def stop_instance(instance_id: str):
         instance_id=instance_id,
         device_id=row[1]
     )
+
+    # Instance count Pavlok signals (skip subagents)
+    if not is_subagent:
+        await check_instance_count_pavlok(remaining_non_sub, was_active)
 
     # If no more active instances and video mode was active, enforce
     if remaining_active == 0 and DESKTOP_STATE.get("current_mode") == "video":
@@ -2324,6 +2403,8 @@ DESKTOP_STATE = {
     "last_detection": None,
     # Work mode: "clocked_in" (normal enforcement), "clocked_out" (no enforcement), "gym" (gym timer)
     "work_mode": "clocked_in",
+    # Location zone tracking (state machine for geofence sequencing)
+    "location_zone": None,  # None = outside all zones, else: "home", "gym", "campus"
     # Grace period: ignore silence detections for 15s after startup to avoid
     # AHK restart race (AHK initializes with silence before detecting real state)
     "startup_time": time.time(),
@@ -2640,6 +2721,7 @@ PHONE_STATE = {
     "is_distracted": False,
     "reachable": None,  # Last known reachability status
     "last_reachable_check": None,
+    "twitter_open_since": None,  # monotonic time when Twitter/X was opened, None when closed
 }
 
 # App categories for phone distraction detection
@@ -2690,7 +2772,7 @@ PAVLOK_CONFIG = {
     "api_url": "https://api.pavlok.com/api/v5/stimulus/send",
     "token": os.getenv("PAVLOK_API_TOKEN"),
     "enabled": True,
-    "cooldown_seconds": 45,
+    "cooldown_seconds": 30,
     "default_zap_value": 50,
 }
 
@@ -2748,7 +2830,171 @@ def send_pavlok_stimulus(
         return {"success": False, "error": str(e), "reason": reason}
 
 
+async def check_instance_count_pavlok(remaining_active: int, was_active: int):
+    """Send Pavlok signals when Claude instance count drops critically.
+
+    - Drops to 1 (from 2+): double vibe as warning
+    - Drops to 0: zap as penalty
+    Skips if was_active was already at or below threshold (no regression).
+    """
+    if remaining_active == 1 and was_active >= 2:
+        print(f"PAVLOK: Instance count dropped to 1 (from {was_active}), double vibe")
+        send_pavlok_stimulus(stimulus_type="vibe", value=50, reason="one_claude_remaining", respect_cooldown=False)
+        await asyncio.sleep(3)
+        send_pavlok_stimulus(stimulus_type="vibe", value=50, reason="one_claude_remaining", respect_cooldown=False)
+        await log_event("instance_count_warning", details={"remaining": 1, "was": was_active})
+    elif remaining_active == 0 and was_active >= 1:
+        print(f"PAVLOK: All Claude instances stopped, zap")
+        send_pavlok_stimulus(stimulus_type="zap", value=50, reason="all_claudes_stopped", respect_cooldown=False)
+        await log_event("instance_count_zero", details={"was": was_active})
+
+
 # ============ Timer I/O Functions ============
+
+
+def _sync_log_shift(old_mode: str | None, new_mode: str, trigger: str, source: str,
+                    phone_app: str | None = None, details: str | None = None):
+    """Log a timer mode shift to the analytics table (sync, for thread offload)."""
+    import sqlite3
+    from datetime import datetime as _dt
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA busy_timeout=5000")
+
+    # Get active non-subagent instance count
+    cursor = conn.execute(
+        "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle') AND COALESCE(is_subagent, 0) = 0"
+    )
+    active_instances = cursor.fetchone()[0]
+
+    conn.execute(
+        """INSERT INTO timer_shifts (timestamp, old_mode, new_mode, trigger, source,
+           break_balance_ms, break_backlog_ms, work_time_ms, active_instances, phone_app, details)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (_dt.now().isoformat(), old_mode, new_mode, trigger, source,
+         timer_engine.accumulated_break_ms, timer_engine.break_backlog_ms,
+         timer_engine.total_work_time_ms, active_instances, phone_app, details)
+    )
+    conn.commit()
+    conn.close()
+
+
+async def timer_log_shift(old_mode: str | None, new_mode: str, trigger: str, source: str,
+                          phone_app: str | None = None, details: str | None = None):
+    """Log a timer mode shift to the analytics table (async wrapper)."""
+    try:
+        await asyncio.to_thread(_sync_log_shift, old_mode, new_mode, trigger, source, phone_app, details)
+    except Exception as e:
+        print(f"TIMER: Failed to log shift: {e}")
+
+
+def _sync_generate_daily_analytics(date_str: str):
+    """Generate daily timer analytics from timer_shifts.
+
+    Writes:
+    1. Summary fields to the daily note's YAML front matter
+    2. Full JSON to Token-ENV/Journal/Daily/analytics/ for programmatic access
+    Then wipes timer_shifts table.
+    """
+    import sqlite3
+    import json
+    from collections import defaultdict
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.row_factory = sqlite3.Row
+
+    rows = conn.execute("SELECT * FROM timer_shifts ORDER BY id").fetchall()
+
+    if not rows:
+        conn.close()
+        return None
+
+    # Compute analytics
+    shift_count_by_trigger = defaultdict(int)
+    shift_count_by_source = defaultdict(int)
+    enforcement_count = 0
+    twitter_shifts = 0
+    modes_seen = set()
+    peak_balance = 0
+    min_balance = float("inf")
+    instance_counts = []
+    # Break balance time series (for sparkline in JSON)
+    balance_timeline = []
+
+    for r in rows:
+        shift_count_by_trigger[r["trigger"] or "unknown"] += 1
+        shift_count_by_source[r["source"] or "unknown"] += 1
+        if r["trigger"] == "enforcement":
+            enforcement_count += 1
+        if r["phone_app"] and "twitter" in (r["phone_app"] or "").lower():
+            twitter_shifts += 1
+        modes_seen.add(r["new_mode"])
+        if r["old_mode"]:
+            modes_seen.add(r["old_mode"])
+        bal = r["break_balance_ms"] or 0
+        peak_balance = max(peak_balance, bal)
+        min_balance = min(min_balance, bal)
+        if r["active_instances"] is not None:
+            instance_counts.append(r["active_instances"])
+        balance_timeline.append({"time": r["timestamp"], "balance_ms": bal})
+
+    summary = {
+        "date": date_str,
+        "total_shifts": len(rows),
+        "shifts_by_trigger": dict(shift_count_by_trigger),
+        "shifts_by_source": dict(shift_count_by_source),
+        "enforcement_events": enforcement_count,
+        "twitter_shifts": twitter_shifts,
+        "modes_seen": sorted(modes_seen),
+        "peak_break_balance_ms": peak_balance,
+        "min_break_balance_ms": min_balance if min_balance != float("inf") else 0,
+        "avg_active_instances": round(sum(instance_counts) / len(instance_counts), 1) if instance_counts else 0,
+        "max_active_instances": max(instance_counts) if instance_counts else 0,
+        "balance_timeline": balance_timeline,
+    }
+
+    # 1. Write full JSON to Token-ENV analytics dir
+    analytics_dir = OBSIDIAN_DAILY_PATH / "analytics"
+    analytics_dir.mkdir(parents=True, exist_ok=True)
+    out_path = analytics_dir / f"timer-{date_str}.json"
+    with open(out_path, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    # 2. Write summary fields to daily note frontmatter
+    note_path = OBSIDIAN_DAILY_PATH / f"{date_str}.md"
+    if note_path.exists():
+        content = note_path.read_text(encoding="utf-8")
+        fm_updates = {
+            "timer_total_shifts": summary["total_shifts"],
+            "timer_enforcements": enforcement_count,
+            "timer_twitter_shifts": twitter_shifts,
+            "timer_peak_break": format_timer_time(peak_balance),
+            "timer_min_break": format_timer_time(min_balance if min_balance != float("inf") else 0),
+            "timer_avg_instances": summary["avg_active_instances"],
+            "timer_max_instances": summary["max_active_instances"],
+        }
+        updated = _merge_frontmatter(content, fm_updates)
+        note_path.write_text(updated, encoding="utf-8")
+
+    # Wipe timer_shifts table
+    conn.execute("DELETE FROM timer_shifts")
+    conn.commit()
+    conn.close()
+
+    return str(out_path)
+
+
+async def generate_daily_timer_analytics(date_str: str):
+    """Generate and save daily timer analytics (async wrapper)."""
+    try:
+        result = await asyncio.to_thread(_sync_generate_daily_analytics, date_str)
+        if result:
+            print(f"TIMER: Daily analytics written to {result}")
+            await log_event("timer_daily_analytics_generated", details={"file": result, "date": date_str})
+        else:
+            print(f"TIMER: No shift data for {date_str}, skipping analytics")
+    except Exception as e:
+        print(f"TIMER: Failed to generate daily analytics: {e}")
 
 
 def _merge_frontmatter(content: str, updates: dict) -> str:
@@ -2810,11 +3056,29 @@ def _format_yaml_value(value) -> str:
 
 
 def _sync_update_daily_note():
-    """Update daily note synchronously (called via asyncio.to_thread)."""
+    """Update daily note synchronically (called via asyncio.to_thread)."""
+    import sqlite3
     today = datetime.now().strftime("%Y-%m-%d")
     note_path = OBSIDIAN_DAILY_PATH / f"{today}.md"
     if not note_path.exists():
         return
+    
+    # Get session count and mode change count for today
+    session_count = 0
+    mode_change_count = 0
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA busy_timeout=5000")
+        session_count = conn.execute(
+            "SELECT COUNT(*) FROM timer_sessions WHERE date = ?", (today,)
+        ).fetchone()[0] or 0
+        mode_change_count = conn.execute(
+            "SELECT COUNT(*) FROM timer_mode_changes WHERE timestamp LIKE ?", (f"{today}%",)
+        ).fetchone()[0] or 0
+        conn.close()
+    except Exception:
+        pass  # Silently skip if DB query fails
+    
     content = note_path.read_text(encoding="utf-8")
     updates = {
         "timer_status": timer_engine.current_mode.value,
@@ -2825,6 +3089,8 @@ def _sync_update_daily_note():
         "timer_break_used": format_timer_time(timer_engine.total_break_time_ms),
         "timer_break_available": format_timer_time(timer_engine.accumulated_break_ms),
         "timer_backlog": format_timer_time(timer_engine.break_backlog_ms),
+        "timer_sessions": session_count,
+        "timer_mode_changes": mode_change_count,
         "last_timer_update": datetime.now().strftime("%H:%M:%S"),
     }
     updated = _merge_frontmatter(content, updates)
@@ -2862,6 +3128,107 @@ async def timer_save_to_db():
         await asyncio.to_thread(_sync_save_to_db, state_json)
     except Exception as e:
         print(f"TIMER: Failed to save to DB: {e}")
+
+
+def _sync_log_mode_change(old_mode: str | None, new_mode: str, is_automatic: bool):
+    """Log a mode change to the database synchronously."""
+    import sqlite3
+    from datetime import datetime
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute(
+        """INSERT INTO timer_mode_changes (timestamp, old_mode, new_mode, is_automatic)
+           VALUES (?, ?, ?, ?)""",
+        (datetime.now().isoformat(), old_mode, new_mode, 1 if is_automatic else 0)
+    )
+    conn.commit()
+    conn.close()
+
+
+async def timer_log_mode_change(old_mode: str | None, new_mode: str, is_automatic: bool):
+    """Log a timer mode change asynchronously."""
+    try:
+        await asyncio.to_thread(_sync_log_mode_change, old_mode, new_mode, is_automatic)
+    except Exception as e:
+        print(f"TIMER: Failed to log mode change: {e}")
+
+
+def _sync_start_session(mode: str, date: str):
+    """Start a new timer session."""
+    import sqlite3
+    from datetime import datetime
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA busy_timeout=5000")
+    cursor = conn.execute(
+        """INSERT INTO timer_sessions (date, start_time, mode)
+           VALUES (?, ?, ?)""",
+        (date, datetime.now().isoformat(), mode)
+    )
+    conn.commit()
+    session_id = cursor.lastrowid
+    conn.close()
+    return session_id
+
+
+async def timer_start_session(mode: str, date: str) -> int:
+    """Start a new timer session asynchronously. Returns session ID."""
+    try:
+        return await asyncio.to_thread(_sync_start_session, mode, date)
+    except Exception as e:
+        print(f"TIMER: Failed to start session: {e}")
+        return 0
+
+
+def _sync_end_session(session_id: int, duration_ms: int, break_earned_ms: int = 0, break_used_ms: int = 0):
+    """End a timer session."""
+    import sqlite3
+    from datetime import datetime
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute(
+        """UPDATE timer_sessions SET end_time = ?, duration_ms = ?, break_earned_ms = ?, break_used_ms = ?
+           WHERE id = ?""",
+        (datetime.now().isoformat(), duration_ms, break_earned_ms, break_used_ms, session_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+async def timer_end_session(session_id: int, duration_ms: int, break_earned_ms: int = 0, break_used_ms: int = 0):
+    """End a timer session asynchronously."""
+    try:
+        await asyncio.to_thread(_sync_end_session, session_id, duration_ms, break_earned_ms, break_used_ms)
+    except Exception as e:
+        print(f"TIMER: Failed to end session: {e}")
+
+
+def _sync_save_daily_score(date: str, productivity_score: int, total_work_ms: int, total_break_used_ms: int, session_count: int, mode_change_count: int):
+    """Save daily productivity score."""
+    import sqlite3
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute(
+        """INSERT INTO timer_daily_scores (date, productivity_score, total_work_ms, total_break_used_ms, session_count, mode_change_count, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+           ON CONFLICT(date) DO UPDATE SET 
+               productivity_score = excluded.productivity_score,
+               total_work_ms = excluded.total_work_ms,
+               total_break_used_ms = excluded.total_break_used_ms,
+               session_count = excluded.session_count,
+               mode_change_count = excluded.mode_change_count,
+               updated_at = CURRENT_TIMESTAMP""",
+        (date, productivity_score, total_work_ms, total_break_used_ms, session_count, mode_change_count)
+    )
+    conn.commit()
+    conn.close()
+
+
+async def timer_save_daily_score(date: str, productivity_score: int, total_work_ms: int, total_break_used_ms: int, session_count: int, mode_change_count: int):
+    """Save daily productivity score asynchronously."""
+    try:
+        await asyncio.to_thread(_sync_save_daily_score, date, productivity_score, total_work_ms, total_break_used_ms, session_count, mode_change_count)
+    except Exception as e:
+        print(f"TIMER: Failed to save daily score: {e}")
 
 
 def timer_load_from_db():
@@ -3342,6 +3709,10 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
         now_ms = int(time.monotonic() * 1000)
         timer_updated, _ = timer_engine.set_mode(TimerMode("work_" + detected_mode), is_automatic=True, now_mono_ms=now_ms)
 
+        if timer_updated:
+            await timer_log_shift("work_" + old_mode if old_mode != "silence" else "work_silence",
+                                  "work_" + detected_mode, trigger="desktop_detection", source="ahk")
+
         await log_event(
             "desktop_mode_change",
             details={
@@ -3482,13 +3853,24 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         PHONE_STATE["is_distracted"] = False
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
 
+        # Clear Twitter tracking on close
+        if app_name in ("twitter", "x", "com.twitter.android"):
+            PHONE_STATE["twitter_open_since"] = None
+            # Clear manual lock so close event restores work mode
+            timer_engine._manual_mode_lock = False
+            timer_engine._manual_mode_lock_until_ms = None
+            print(f"    Twitter closed, lock cleared")
+
         # Switch timer to silence when distraction app closes
         timer_updated = False
         if old_app:
             DESKTOP_STATE["current_mode"] = "silence"
             DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
             now_ms = int(time.monotonic() * 1000)
-            timer_updated, _ = timer_engine.set_mode(TimerMode.WORK_SILENCE, is_automatic=True, now_mono_ms=now_ms)
+            timer_updated, _ = timer_engine.set_mode(TimerMode.WORK_SILENCE, is_automatic=False, now_mono_ms=now_ms)
+            if timer_updated:
+                await timer_log_shift(None, "work_silence", trigger="phone_app", source="macrodroid",
+                                      phone_app=app_name)
             print(f"    Phone close -> silence | timer={timer_updated}")
 
         await log_event(
@@ -3523,12 +3905,18 @@ async def handle_phone_activity(request: PhoneActivityRequest):
 
     # Helper to sync timer mode for phone distraction
     def _sync_phone_timer():
+        old_timer_mode = timer_engine.current_mode.value
         DESKTOP_STATE["current_mode"] = distraction_mode
         DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
         now_ms = int(time.monotonic() * 1000)
         updated, _ = timer_engine.set_mode(TimerMode("work_" + distraction_mode), is_automatic=True, now_mono_ms=now_ms)
         print(f"    Phone open -> {distraction_mode} | timer={updated}")
-        return updated
+        # Track Twitter open time for 7-minute enforcement
+        if app_name in ("twitter", "x", "com.twitter.android"):
+            if PHONE_STATE["twitter_open_since"] is None:
+                PHONE_STATE["twitter_open_since"] = time.monotonic()
+                print(f"    Twitter timer started")
+        return updated, old_timer_mode
 
     # Check work mode
     work_mode = DESKTOP_STATE.get("work_mode", "clocked_in")
@@ -3538,7 +3926,9 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         PHONE_STATE["current_app"] = app_name
         PHONE_STATE["is_distracted"] = True
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
-        _sync_phone_timer()
+        _updated, _old_mode = _sync_phone_timer()
+        if _updated:
+            await timer_log_shift(_old_mode, "work_" + distraction_mode, trigger="phone_app", source="macrodroid", phone_app=app_name)
 
         await log_event(
             "phone_distraction_allowed",
@@ -3581,7 +3971,9 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         PHONE_STATE["current_app"] = app_name
         PHONE_STATE["is_distracted"] = True
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
-        _sync_phone_timer()
+        _updated, _old_mode = _sync_phone_timer()
+        if _updated:
+            await timer_log_shift(_old_mode, "work_" + distraction_mode, trigger="phone_app", source="macrodroid", phone_app=app_name)
 
         await log_event(
             "phone_distraction_allowed",
@@ -3605,7 +3997,9 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         PHONE_STATE["current_app"] = app_name
         PHONE_STATE["is_distracted"] = True
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
-        _sync_phone_timer()
+        _updated, _old_mode = _sync_phone_timer()
+        if _updated:
+            await timer_log_shift(_old_mode, "work_" + distraction_mode, trigger="phone_app", source="macrodroid", phone_app=app_name)
 
         await log_event(
             "phone_distraction_allowed",
@@ -3733,15 +4127,76 @@ async def get_timer_state():
     }
 
 
+@app.get("/api/timer/shifts")
+async def get_timer_shifts():
+    """Get today's timer shift analytics for TUI visualization."""
+    from collections import defaultdict
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM timer_shifts ORDER BY id")
+        rows = await cursor.fetchall()
+
+    if not rows:
+        return {"total_shifts": 0, "balance_series": [], "mode_distribution": {},
+                "shifts_by_trigger": {}, "enforcement_count": 0, "twitter_time_mins": 0}
+
+    balance_series = []
+    mode_time = defaultdict(int)
+    shifts_by_trigger = defaultdict(int)
+    enforcement_count = 0
+    twitter_shifts = 0
+    prev_time = None
+
+    for r in rows:
+        bal = r["break_balance_ms"] or 0
+        balance_series.append(round(bal / 60000, 1))  # minutes for sparkline
+        shifts_by_trigger[r["trigger"] or "unknown"] += 1
+        if r["trigger"] == "enforcement":
+            enforcement_count += 1
+        if r["phone_app"] and "twitter" in (r["phone_app"] or "").lower():
+            twitter_shifts += 1
+        # Rough mode time (time between shifts spent in old_mode)
+        if prev_time and r["old_mode"]:
+            try:
+                from datetime import datetime as _dt
+                t1 = _dt.fromisoformat(prev_time)
+                t2 = _dt.fromisoformat(r["timestamp"])
+                delta_s = (t2 - t1).total_seconds()
+                if 0 < delta_s < 7200:  # cap at 2h to avoid stale gaps
+                    mode_time[r["old_mode"]] += int(delta_s)
+            except Exception:
+                pass
+        prev_time = r["timestamp"]
+
+    return {
+        "total_shifts": len(rows),
+        "balance_series": balance_series,
+        "mode_distribution": dict(mode_time),
+        "shifts_by_trigger": dict(shifts_by_trigger),
+        "enforcement_count": enforcement_count,
+        "twitter_shifts": twitter_shifts,
+    }
+
+
 @app.post("/api/timer/break")
 async def enter_break_mode():
     """Enter break mode (for Stream Deck / TUI / manual control)."""
+    global _current_session_id, _session_start_ms
     if timer_engine.accumulated_break_ms <= 0:
         raise HTTPException(status_code=400, detail="No break time available")
 
     now_ms = int(time.monotonic() * 1000)
-    changed, _ = timer_engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=now_ms)
+    old_mode = timer_engine.current_mode.value
+    changed, tick_result = timer_engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=now_ms)
     if changed:
+        today = datetime.now().strftime("%Y-%m-%d")
+        await timer_log_mode_change(old_mode, "break", is_automatic=False)
+        await timer_log_shift(old_mode, "break", trigger="manual", source="api")
+        # End previous session and start new one
+        await timer_end_session(_current_session_id, now_ms - _session_start_ms, break_used_ms=timer_engine.total_break_time_ms)
+        _current_session_id = await timer_start_session("break", today)
+        _session_start_ms = now_ms
         await log_event("timer_mode_change", details={"new_mode": "break", "source": "api"})
     return {"status": "break", "changed": changed, "break_available_seconds": round(timer_engine.accumulated_break_ms / 1000)}
 
@@ -3749,21 +4204,55 @@ async def enter_break_mode():
 @app.post("/api/timer/pause")
 async def enter_pause_mode():
     """Enter pause mode (for Stream Deck / TUI / manual control)."""
+    global _current_session_id, _session_start_ms
     now_ms = int(time.monotonic() * 1000)
-    changed, _ = timer_engine.set_mode(TimerMode.PAUSE, is_automatic=False, now_mono_ms=now_ms)
+    old_mode = timer_engine.current_mode.value
+    changed, tick_result = timer_engine.set_mode(TimerMode.PAUSE, is_automatic=False, now_mono_ms=now_ms)
     if changed:
+        today = datetime.now().strftime("%Y-%m-%d")
+        await timer_log_mode_change(old_mode, "pause", is_automatic=False)
+        await timer_log_shift(old_mode, "pause", trigger="manual", source="api")
+        await timer_end_session(_current_session_id, now_ms - _session_start_ms)
+        _current_session_id = await timer_start_session("pause", today)
+        _session_start_ms = now_ms
         await log_event("timer_mode_change", details={"new_mode": "pause", "source": "api"})
     return {"status": "pause", "changed": changed}
+
+
+@app.post("/api/timer/sleep")
+async def enter_sleep_mode():
+    """Enter sleeping mode - neutral, doesn't count as work or break."""
+    global _current_session_id, _session_start_ms
+    now_ms = int(time.monotonic() * 1000)
+    old_mode = timer_engine.current_mode.value
+    changed, tick_result = timer_engine.set_mode(TimerMode.SLEEPING, is_automatic=False, now_mono_ms=now_ms)
+    if changed:
+        today = datetime.now().strftime("%Y-%m-%d")
+        await timer_log_mode_change(old_mode, "sleeping", is_automatic=False)
+        await timer_log_shift(old_mode, "sleeping", trigger="manual", source="api")
+        await timer_end_session(_current_session_id, now_ms - _session_start_ms)
+        _current_session_id = await timer_start_session("sleeping", today)
+        _session_start_ms = now_ms
+        await log_event("timer_mode_change", details={"new_mode": "sleeping", "source": "api"})
+    return {"status": "sleeping", "changed": changed}
 
 
 @app.post("/api/timer/resume")
 async def resume_work_mode():
     """Exit break/pause and return to work_silence."""
+    global _current_session_id, _session_start_ms
     now_ms = int(time.monotonic() * 1000)
-    changed, _ = timer_engine.set_mode(TimerMode.WORK_SILENCE, is_automatic=False, now_mono_ms=now_ms)
+    old_mode = timer_engine.current_mode.value
+    changed, tick_result = timer_engine.set_mode(TimerMode.WORK_SILENCE, is_automatic=False, now_mono_ms=now_ms)
     if changed:
         DESKTOP_STATE["current_mode"] = "silence"
         DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
+        today = datetime.now().strftime("%Y-%m-%d")
+        await timer_log_mode_change(old_mode, "work_silence", is_automatic=False)
+        await timer_log_shift(old_mode, "work_silence", trigger="manual", source="api")
+        await timer_end_session(_current_session_id, now_ms - _session_start_ms)
+        _current_session_id = await timer_start_session("work_silence", today)
+        _session_start_ms = now_ms
         await log_event("timer_mode_change", details={"new_mode": "work_silence", "source": "api"})
     return {"status": "work_silence", "changed": changed}
 
@@ -3777,6 +4266,33 @@ async def manual_daily_reset():
         "accumulated_break_ms": timer_engine.accumulated_break_ms,
         "daily_start_date": timer_engine.daily_start_date,
     }
+
+
+@app.post("/api/timer/reset")
+async def reset_timer():
+    """Reset timer to fresh state - zero work time, default break buffer."""
+    global _current_session_id, _session_start_ms
+    now_ms = int(time.monotonic() * 1000)
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # End current session if running
+    if _current_session_id > 0:
+        await timer_end_session(_current_session_id, now_ms - _session_start_ms)
+
+    # Reset timer state
+    timer_engine._total_work_time_ms = 0
+    timer_engine._total_break_time_ms = 0
+    timer_engine._accumulated_break_ms = DEFAULT_BREAK_BUFFER_MS
+    timer_engine._break_backlog_ms = 0
+    timer_engine._daily_start_date = today
+    timer_engine._current_mode = TimerMode.WORK_SILENCE
+
+    # Start fresh session
+    _current_session_id = await timer_start_session("work_silence", today)
+    _session_start_ms = now_ms
+
+    await log_event("timer_reset", details={"date": today})
+    return {"status": "reset", "total_work_time": "0h 0m", "accumulated_break": "5m", "current_mode": "work_silence"}
 
 
 # ============ Pavlok Endpoints ============
@@ -3893,6 +4409,103 @@ async def set_work_mode(request: WorkModeRequest):
         "old_mode": old_mode,
         "new_mode": request.mode,
         "timer_updated": timer_updated,
+    }
+
+
+LOCATION_MODE_MAP = {
+    ("home", "exit"):    "clocked_out",
+    ("home", "enter"):   "clocked_in",
+    ("gym", "enter"):    "gym",
+    ("gym", "exit"):     "clocked_out",
+    ("campus", "enter"): "clocked_out",
+    ("campus", "exit"):  None,  # tracking only, no mode change
+}
+
+
+class LocationEventRequest(BaseModel):
+    location: str = Field(..., description="Location name: home, gym, work")
+    action: str = Field(..., description="enter or exit")
+    source: str = Field(default="macrodroid", description="Source of the event")
+
+
+@app.post("/api/location")
+async def handle_location_event(request: LocationEventRequest):
+    """
+    Handle geofence location events from MacroDroid.
+    Maps location+action pairs to work modes with zone state tracking.
+
+    State machine rules:
+    - enter while in same zone → duplicate, ignored
+    - enter while in different zone → log implied exit for old zone, then process enter
+    - exit while not in that zone → log as stale but still process (recover from missed events)
+    - exit: sets zone to None; enter: sets zone to new location
+    """
+    location = request.location.lower()
+    action = request.action.lower()
+    key = (location, action)
+    current_zone = DESKTOP_STATE.get("location_zone")
+    notes = []
+
+    print(f">>> Location event: {location}:{action} current_zone={current_zone}")
+
+    # --- State machine validation ---
+    if action == "enter":
+        if current_zone == location:
+            await log_event("location_event", details={
+                "location": location, "action": action,
+                "status": "duplicate", "current_zone": current_zone,
+                "source": request.source,
+            })
+            return {"status": "duplicate", "reason": f"Already in {location}", "zone": current_zone}
+
+        if current_zone is not None and current_zone != location:
+            # Geofence exit didn't fire — log the implied exit
+            notes.append(f"implied_exit:{current_zone}")
+            print(f">>> Implied exit from {current_zone} (no exit event received)")
+            await log_event("location_event", details={
+                "location": current_zone, "action": "exit",
+                "implied": True, "reason": f"entered {location} without exiting {current_zone}",
+                "source": "state_machine",
+            })
+
+        DESKTOP_STATE["location_zone"] = location
+
+    elif action == "exit":
+        if current_zone != location:
+            notes.append(f"stale_exit:was_{current_zone}")
+            print(f">>> Stale exit for {location} (tracked zone={current_zone}), processing anyway")
+        DESKTOP_STATE["location_zone"] = None
+
+    # --- Mode change ---
+    new_mode = LOCATION_MODE_MAP.get(key)
+    result = {}
+
+    if new_mode is not None:
+        work_mode_req = WorkModeRequest(
+            mode=new_mode,
+            source=f"macrodroid:{location}:{action}"
+        )
+        result = await set_work_mode(work_mode_req)
+    else:
+        print(f">>> Location tracking only for {key}, no mode change")
+
+    await log_event("location_event", details={
+        "location": location,
+        "action": action,
+        "mapped_mode": new_mode,
+        "prev_zone": current_zone,
+        "notes": notes or None,
+        "source": request.source,
+    })
+
+    return {
+        "status": "ok",
+        "location": location,
+        "action": action,
+        "mode": new_mode,
+        "prev_zone": current_zone,
+        "notes": notes or None,
+        **result,
     }
 
 
@@ -5217,27 +5830,86 @@ async def tts_queue_worker():
             await asyncio.sleep(1)
 
 
+# Timer session tracking globals
+_current_session_id = 0
+_session_start_ms = 0
+_mode_change_count = 0
+
+
 async def timer_worker():
     """Background worker: ticks timer every 1s, persists state periodically."""
+    global _current_session_id, _session_start_ms, _mode_change_count
     last_daily_update = 0.0
     last_db_save = 0.0
+    last_mode = timer_engine.current_mode.value
+    today = datetime.now().strftime("%Y-%m-%d")
+    
+    # Start initial session
+    _current_session_id = await timer_start_session(timer_engine.current_mode.value, today)
+    _session_start_ms = int(time.monotonic() * 1000)
 
     while True:
         try:
             await asyncio.sleep(1)
             now_ms = int(time.monotonic() * 1000)
-            today = datetime.now().strftime("%Y-%m-%d")
-            result = timer_engine.tick(now_ms, today)
+            now = datetime.now()
+            today = now.strftime("%Y-%m-%d")
+            current_hour = now.hour
+            result = timer_engine.tick(now_ms, today, current_hour)
 
             # Handle events
             for event in result.events:
                 if event == TimerEvent.BREAK_EXHAUSTED:
+                    await timer_log_shift(timer_engine.current_mode.value, "break_exhausted",
+                                         trigger="enforcement", source="timer_worker")
                     asyncio.create_task(_async_enforce_break_exhausted())
                 elif event == TimerEvent.DAILY_RESET:
                     print(f"TIMER: Daily reset (was {result.reset_date}, now {today}). Productivity score: {result.productivity_score}")
-                    await asyncio.to_thread(
-                        _write_productivity_score, result.reset_date, result.productivity_score
+                    # End current session
+                    if _current_session_id > 0:
+                        duration_ms = now_ms - _session_start_ms
+                        await timer_end_session(_current_session_id, duration_ms, break_earned_ms=timer_engine.total_break_time_ms)
+                    # Save daily score
+                    await timer_save_daily_score(
+                        result.reset_date, 
+                        result.productivity_score or 0,
+                        timer_engine.total_work_time_ms,
+                        timer_engine.total_break_time_ms,
+                        _mode_change_count,
+                        _mode_change_count
                     )
+                    # Generate daily analytics before wiping shifts
+                    await generate_daily_timer_analytics(result.reset_date)
+                    await timer_log_shift(result.old_mode.value if result.old_mode else None,
+                                         "work_silence", trigger="daily_reset", source="timer_worker")
+                    # Reset for new day
+                    _mode_change_count = 0
+                    _current_session_id = await timer_start_session(timer_engine.current_mode.value, today)
+                    _session_start_ms = now_ms
+                elif event == TimerEvent.MODE_CHANGED and result.old_mode:
+                    # End previous session
+                    if _current_session_id > 0:
+                        duration_ms = now_ms - _session_start_ms
+                        # Calculate break earned/used for the session
+                        if result.old_mode.value.startswith("work_") or result.old_mode == TimerMode.GYM:
+                            await timer_end_session(_current_session_id, duration_ms, break_earned_ms=timer_engine.total_break_time_ms)
+                        else:
+                            await timer_end_session(_current_session_id, duration_ms, break_used_ms=timer_engine.total_break_time_ms)
+                    # Log mode change
+                    await timer_log_mode_change(result.old_mode.value if result.old_mode else None, timer_engine.current_mode.value, is_automatic=False)
+                    _mode_change_count += 1
+                    # Start new session
+                    _current_session_id = await timer_start_session(timer_engine.current_mode.value, today)
+                    _session_start_ms = now_ms
+
+            # Twitter 7-minute enforcement
+            twitter_since = PHONE_STATE.get("twitter_open_since")
+            if twitter_since is not None:
+                twitter_elapsed = time.monotonic() - twitter_since
+                if twitter_elapsed > 420:  # 7 minutes
+                    print(f"TIMER: Twitter open for {twitter_elapsed:.0f}s (>7min). Forcing break.")
+                    PHONE_STATE["twitter_open_since"] = None  # one-shot per session
+                    asyncio.create_task(_async_enforce_twitter_timeout())
 
             now = time.time()
 
@@ -5265,6 +5937,41 @@ async def _async_enforce_break_exhausted():
     print("TIMER: Enforcing break exhaustion")
     result = await enforce_break_exhausted_impl()
     await log_event("break_exhausted_enforcement", details=result)
+
+
+async def _async_enforce_twitter_timeout():
+    """Enforce Twitter 7-minute timeout: notify, zap, force break."""
+    global _current_session_id, _session_start_ms
+    now_ms = int(time.monotonic() * 1000)
+
+    # Send notification sound + TTS
+    play_sound()
+    try:
+        subprocess.Popen(["say", "-v", "Daniel", "Twitter open for 7 minutes. Forcing break."])
+    except Exception:
+        pass
+
+    # Send low-intensity Pavlok zap
+    send_pavlok_stimulus(stimulus_type="zap", value=30, reason="twitter_timeout")
+
+    # Force timer into BREAK mode (bypass lock)
+    old_mode = timer_engine.current_mode.value
+    timer_engine._manual_mode_lock = False
+    timer_engine._manual_mode_lock_until_ms = None
+    changed, _ = timer_engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=now_ms)
+    if changed:
+        today = datetime.now().strftime("%Y-%m-%d")
+        await timer_log_mode_change(old_mode, "break", is_automatic=False)
+        await timer_log_shift(old_mode, "break", trigger="enforcement", source="timer_worker",
+                              phone_app="twitter")
+        await timer_end_session(_current_session_id, now_ms - _session_start_ms)
+        _current_session_id = await timer_start_session("break", today)
+        _session_start_ms = now_ms
+
+    await log_event("twitter_timeout_enforcement", details={
+        "old_mode": old_mode,
+        "forced_break": changed,
+    })
 
 
 async def enforce_break_exhausted_impl() -> dict:
@@ -5878,13 +6585,22 @@ async def handle_session_end(payload: dict) -> dict:
 
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT id, device_id FROM claude_instances WHERE id = ?",
+            "SELECT id, device_id, COALESCE(is_subagent, 0) FROM claude_instances WHERE id = ?",
             (session_id,)
         )
         row = await cursor.fetchone()
 
         if not row:
             return {"success": False, "action": "not_found", "instance_id": session_id}
+
+        is_subagent = row[2]
+
+        # Count non-subagent active instances BEFORE stopping
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle') AND COALESCE(is_subagent, 0) = 0"
+        )
+        count_row = await cursor.fetchone()
+        was_active = count_row[0] if count_row else 0
 
         await db.execute(
             "UPDATE claude_instances SET status = 'stopped', stopped_at = ? WHERE id = ?",
@@ -5899,9 +6615,20 @@ async def handle_session_end(payload: dict) -> dict:
         count_row = await cursor.fetchone()
         remaining_active = count_row[0] if count_row else 0
 
+        # Count remaining non-subagent active instances
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle') AND COALESCE(is_subagent, 0) = 0"
+        )
+        count_row = await cursor.fetchone()
+        remaining_non_sub = count_row[0] if count_row else 0
+
     logger.info(f"Hook: SessionEnd stopped {session_id[:12]}...")
     await log_event("instance_stopped", instance_id=session_id, device_id=row[1],
                     details={"source": "hook"})
+
+    # Instance count Pavlok signals (skip subagents)
+    if not is_subagent:
+        await check_instance_count_pavlok(remaining_non_sub, was_active)
 
     # Handle productivity enforcement if needed
     result = {"success": True, "action": "stopped", "instance_id": session_id}

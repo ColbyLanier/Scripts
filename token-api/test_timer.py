@@ -48,11 +48,11 @@ class TestFormatTimerTime:
 # ---- Basic tick ----
 
 class TestBasicTick:
-    def test_silence_earns_half_rate(self):
-        """60s of work_silence → 30_000ms break earned."""
+    def test_silence_earns_quarter_rate(self):
+        """60s of work_silence → 15_000ms break earned (parity with music)."""
         engine = make_engine(0)
         advance(engine, 0, 60)
-        assert engine.accumulated_break_ms == 30_000
+        assert engine.accumulated_break_ms == 15_000
 
     def test_music_earns_quarter_rate(self):
         """60s of work_music → 15_000ms break earned."""
@@ -104,13 +104,13 @@ class TestBasicTick:
 
 class TestModeSwitch:
     def test_silence_to_music(self):
-        """Switch from silence to music, verify rates change."""
+        """Switch from silence to music, verify rates are same (parity)."""
         engine = make_engine(0)
-        advance(engine, 0, 60)  # 30s break earned
+        advance(engine, 0, 60)  # 15s break earned (silence = 1/4 rate)
         changed, _ = engine.set_mode(TimerMode.WORK_MUSIC, is_automatic=False, now_mono_ms=60_000)
         assert changed
-        advance(engine, 60_000, 60)  # 15s more break
-        assert engine.accumulated_break_ms == 45_000
+        advance(engine, 60_000, 60)  # 15s more break (music = 1/4 rate)
+        assert engine.accumulated_break_ms == 30_000
 
     def test_same_mode_returns_false(self):
         engine = make_engine(0)
@@ -127,9 +127,9 @@ class TestModeSwitch:
     def test_set_mode_finalizes_previous_period(self):
         """set_mode calls _advance internally, capturing elapsed time."""
         engine = make_engine(0)
-        # Advance 10s in silence (should earn 5000ms break)
+        # Advance 10s in silence (should earn 2500ms break at 1/4 rate)
         changed, _ = engine.set_mode(TimerMode.WORK_MUSIC, is_automatic=False, now_mono_ms=10_000)
-        assert engine.accumulated_break_ms == 5_000
+        assert engine.accumulated_break_ms == 2_500
 
 
 # ---- Video penalty ----
@@ -138,19 +138,19 @@ class TestVideoPenalty:
     def test_video_decreases_break(self):
         """Accumulate break, switch to video, verify break decreases."""
         engine = make_engine(0)
-        advance(engine, 0, 60)  # 30_000ms break
+        advance(engine, 0, 60)  # 15_000ms break (silence at 1/4 rate)
         engine.set_mode(TimerMode.WORK_VIDEO, is_automatic=False, now_mono_ms=60_000)
         advance(engine, 60_000, 60)  # -15_000ms (video penalty)
-        assert engine.accumulated_break_ms == 15_000
+        assert engine.accumulated_break_ms == 0
 
     def test_gaming_decreases_break_faster(self):
         """Gaming penalty is twice video."""
         engine = make_engine(0)
-        advance(engine, 0, 60)  # 30_000ms break
+        advance(engine, 0, 60)  # 15_000ms break (silence at 1/4 rate)
         engine.set_mode(TimerMode.WORK_GAMING, is_automatic=False, now_mono_ms=60_000)
-        advance(engine, 60_000, 60)  # -30_000ms (gaming penalty)
+        advance(engine, 60_000, 60)  # -30_000ms (gaming penalty) → 15k backlog
         assert engine.accumulated_break_ms == 0
-        assert engine.break_backlog_ms == 0  # exactly zeroed, no backlog
+        assert engine.break_backlog_ms == 15_000  # overshoot into backlog
 
 
 # ---- Break consumption ----
@@ -159,10 +159,10 @@ class TestBreakConsumption:
     def test_break_mode_consumes_accumulated(self):
         """Enter break mode, verify accumulated_break_ms decreases."""
         engine = make_engine(0)
-        advance(engine, 0, 60)  # 30_000ms break earned
+        advance(engine, 0, 60)  # 15_000ms break earned (silence at 1/4 rate)
         engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=60_000)
         advance(engine, 60_000, 10)  # consume 10_000ms
-        assert engine.accumulated_break_ms == 20_000
+        assert engine.accumulated_break_ms == 5_000
         assert engine.total_break_time_ms == 10_000
 
     def test_break_tracks_break_time(self):
@@ -179,10 +179,10 @@ class TestBreakExhaustion:
     def test_break_exhaustion_event(self):
         """Consume all break time → BREAK_EXHAUSTED event."""
         engine = make_engine(0)
-        advance(engine, 0, 60)  # 30_000ms break
+        advance(engine, 0, 60)  # 15_000ms break (silence at 1/4 rate)
         engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=60_000)
-        # Consume 31s of break (more than available)
-        result = advance(engine, 60_000, 31)
+        # Consume 16s of break (more than 15s available)
+        result = advance(engine, 60_000, 16)
         assert TimerEvent.BREAK_EXHAUSTED in result.events
         assert engine.accumulated_break_ms == 0
         assert engine.break_backlog_ms > 0
@@ -190,12 +190,12 @@ class TestBreakExhaustion:
     def test_video_exhaustion(self):
         """Video penalty can exhaust break."""
         engine = make_engine(0)
-        advance(engine, 0, 20)  # 10_000ms break
+        advance(engine, 0, 20)  # 5_000ms break (silence at 1/4 rate)
         engine.set_mode(TimerMode.WORK_VIDEO, is_automatic=False, now_mono_ms=20_000)
-        # 41s of video = 10_250ms penalty, exceeds 10_000ms break
+        # 21s of video = 5_250ms penalty, exceeds 5_000ms break
         last = TickResult()
         exhausted = False
-        for i in range(41):
+        for i in range(21):
             last = engine.tick(20_000 + (i + 1) * 1000, "2026-02-11")
             if TimerEvent.BREAK_EXHAUSTED in last.events:
                 exhausted = True
@@ -224,7 +224,7 @@ class TestBacklog:
         assert engine.break_backlog_ms == 10_000
 
         engine.set_mode(TimerMode.WORK_SILENCE, is_automatic=False, now_mono_ms=40_000)
-        advance(engine, 40_000, 40)  # 20_000ms earned → 10_000 to backlog, 10_000 to break
+        advance(engine, 40_000, 80)  # 80s silence at 1/4 = 20_000ms earned → 10k backlog, 10k break
         assert engine.break_backlog_ms == 0
         assert engine.accumulated_break_ms == 10_000
 
@@ -248,8 +248,8 @@ class TestIdleDetection:
         # Jump 15 minutes
         result = engine.tick(10_000 + 15 * 60 * 1000, "2026-02-11")
         assert TimerEvent.BREAK_EXHAUSTED not in result.events
-        # Only the first 10s of work should have accumulated
-        assert engine.accumulated_break_ms == 5_000
+        # Only the first 10s of work should have accumulated (at 1/4 rate)
+        assert engine.accumulated_break_ms == 2_500
 
     def test_exactly_at_threshold(self):
         """Gap exactly at MAX_IDLE_MS is still idle."""
@@ -266,26 +266,27 @@ class TestDailyReset:
         """Tick with new date → DAILY_RESET event, counters zeroed."""
         engine = make_engine(0, "2026-02-10")
         advance(engine, 0, 60, date="2026-02-10")  # accumulate some state
-        assert engine.accumulated_break_ms == 30_000
+        assert engine.accumulated_break_ms == 15_000
 
         result = engine.tick(61_000, "2026-02-11")
         assert TimerEvent.DAILY_RESET in result.events
         assert result.reset_date == "2026-02-10"
-        # 30_000ms // (1000 * 60) = 0 (less than 1 full minute)
+        # 15_000ms // (1000 * 60) = 0 (less than 1 full minute)
         assert result.productivity_score == 0
 
     def test_reset_productivity_score(self):
         """Productivity score = accumulated_break_ms // (1000 * 60)."""
         engine = make_engine(0, "2026-02-10")
-        advance(engine, 0, 240, date="2026-02-10")  # 120_000ms break
+        advance(engine, 0, 240, date="2026-02-10")  # 60_000ms break (240s * 1/4)
         result = engine.tick(241_000, "2026-02-11")
-        assert result.productivity_score == 2  # 120_000 // 60_000 = 2
+        assert result.productivity_score == 1  # 60_000 // 60_000 = 1
 
     def test_reset_clears_counters(self):
         engine = make_engine(0, "2026-02-10")
         advance(engine, 0, 60, date="2026-02-10")
         engine.tick(61_000, "2026-02-11")
-        assert engine.accumulated_break_ms == 0
+        from timer import DEFAULT_BREAK_BUFFER_MS
+        assert engine.accumulated_break_ms == DEFAULT_BREAK_BUFFER_MS  # 5 min starting buffer
         assert engine.break_backlog_ms == 0
         assert engine.total_work_time_ms == 0
         assert engine.total_break_time_ms == 0
@@ -442,7 +443,7 @@ class TestSerialization:
         d = engine.to_export_dict()
         assert "currentMode" in d
         assert "breakAvailableSeconds" in d
-        assert d["breakAvailableSeconds"] == 30  # 30_000ms = 30s
+        assert d["breakAvailableSeconds"] == 15  # 15_000ms = 15s
 
 
 # ---- Edge cases ----
@@ -465,9 +466,8 @@ class TestEdgeCases:
         engine = make_engine(0)
         for i in range(1000):
             engine.tick(i * 100, "2026-02-11")  # 100ms ticks for 100s
-        # 99.9s of silence at 0.5 rate ≈ 49_950ms
-        # Actually: 999 ticks of 100ms each = 99_900ms total, * 1/2 = 49_950ms
-        assert engine.accumulated_break_ms == 49_950
+        # 999 ticks of 100ms each = 99_900ms total, * 1/4 = 24_975ms
+        assert engine.accumulated_break_ms == 24_975
 
     def test_initial_mode_is_work_silence(self):
         engine = TimerEngine(now_mono_ms=0)
@@ -476,11 +476,11 @@ class TestEdgeCases:
     def test_break_exhaustion_exact_zero(self):
         """When break hits exactly 0 (no overshoot), no backlog created."""
         engine = make_engine(0)
-        # Earn exactly 10_000ms break (20s silence)
+        # Earn exactly 5_000ms break (20s silence at 1/4 rate)
         advance(engine, 0, 20)
-        assert engine.accumulated_break_ms == 10_000
-        # Consume exactly 10_000ms in break mode
+        assert engine.accumulated_break_ms == 5_000
+        # Consume exactly 5_000ms in break mode
         engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=20_000)
-        advance(engine, 20_000, 10)
+        advance(engine, 20_000, 5)
         assert engine.accumulated_break_ms == 0
         assert engine.break_backlog_ms == 0

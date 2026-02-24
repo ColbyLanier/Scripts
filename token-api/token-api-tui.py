@@ -104,7 +104,7 @@ show_subagents = False  # Hide subagents by default, toggle with 'a'
 table_mode = "instances"  # "instances" or "cron"
 cron_selected_index = 0
 panel_page = 0  # 0 = events view, 1 = server logs view, 2 = deploy logs view
-PANEL_PAGE_MAX = 3  # 0=Events, 1=Logs, 2=Deploy, 3=Monitor
+PANEL_PAGE_MAX = 4  # 0=Events, 1=Logs, 2=Deploy, 3=Monitor, 4=Timer Stats
 deploy_active = False
 deploy_log_path = None
 deploy_metadata = {}
@@ -1813,8 +1813,169 @@ def get_cached_cron_jobs() -> list:
     return _cron_jobs_cache
 
 
+_timer_shifts_cache = {}
+_timer_shifts_cache_time = 0.0
+
+def _fetch_timer_shifts() -> dict:
+    """Fetch timer shift analytics from API (cached 5s)."""
+    global _timer_shifts_cache, _timer_shifts_cache_time
+    now = time.time()
+    if now - _timer_shifts_cache_time < 5 and _timer_shifts_cache:
+        return _timer_shifts_cache
+    try:
+        req = urllib.request.Request(f"{API_URL}/api/timer/shifts")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            _timer_shifts_cache = json.loads(resp.read().decode())
+            _timer_shifts_cache_time = now
+    except Exception:
+        pass
+    return _timer_shifts_cache
+
+
+def _sparkline(values: list, width: int = 40) -> str:
+    """Render a Unicode sparkline from a list of numeric values.
+
+    Uses block characters ▁▂▃▄▅▆▇█ for 8 levels of granularity.
+    Returns empty string if no values.
+    """
+    if not values:
+        return ""
+    blocks = " ▁▂▃▄▅▆▇█"
+    # Downsample if more points than width
+    if len(values) > width:
+        step = len(values) / width
+        sampled = [values[int(i * step)] for i in range(width)]
+    else:
+        sampled = values
+
+    mn = min(sampled)
+    mx = max(sampled)
+    rng = mx - mn if mx != mn else 1
+    return "".join(blocks[min(8, max(1, int((v - mn) / rng * 8)))] for v in sampled)
+
+
+def _mode_bar(mode_dist: dict, width: int = 36) -> Text:
+    """Render a colored horizontal bar showing time distribution per mode."""
+    MODE_COLORS = {
+        "work_silence": "bright_white",
+        "work_music": "cyan",
+        "work_video": "yellow",
+        "work_gaming": "red",
+        "work_gym": "green",
+        "gym": "bright_green",
+        "break": "blue",
+        "pause": "magenta",
+        "sleeping": "dim",
+    }
+    MODE_CHARS = {
+        "work_silence": "░",
+        "work_music": "▒",
+        "work_video": "▓",
+        "work_gaming": "█",
+        "work_gym": "▓",
+        "gym": "█",
+        "break": "▒",
+        "pause": "░",
+        "sleeping": "·",
+    }
+
+    total = sum(mode_dist.values())
+    if total == 0:
+        return Text("No mode data", style="dim")
+
+    text = Text()
+    for mode, secs in sorted(mode_dist.items(), key=lambda x: -x[1]):
+        chars = max(1, round(secs / total * width))
+        color = MODE_COLORS.get(mode, "white")
+        char = MODE_CHARS.get(mode, "▒")
+        text.append(char * chars, style=color)
+    return text
+
+
+def create_timer_stats_panel(max_lines: int = 8) -> Panel:
+    """Create timer stats panel with sparkline, mode distribution, and shift stats."""
+    data = _fetch_timer_shifts()
+
+    if not data or data.get("total_shifts", 0) == 0:
+        return Panel("[dim]No timer shifts recorded today[/dim]", title="Timer Stats", border_style="magenta")
+
+    lines = []
+
+    # Break balance sparkline
+    series = data.get("balance_series", [])
+    if series:
+        spark = _sparkline(series, width=42)
+        mn = min(series)
+        mx = max(series)
+        lines.append(f"[bold]Break Balance[/bold]  [dim]{mn:.0f}m[/dim] {spark} [dim]{mx:.0f}m[/dim]")
+    else:
+        lines.append("[bold]Break Balance[/bold]  [dim]no data[/dim]")
+
+    # Mode distribution bar
+    mode_dist = data.get("mode_distribution", {})
+    if mode_dist:
+        bar = _mode_bar(mode_dist)
+        bar_line = Text()
+        bar_line.append("Modes ", style="bold")
+        bar_line.append("  ")
+        bar_line.append_text(bar)
+        lines.append(bar_line)
+
+        # Mode legend (compact)
+        legend_parts = []
+        total = sum(mode_dist.values())
+        MODE_SHORTS = {
+            "work_silence": ("░ sil", "bright_white"),
+            "work_music": ("▒ mus", "cyan"),
+            "work_video": ("▓ vid", "yellow"),
+            "work_gaming": ("█ game", "red"),
+            "break": ("▒ brk", "blue"),
+            "pause": ("░ paus", "magenta"),
+        }
+        for mode, secs in sorted(mode_dist.items(), key=lambda x: -x[1]):
+            pct = round(secs / total * 100)
+            if pct < 3:
+                continue
+            short, color = MODE_SHORTS.get(mode, (mode[-4:], "white"))
+            legend_parts.append(f"[{color}]{short}[/{color}] {pct}%")
+        if legend_parts:
+            lines.append("  " + "  ".join(legend_parts[:4]))
+
+    # Stats row
+    shifts = data.get("total_shifts", 0)
+    enforcements = data.get("enforcement_count", 0)
+    twitter = data.get("twitter_shifts", 0)
+    triggers = data.get("shifts_by_trigger", {})
+
+    stats = f"[bold]Shifts[/bold] {shifts}"
+    if enforcements:
+        stats += f"  [red bold]Enforcements[/red bold] {enforcements}"
+    if twitter:
+        stats += f"  [yellow]Twitter[/yellow] {twitter}"
+    lines.append(stats)
+
+    # Trigger breakdown (compact)
+    if triggers:
+        trigger_parts = []
+        for t, count in sorted(triggers.items(), key=lambda x: -x[1]):
+            trigger_parts.append(f"[dim]{t}[/dim]={count}")
+        lines.append("  " + "  ".join(trigger_parts[:5]))
+
+    # Join lines — handle mixed str/Text
+    content = Text()
+    for i, line in enumerate(lines[:max_lines]):
+        if i > 0:
+            content.append("\n")
+        if isinstance(line, Text):
+            content.append_text(line)
+        else:
+            content.append_text(Text.from_markup(line))
+
+    return Panel(content, title="Timer Stats", border_style="magenta")
+
+
 def create_info_panel(max_lines: int = 8) -> Panel:
-    """Create the info panel - events, server logs, deploy logs, or monitor based on panel_page."""
+    """Create the info panel - events, server logs, deploy logs, monitor, or timer stats based on panel_page."""
     if panel_page == 0:
         events = get_recent_events(max_lines)
         return create_events_panel(events)
@@ -1822,12 +1983,14 @@ def create_info_panel(max_lines: int = 8) -> Panel:
         return create_server_logs_panel(max_lines=max_lines)
     elif panel_page == 2:
         return create_deploy_logs_panel(max_lines=max_lines)
-    else:
+    elif panel_page == 3:
         return create_monitor_panel(max_lines=max_lines)
+    else:
+        return create_timer_stats_panel(max_lines=max_lines)
 
 
 def create_mobile_info_panel(max_lines: int = 4) -> Panel:
-    """Create a compact info panel for mobile - events, server logs, deploy logs, or monitor based on panel_page."""
+    """Create a compact info panel for mobile - events, server logs, deploy logs, monitor, or timer stats based on panel_page."""
     if panel_page == 0:
         events = get_recent_events(max_lines)
         return create_mobile_events_panel(events)
@@ -1835,8 +1998,10 @@ def create_mobile_info_panel(max_lines: int = 4) -> Panel:
         return create_server_logs_panel(max_lines=max_lines)
     elif panel_page == 2:
         return create_deploy_logs_panel(max_lines=max_lines)
-    else:
+    elif panel_page == 3:
         return create_monitor_panel(max_lines=max_lines)
+    else:
+        return create_timer_stats_panel(max_lines=max_lines)
 
 
 def create_status_bar(instances: list, selected_idx: int) -> Text:
@@ -1851,7 +2016,7 @@ def create_status_bar(instances: list, selected_idx: int) -> Text:
     mode_color = mode_colors.get(layout_mode, "white")
 
     # Page indicator
-    page_names = ["Events", "Logs", "Deploy", "Monitor"]
+    page_names = ["Events", "Logs", "Deploy", "Monitor", "Timer"]
     page_name = page_names[panel_page] if panel_page < len(page_names) else "?"
 
     # Filter indicator
@@ -1923,7 +2088,7 @@ def create_mobile_status_bar(instances: list, selected_idx: int) -> Text:
     total_count = len(instances)
 
     # Page indicator
-    page_indicators = {0: "E", 1: "L", 2: "D", 3: "M"}
+    page_indicators = {0: "E", 1: "L", 2: "D", 3: "M", 4: "T"}
     page_indicator = page_indicators.get(panel_page, "?")
 
     table_tag = "C" if table_mode == "cron" else "I"

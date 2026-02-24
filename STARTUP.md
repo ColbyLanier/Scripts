@@ -1,11 +1,49 @@
-# Windows Startup Audit
+# Startup Audit (All Devices)
 
-> Last updated: 2026-02-19
+> Last updated: 2026-02-22
 
-Central reference for all custom startup automations on this machine.
-Everything runs at logon unless noted otherwise.
+Central reference for all custom startup automations across devices.
 
 ---
+
+# Mac Mini (100.95.109.23)
+
+## LaunchAgents (`~/Library/LaunchAgents/`)
+
+| Label | State | What It Does |
+|-------|-------|-------------|
+| **ai.openclaw.tokenapi** | enabled | Token API — FastAPI on `:7777` (uvicorn). KeepAlive on crash. Logs: `~/.claude/token-api-std{out,err}.log` |
+| **ai.openclaw.caffeinate** | enabled | `caffeinate -dims` — prevents display, idle, system, and disk sleep. KeepAlive always. **Added 2026-02-22** (was previously relying on openclaw cron watchdog, which used wrong flags) |
+| **ai.openclaw.gateway** | enabled | OpenClaw gateway |
+| **ai.openclaw.discord-context** | enabled | Discord context collector |
+
+### Disabled / Backed Up
+
+| Label | Notes |
+|-------|-------|
+| **ai.openclaw.watchdog** | `.plist.disabled` — superseded by openclaw cron `overnight-watchdog` |
+
+## Mac Boot Sequence
+
+1. macOS login
+2. launchd loads all `~/Library/LaunchAgents/*.plist` with `RunAtLoad`
+3. **caffeinate** starts immediately — display stays on
+4. **tokenapi** starts on `:7777`
+5. **gateway** + **discord-context** start
+6. Windows PC boots → Deskflow KVM connects → `POST /api/kvm/start` signals Mac
+
+## Power Settings (`pmset`)
+
+```
+displaysleep    10      ← overridden by caffeinate -d
+sleep           0       ← system sleep disabled
+autorestart     1       ← restart after power loss
+womp            1       ← wake on LAN
+```
+
+---
+
+# Windows PC (Task Scheduler + WSL)
 
 ## Task Scheduler (All Custom Tasks)
 

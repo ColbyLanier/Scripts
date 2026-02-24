@@ -19,6 +19,7 @@ class TimerMode(str, Enum):
     GYM = "gym"
     BREAK = "break"
     PAUSE = "pause"
+    SLEEPING = "sleeping"
 
 
 class TimerEvent(Enum):
@@ -38,16 +39,18 @@ class TickResult:
 # Break rates as (numerator, denominator) — integer rational arithmetic.
 # break_delta_ms = elapsed_ms * numerator // denominator
 BREAK_RATE_TABLE: dict[TimerMode, tuple[int, int]] = {
-    TimerMode.WORK_SILENCE: (1, 2),   # +30 min/hr
+    TimerMode.WORK_SILENCE: (1, 4),   # +15 min/hr (parity with music)
     TimerMode.WORK_MUSIC: (1, 4),     # +15 min/hr
     TimerMode.WORK_VIDEO: (-1, 4),    # -15 min/hr
     TimerMode.WORK_GAMING: (-1, 2),   # -30 min/hr
     TimerMode.WORK_GYM: (3, 4),       # +45 min/hr
     TimerMode.GYM: (1, 1),            # +60 min/hr
+    TimerMode.SLEEPING: (0, 1),       # 0 min/hr - neutral, doesn't impact break
 }
 
 MAX_IDLE_MS = 10 * 60 * 1000  # 10 minutes
-MANUAL_LOCK_DURATION_MS = 30 * 60 * 1000  # 30 minutes
+MANUAL_LOCK_DURATION_MS = 20 * 60 * 1000  # 20 minutes
+DEFAULT_BREAK_BUFFER_MS = 5 * 60 * 1000   # 5 minutes - starting break on reset
 
 
 def format_timer_time(ms: int) -> str:
@@ -66,7 +69,7 @@ class TimerEngine:
     Pure computation — no I/O, no globals, deterministically testable.
     """
 
-    def __init__(self, now_mono_ms: int):
+    def __init__(self, now_mono_ms: int, reset_hour: int = 9):
         self._current_mode: TimerMode = TimerMode.WORK_SILENCE
         self._total_work_time_ms: int = 0
         self._total_break_time_ms: int = 0
@@ -76,6 +79,7 @@ class TimerEngine:
         self._last_tick_ms: int = now_mono_ms
         self._manual_mode_lock: bool = False
         self._manual_mode_lock_until_ms: int | None = None
+        self._reset_hour: int = reset_hour  # Hour (0-23) when daily reset happens
 
     # ---- Read-only properties ----
 
@@ -109,11 +113,25 @@ class TimerEngine:
 
     # ---- Core methods ----
 
-    def tick(self, now_mono_ms: int, today_date: str) -> TickResult:
-        """Main tick: check daily reset, then advance counters."""
-        reset_result = self._check_daily_reset(now_mono_ms, today_date)
+    def tick(self, now_mono_ms: int, today_date: str, current_hour: int | None = None) -> TickResult:
+        """Main tick: check daily reset, then advance counters.
+        
+        Args:
+            now_mono_ms: Monotonic timestamp in milliseconds
+            today_date: Today's date as YYYY-MM-DD string
+            current_hour: Current hour (0-23). If provided along with date change,
+                         only resets if hour >= reset_hour (default 9).
+        """
+        reset_result = self._check_daily_reset(now_mono_ms, today_date, current_hour)
         if reset_result is not None:
             return reset_result
+        
+        # Auto-switch from sleeping to work at reset hour
+        if (current_hour is not None 
+            and current_hour >= self._reset_hour 
+            and self._current_mode == TimerMode.SLEEPING):
+            return self.set_mode(TimerMode.WORK_SILENCE, is_automatic=True, now_mono_ms=now_mono_ms)[1]
+        
         return self._advance(now_mono_ms)
 
     def set_mode(
@@ -250,8 +268,11 @@ class TimerEngine:
         self._last_tick_ms = now_mono_ms
         return result
 
-    def _check_daily_reset(self, now_mono_ms: int, today_date: str) -> TickResult | None:
-        """Check and perform daily reset. Returns TickResult if reset happened."""
+    def _check_daily_reset(self, now_mono_ms: int, today_date: str, current_hour: int | None = None) -> TickResult | None:
+        """Check and perform daily reset. Returns TickResult if reset happened.
+        
+        Resets at _reset_hour (default 9 AM) when date changes.
+        """
         if self._daily_start_date is None:
             self._daily_start_date = today_date
             return None
@@ -259,7 +280,15 @@ class TimerEngine:
         if self._daily_start_date == today_date:
             return None
 
-        # Day changed — calculate productivity score and reset
+        # Date changed - check if we're past the reset hour
+        # If current_hour < reset_hour, we haven't hit the reset time yet today
+        # (e.g., it's 7 AM but reset_hour is 9, so don't reset yet)
+        if current_hour is not None and current_hour < self._reset_hour:
+            # Haven't reached reset hour yet today - update date but don't reset timer
+            self._daily_start_date = today_date
+            return None
+
+        # Day changed (and past reset hour) — calculate productivity score and reset
         productivity_score = max(0, self._accumulated_break_ms // (1000 * 60))
 
         result = TickResult()
@@ -270,7 +299,7 @@ class TimerEngine:
         self._current_mode = TimerMode.WORK_SILENCE
         self._total_work_time_ms = 0
         self._total_break_time_ms = 0
-        self._accumulated_break_ms = 0
+        self._accumulated_break_ms = DEFAULT_BREAK_BUFFER_MS  # Start with default break
         self._break_backlog_ms = 0
         self._daily_start_date = today_date
         self._last_tick_ms = now_mono_ms

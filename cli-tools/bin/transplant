@@ -26,23 +26,39 @@ log_success() { echo -e "${GREEN}✓${NC} $1"; }
 log_warn()    { echo -e "${YELLOW}!${NC} $1"; }
 log_error()   { echo -e "${RED}✗${NC} $1"; }
 
+# --- Host mapping (reuses ssh-connect aliases) ---
+host_to_ssh() {
+    case "$1" in
+        mac)   echo "mini" ;;
+        wsl)   echo "wsl" ;;
+        phone) echo "phone" ;;
+        *)     echo "Error: unknown host '$1' (expected mac, wsl, phone)" >&2; exit 1 ;;
+    esac
+}
+
 usage() {
     cat << 'EOF'
-transplant - Move the current Claude session to a different directory
+transplant - Move the current Claude session to a different directory or device
 
-Usage: transplant <target-directory>
+Usage: transplant [options] <target-directory>
 
 Kills the current Claude session and restarts it in the target directory
 with conversation history preserved via --resume --fork-session.
 
-Requires tmux (the claude wrapper auto-creates tmux sessions).
+Local mode requires tmux (the claude wrapper auto-creates tmux sessions).
 
 Options:
-  -h, --help    Show this help message
+  -h, --help     Show this help message
+  --host <name>  Target device: mac, wsl, or phone
+  --relay        Interactive relay mode (default: headless)
 
-Examples:
+Local examples:
   transplant /home/token/ProcAgentDir/ProcurementAgentAI
   transplant /tmp/transplant-test
+
+Remote examples:
+  transplant --host wsl /home/token/project       # Headless: agent continues on WSL
+  transplant --host mac --relay ~/project          # Relay: pane becomes remote session
 EOF
     exit 0
 }
@@ -52,20 +68,45 @@ encode_claude_path() {
     echo "$1" | tr '/.' '-'
 }
 
-# Walk /proc to find the Claude ancestor process
+# Walk process tree to find the Claude ancestor process
 find_claude_pid() {
     local current="$PPID"
-    for _ in 1 2 3 4 5 6 7 8; do
-        [[ -z "$current" || "$current" == "1" || "$current" == "0" ]] && break
-        local comm
-        comm=$(cat "/proc/$current/comm" 2>/dev/null) || break
-        if [[ "$comm" == "claude" ]]; then
-            echo "$current"
-            return 0
-        fi
-        current=$(awk '{print $4}' "/proc/$current/stat" 2>/dev/null) || break
-    done
+    if [[ "$(uname)" == "Darwin" ]]; then
+        # macOS: use ps (no /proc)
+        for _ in 1 2 3 4 5 6 7 8; do
+            [[ -z "$current" || "$current" == "1" || "$current" == "0" ]] && break
+            local comm
+            comm=$(ps -p "$current" -o comm= 2>/dev/null) || break
+            if [[ "$comm" == *"claude"* ]]; then
+                echo "$current"
+                return 0
+            fi
+            current=$(ps -p "$current" -o ppid= 2>/dev/null | tr -d ' ') || break
+        done
+    else
+        # Linux: use /proc
+        for _ in 1 2 3 4 5 6 7 8; do
+            [[ -z "$current" || "$current" == "1" || "$current" == "0" ]] && break
+            local comm
+            comm=$(cat "/proc/$current/comm" 2>/dev/null) || break
+            if [[ "$comm" == "claude" ]]; then
+                echo "$current"
+                return 0
+            fi
+            current=$(awk '{print $4}' "/proc/$current/stat" 2>/dev/null) || break
+        done
+    fi
     return 1
+}
+
+# Get parent PID (cross-platform)
+get_ppid() {
+    local pid=$1
+    if [[ "$(uname)" == "Darwin" ]]; then
+        ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' '
+    else
+        awk '{print $4}' "/proc/$pid/stat" 2>/dev/null
+    fi
 }
 
 # Find the tmux pane containing a given PID (walks ancestry)
@@ -78,16 +119,28 @@ find_tmux_pane() {
                 echo "$pane_id"
                 return 0
             fi
-            check_pid=$(awk '{print $4}' "/proc/$check_pid/stat" 2>/dev/null) || break
+            check_pid=$(get_ppid "$check_pid") || break
         done
     done | head -1
 }
 
 # Parse args
 TARGET_DIR=""
+REMOTE_HOST=""
+RELAY_MODE=false
 while [[ $# -gt 0 ]]; do
     case $1 in
         -h|--help) usage ;;
+        --host)
+            REMOTE_HOST="$2"
+            shift 2
+            continue
+            ;;
+        --relay)
+            RELAY_MODE=true
+            shift
+            continue
+            ;;
         -*)
             log_error "Unknown option: $1"
             exit 1
@@ -110,13 +163,112 @@ if [[ -z "$TARGET_DIR" ]]; then
     exit 1
 fi
 
-# Resolve to absolute path
-TARGET_DIR=$(cd "$TARGET_DIR" 2>/dev/null && pwd) || {
-    log_error "Target directory does not exist: $TARGET_DIR"
-    exit 1
-}
+# Resolve to absolute path (skip for remote targets)
+if [[ -z "$REMOTE_HOST" ]]; then
+    TARGET_DIR=$(cd "$TARGET_DIR" 2>/dev/null && pwd) || {
+        log_error "Target directory does not exist: $TARGET_DIR"
+        exit 1
+    }
+fi
 
 SOURCE_DIR="$PWD"
+
+# --- Remote transcript transfer ---
+scp_transcript() {
+    local ssh_target="$1" target_dir="$2" source_jsonl="$3"
+    local remote_encoded
+    remote_encoded=$(encode_claude_path "$target_dir")
+    # ssh mkdir uses $HOME (expanded by remote shell)
+    # scp uses ~ (expanded by scp itself)
+    ssh "$ssh_target" "mkdir -p \$HOME/.claude/projects/${remote_encoded}"
+    scp -q "$source_jsonl" "${ssh_target}:~/.claude/projects/${remote_encoded}/"
+}
+
+# --- Kill local Claude (signal escalation) ---
+kill_local_claude() {
+    local pid="$1"
+
+    trap '' INT HUP TERM
+
+    kill -INT "$pid" 2>/dev/null || true
+    sleep 1.5
+
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -INT "$pid" 2>/dev/null || true
+        sleep 2
+    fi
+
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+}
+
+# --- Clean up old Token API instance ---
+cleanup_old_instance() {
+    local instance_id="$1"
+    if command -v curl &>/dev/null; then
+        curl -s -X DELETE "http://localhost:7777/api/instances/${instance_id}" >/dev/null 2>&1 || true
+    fi
+}
+
+# --- Remote headless transplant ---
+transplant_remote_headless() {
+    local ssh_target="$1" session_id="$2" source_jsonl="$3" claude_pid="$4"
+
+    log_info "SCP transcript to $REMOTE_HOST..."
+    scp_transcript "$ssh_target" "$TARGET_DIR" "$source_jsonl"
+    log_success "Transcript copied to $REMOTE_HOST"
+
+    log_info "Spawning headless Claude on $REMOTE_HOST..."
+    local remote_log="\$HOME/.subagent/logs/transplant-${session_id}.log"
+    ssh "$ssh_target" "mkdir -p \$HOME/.subagent/logs && cd '$TARGET_DIR' && nohup \$HOME/.local/bin/claude --dangerously-skip-permissions --resume '$session_id' --fork-session > $remote_log 2>&1 &"
+    log_success "Remote agent spawned"
+
+    echo ""
+    echo "  Host: $REMOTE_HOST ($ssh_target)"
+    echo "  Dir:  $TARGET_DIR"
+    echo "  Log:  ~/.subagent/logs/transplant-${session_id}.log"
+    echo "  Session: ${session_id:0:12}..."
+    echo ""
+
+    log_info "Killing local Claude..."
+    kill_local_claude "$claude_pid"
+    cleanup_old_instance "$session_id"
+}
+
+# --- Remote relay transplant ---
+transplant_remote_relay() {
+    local ssh_target="$1" session_id="$2" source_jsonl="$3" claude_pid="$4" pane_target="$5"
+
+    log_info "SCP transcript to $REMOTE_HOST..."
+    scp_transcript "$ssh_target" "$TARGET_DIR" "$source_jsonl"
+    log_success "Transcript copied to $REMOTE_HOST"
+
+    echo ""
+    log_info "Relay mode: local pane will SSH into $REMOTE_HOST..."
+    echo ""
+
+    # Spawn detached daemon: waits for Claude to die, then sends ssh command to tmux pane
+    (
+        exec 0</dev/null 1>/dev/null 2>/dev/null
+
+        wait_count=0
+        while kill -0 "$claude_pid" 2>/dev/null; do
+            sleep 0.5
+            wait_count=$((wait_count + 1))
+            [[ $wait_count -ge 20 ]] && break
+        done
+        sleep 0.5
+
+        tmux send-keys -t "$pane_target" \
+            "ssh -t $ssh_target \"cd '$TARGET_DIR' && \\\$HOME/.local/bin/claude --resume '$session_id' --fork-session\"" \
+            Enter
+    ) &
+    disown
+
+    cleanup_old_instance "$session_id"
+    kill_local_claude "$claude_pid"
+}
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
@@ -124,17 +276,22 @@ echo " Session Transplant"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
 echo "  From: $SOURCE_DIR"
-echo "  To:   $TARGET_DIR"
+echo "  To:   ${REMOTE_HOST:+$REMOTE_HOST:}$TARGET_DIR"
 echo ""
 
-# Check tmux (Claude strips $TMUX from tool env, so use tmux command)
-if ! tmux display-message -p '#{session_name}' &>/dev/null; then
-    log_error "Not in tmux — transplant requires tmux"
+# Check tmux (required for local transplant and relay mode, not headless remote)
+HAVE_TMUX=false
+if tmux display-message -p '#{session_name}' &>/dev/null; then
+    HAVE_TMUX=true
+    log_success "tmux detected (session: $(tmux display-message -p '#{session_name}'))"
+elif [[ -z "$REMOTE_HOST" ]] || $RELAY_MODE; then
+    log_error "Not in tmux — transplant requires tmux (except headless remote)"
     echo ""
     echo "  Manual: cd '$TARGET_DIR' && claude --continue --fork-session"
     exit 1
+else
+    log_warn "No tmux (OK for headless remote)"
 fi
-log_success "tmux detected (session: $(tmux display-message -p '#{session_name}'))"
 
 # Find Claude PID
 claude_pid=$(find_claude_pid) || {
@@ -169,9 +326,6 @@ if [[ -z "$session_id" ]]; then
 fi
 log_success "Session ID: ${session_id:0:12}..."
 
-# Copy JSONL to target project directory
-target_encoded=$(encode_claude_path "$TARGET_DIR")
-target_project_dir="${HOME}/.claude/projects/${target_encoded}"
 source_jsonl="${source_project_dir}/${session_id}.jsonl"
 
 if [[ ! -f "$source_jsonl" ]]; then
@@ -179,93 +333,108 @@ if [[ ! -f "$source_jsonl" ]]; then
     exit 1
 fi
 
-mkdir -p "$target_project_dir"
-cp "$source_jsonl" "$target_project_dir/"
-log_success "Transcript copied → ${target_project_dir}/"
+# --- Branch: remote vs local ---
+if [[ -n "$REMOTE_HOST" ]]; then
+    ssh_target=$(host_to_ssh "$REMOTE_HOST")
 
-# Find tmux pane (Claude strips $TMUX_PANE, always use PID-based lookup)
-pane_target=$(find_tmux_pane "$claude_pid")
-if [[ -z "$pane_target" ]]; then
-    log_error "Could not identify tmux pane"
-    echo "  Fallback: cd '$TARGET_DIR' && claude --resume '$session_id' --fork-session"
-    exit 1
-fi
-log_success "Tmux pane: $pane_target"
-
-# Capture old instance name for transfer to new session
-old_tab_name=""
-old_instance_id="$session_id"
-if command -v curl &>/dev/null && command -v jq &>/dev/null; then
-    old_tab_name=$(curl -s "http://localhost:7777/api/instances" 2>/dev/null | \
-        jq -r --arg id "$old_instance_id" \
-        '.[] | select(.id == $id) | .tab_name // empty' 2>/dev/null || true)
-fi
-
-echo ""
-log_info "Transplanting session..."
-echo ""
-
-# Spawn detached restart daemon
-(
-    exec 0</dev/null 1>/dev/null 2>/dev/null
-
-    # Wait for Claude to exit
-    wait_count=0
-    while kill -0 "$claude_pid" 2>/dev/null; do
-        sleep 0.5
-        wait_count=$((wait_count + 1))
-        if [[ $wait_count -ge 20 ]]; then
-            break
-        fi
-    done
-    sleep 0.5
-
-    # Send restart command
-    tmux send-keys -t "$pane_target" \
-        "cd '$TARGET_DIR' && /home/token/.local/bin/claude --dangerously-skip-permissions --resume '$session_id' --fork-session" \
-        Enter
-
-    # Transfer instance name and clean up old instance
-    if [[ -n "$old_tab_name" && -n "$old_instance_id" ]]; then
-        # Wait for new instance to register (up to 30s)
-        new_id=""
-        for attempt in $(seq 1 30); do
-            sleep 1
-            new_id=$(curl -s "http://localhost:7777/api/instances" 2>/dev/null | \
-                jq -r --arg dir "$TARGET_DIR" \
-                '.[] | select(.working_dir == $dir and (.status == "processing" or .status == "idle")) | .id' 2>/dev/null | head -1 || true)
-            [[ -n "$new_id" ]] && break
-        done
-
-        if [[ -n "$new_id" ]]; then
-            # Transfer tab_name to new instance
-            curl -s -X PATCH "http://localhost:7777/api/instances/${new_id}/rename" \
-                -H "Content-Type: application/json" \
-                -d "{\"tab_name\": \"${old_tab_name}\"}" >/dev/null 2>&1 || true
-        fi
-
-        # Delete old instance (belt + suspenders — SessionEnd may not fire on SIGKILL)
-        curl -s -X DELETE "http://localhost:7777/api/instances/${old_instance_id}" >/dev/null 2>&1 || true
+    # Pre-flight SSH check
+    if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$ssh_target" true 2>/dev/null; then
+        log_error "Cannot reach host '$REMOTE_HOST' (ssh target: $ssh_target)"
+        exit 1
     fi
-) &
-disown
+    log_success "SSH to $REMOTE_HOST ($ssh_target) OK"
 
-# Ignore signals during shutdown
-trap '' INT HUP TERM
+    if $RELAY_MODE; then
+        # Relay needs tmux pane
+        pane_target=$(find_tmux_pane "$claude_pid")
+        if [[ -z "$pane_target" ]]; then
+            log_error "Could not identify tmux pane (required for relay mode)"
+            exit 1
+        fi
+        log_success "Tmux pane: $pane_target"
+        transplant_remote_relay "$ssh_target" "$session_id" "$source_jsonl" "$claude_pid" "$pane_target"
+    else
+        transplant_remote_headless "$ssh_target" "$session_id" "$source_jsonl" "$claude_pid"
+    fi
+else
+    # --- Local transplant (original logic) ---
 
-# Kill Claude (SIGINT for graceful shutdown)
-kill -INT "$claude_pid" 2>/dev/null || true
-sleep 1.5
+    # Copy JSONL to target project directory
+    target_encoded=$(encode_claude_path "$TARGET_DIR")
+    target_project_dir="${HOME}/.claude/projects/${target_encoded}"
 
-# Double-SIGINT if still alive
-if kill -0 "$claude_pid" 2>/dev/null; then
-    kill -INT "$claude_pid" 2>/dev/null || true
-    sleep 2
-fi
+    mkdir -p "$target_project_dir"
+    cp "$source_jsonl" "$target_project_dir/"
+    log_success "Transcript copied → ${target_project_dir}/"
 
-# Force kill as last resort
-if kill -0 "$claude_pid" 2>/dev/null; then
-    kill -KILL "$claude_pid" 2>/dev/null || true
+    # Find tmux pane (Claude strips $TMUX_PANE, always use PID-based lookup)
+    pane_target=$(find_tmux_pane "$claude_pid")
+    if [[ -z "$pane_target" ]]; then
+        log_error "Could not identify tmux pane"
+        echo "  Fallback: cd '$TARGET_DIR' && claude --resume '$session_id' --fork-session"
+        exit 1
+    fi
+    log_success "Tmux pane: $pane_target"
+
+    # Capture old instance name for transfer to new session
+    old_tab_name=""
+    old_instance_id="$session_id"
+    if command -v curl &>/dev/null && command -v jq &>/dev/null; then
+        old_tab_name=$(curl -s "http://localhost:7777/api/instances" 2>/dev/null | \
+            jq -r --arg id "$old_instance_id" \
+            '.[] | select(.id == $id) | .tab_name // empty' 2>/dev/null || true)
+    fi
+
+    echo ""
+    log_info "Transplanting session..."
+    echo ""
+
+    # Spawn detached restart daemon
+    (
+        exec 0</dev/null 1>/dev/null 2>/dev/null
+
+        # Wait for Claude to exit
+        wait_count=0
+        while kill -0 "$claude_pid" 2>/dev/null; do
+            sleep 0.5
+            wait_count=$((wait_count + 1))
+            if [[ $wait_count -ge 20 ]]; then
+                break
+            fi
+        done
+        sleep 0.5
+
+        # Send restart command
+        tmux send-keys -t "$pane_target" \
+            "cd '$TARGET_DIR' && /home/token/.local/bin/claude --dangerously-skip-permissions --resume '$session_id' --fork-session" \
+            Enter
+
+        # Transfer instance name and clean up old instance
+        if [[ -n "$old_tab_name" && -n "$old_instance_id" ]]; then
+            # Wait for new instance to register (up to 30s)
+            new_id=""
+            for attempt in $(seq 1 30); do
+                sleep 1
+                new_id=$(curl -s "http://localhost:7777/api/instances" 2>/dev/null | \
+                    jq -r --arg dir "$TARGET_DIR" \
+                    '.[] | select(.working_dir == $dir and (.status == "processing" or .status == "idle")) | .id' 2>/dev/null | head -1 || true)
+                [[ -n "$new_id" ]] && break
+            done
+
+            if [[ -n "$new_id" ]]; then
+                # Transfer tab_name to new instance
+                curl -s -X PATCH "http://localhost:7777/api/instances/${new_id}/rename" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"tab_name\": \"${old_tab_name}\"}" >/dev/null 2>&1 || true
+            fi
+
+            # Delete old instance (belt + suspenders — SessionEnd may not fire on SIGKILL)
+            curl -s -X DELETE "http://localhost:7777/api/instances/${old_instance_id}" >/dev/null 2>&1 || true
+        fi
+    ) &
+    disown
+
+    kill_local_claude "$claude_pid"
 fi
 
 exit 0
