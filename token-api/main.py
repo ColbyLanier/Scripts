@@ -6848,13 +6848,6 @@ async def handle_stop_validate(payload: dict) -> dict:
         logger.info(f"{log_prefix} ALLOW: TOKEN_API_SUBAGENT={token_api_subagent}")
         return {}
 
-    # ── Active subagent detection: this instance HAS child subagents still running ──
-    # Background subagents returning one-by-one cause repeated Stop hooks on the parent.
-    # If child claude processes are alive, this is an intermediate stop — skip validation.
-    if payload.get("has_active_subagents"):
-        logger.info(f"{log_prefix} ALLOW: has active child subagents (intermediate stop)")
-        return {}
-
     # ── Escape hatch: second attempt is always allowed ──
     if payload.get("stop_hook_active"):
         logger.info(f"{log_prefix} ALLOW: stop_hook_active")
@@ -6873,7 +6866,6 @@ async def handle_stop_validate(payload: dict) -> dict:
         logger.info(f"{log_prefix} ALLOW: no transcript")
         return {}
 
-    turn = turn  # (re-binding for clarity below)
     if not turn:
         logger.info(f"{log_prefix} ALLOW: no assistant turn found")
         return {}
@@ -6961,13 +6953,6 @@ async def handle_stop(payload: dict) -> dict:
     if is_subagent_instance:
         result["action"] = "stop_processed_subagent"
         logger.info(f"Hook: Stop {session_id[:12]}... subagent — state updated, skipping notifications")
-        return result
-
-    # Intermediate stop: parent has background subagents still running.
-    # Update state but skip notifications — the "real" final stop comes after all subagents return.
-    if payload.get("has_active_subagents"):
-        result["action"] = "stop_processed_intermediate"
-        logger.info(f"Hook: Stop {session_id[:12]}... intermediate (child subagents still running) — skipping notifications")
         return result
 
     # Mobile path: send webhook notification
