@@ -80,9 +80,13 @@ remote_restart() {
     echo -e "${BOLD}=== Token Restart (remote → Mac) ===${NC}"
     echo ""
 
-    # Sync local changes and pull on Mac so it has the latest code before we invoke it
+    # Sync local changes to git, then pull on Mac before invoking token-restart there
     if [[ "${NO_PUSH}" != true ]]; then
-        scripts_sync || true
+        scripts_sync --no-pull || true
+        echo ""
+        echo -e "${BLUE}→${NC} Pulling latest code on Mac..."
+        ssh -o ConnectTimeout=5 -o BatchMode=yes mini \
+            "cd ~/Scripts && git pull --ff-only --quiet 2>&1 && echo '  OK Pulled'" || true
         echo ""
     fi
 
