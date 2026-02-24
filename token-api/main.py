@@ -436,6 +436,10 @@ class PreToolUseResponse(BaseModel):
 # Debouncing for PostToolUse to avoid excessive API calls
 _post_tool_debounce: dict = {}  # session_id -> last_call_time
 
+# Tracks background Task subagents still awaiting result delivery.
+# Incremented in handle_pre_tool_use, decremented in handle_prompt_submit.
+_pending_background_tasks: dict = {}  # session_id -> count
+
 
 # Database helper: connect with busy_timeout to prevent indefinite blocking
 async def get_db():
@@ -6597,6 +6601,8 @@ async def handle_session_end(payload: dict) -> dict:
     if not session_id:
         return {"success": False, "action": "no_session_id"}
 
+    _pending_background_tasks.pop(session_id, None)
+
     now = datetime.now().isoformat()
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -6661,6 +6667,13 @@ async def handle_prompt_submit(payload: dict) -> dict:
     session_id = payload.get("session_id")
     if not session_id:
         return {"success": False, "action": "no_session_id"}
+
+    # Each UserPromptSubmit for a session with pending tasks = one background task result delivered.
+    if session_id in _pending_background_tasks:
+        _pending_background_tasks[session_id] -= 1
+        if _pending_background_tasks[session_id] <= 0:
+            del _pending_background_tasks[session_id]
+        logger.info(f"PromptSubmit: background task returned for {session_id[:12]} (pending: {_pending_background_tasks.get(session_id, 0)})")
 
     now = datetime.now().isoformat()
 
@@ -6848,6 +6861,11 @@ async def handle_stop_validate(payload: dict) -> dict:
         logger.info(f"{log_prefix} ALLOW: TOKEN_API_SUBAGENT={token_api_subagent}")
         return {}
 
+    # Intermediate stop: background subagents still pending for this session.
+    if _pending_background_tasks.get(session_id, 0) > 0:
+        logger.info(f"{log_prefix} ALLOW: intermediate stop ({_pending_background_tasks[session_id]} background tasks pending)")
+        return {}
+
     # ── Escape hatch: second attempt is always allowed ──
     if payload.get("stop_hook_active"):
         logger.info(f"{log_prefix} ALLOW: stop_hook_active")
@@ -6953,6 +6971,12 @@ async def handle_stop(payload: dict) -> dict:
     if is_subagent_instance:
         result["action"] = "stop_processed_subagent"
         logger.info(f"Hook: Stop {session_id[:12]}... subagent — state updated, skipping notifications")
+        return result
+
+    # Intermediate stop: background subagents still pending. Update state but skip notifications.
+    if _pending_background_tasks.get(session_id, 0) > 0:
+        result["action"] = "stop_processed_intermediate"
+        logger.info(f"Hook: Stop {session_id[:12]}... intermediate ({_pending_background_tasks[session_id]} background tasks pending) — skipping notifications")
         return result
 
     # Mobile path: send webhook notification
@@ -7075,6 +7099,12 @@ async def handle_pre_tool_use(payload: dict) -> dict:
                 (now, session_id)
             )
             await db.commit()
+
+    # Track background Task subagents so Stop hooks can detect intermediate vs final stops.
+    if tool_name == "Task" and tool_input.get("run_in_background"):
+        _pending_background_tasks[session_id] = _pending_background_tasks.get(session_id, 0) + 1
+        logger.info(f"PreToolUse: Task background launched for {session_id[:12]} (pending: {_pending_background_tasks[session_id]})")
+        return {"success": True, "action": "allowed"}
 
     # Only check Bash commands for blocking
     if tool_name != "Bash":
