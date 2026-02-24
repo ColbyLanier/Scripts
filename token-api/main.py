@@ -6719,6 +6719,38 @@ async def handle_post_tool_use(payload: dict) -> dict:
     return {"success": True, "action": "heartbeat", "instance_id": session_id}
 
 
+def _parse_assistant_turn_from_lines(lines: list) -> Optional[dict]:
+    """Parse the last assistant turn from a list of JSONL lines."""
+    blocks: list = []
+    found = False
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        line_type = d.get("type", "")
+        if line_type == "assistant":
+            found = True
+            content = d.get("message", {}).get("content", [])
+            if isinstance(content, list):
+                blocks = content + blocks
+            elif isinstance(content, str):
+                blocks.insert(0, {"type": "text", "text": content})
+        elif line_type == "user" and found:
+            break
+
+    if blocks and any(b.get("type") == "text" for b in blocks):
+        return {
+            "text": "\n".join(b["text"] for b in blocks if b.get("type") == "text"),
+            "tool_names": [b.get("name", "") for b in blocks if b.get("type") == "tool_use"],
+            "last_block_type": blocks[-1].get("type", "unknown"),
+        }
+    return None
+
+
 def _extract_last_assistant_turn(transcript_path: str, max_retries: int = 8, retry_delay: float = 0.25) -> Optional[dict]:
     """Extract last assistant turn from a transcript file, polling briefly for flush."""
     for attempt in range(max_retries):
@@ -6728,33 +6760,9 @@ def _extract_last_assistant_turn(transcript_path: str, max_retries: int = 8, ret
         except OSError:
             return None
 
-        blocks: list = []
-        found = False
-        for line in reversed(lines):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                d = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            line_type = d.get("type", "")
-            if line_type == "assistant":
-                found = True
-                content = d.get("message", {}).get("content", [])
-                if isinstance(content, list):
-                    blocks = content + blocks
-                elif isinstance(content, str):
-                    blocks.insert(0, {"type": "text", "text": content})
-            elif line_type == "user" and found:
-                break
-
-        if blocks and any(b.get("type") == "text" for b in blocks):
-            return {
-                "text": "\n".join(b["text"] for b in blocks if b.get("type") == "text"),
-                "tool_names": [b.get("name", "") for b in blocks if b.get("type") == "tool_use"],
-                "last_block_type": blocks[-1].get("type", "unknown"),
-            }
+        result = _parse_assistant_turn_from_lines(lines)
+        if result:
+            return result
 
         if attempt < max_retries - 1:
             time.sleep(retry_delay)
@@ -6840,14 +6848,20 @@ async def handle_stop_validate(payload: dict) -> dict:
         logger.info(f"{log_prefix} ALLOW: stop_hook_active")
         return {}
 
-    # ── No transcript → allow ──
+    # ── Extract last assistant turn ──
+    # Prefer embedded tail (sent by shim when transcript is on a remote machine),
+    # fall back to direct file read if local.
+    transcript_tail = payload.get("transcript_tail")
     transcript_path = payload.get("transcript_path")
-    if not transcript_path or not os.path.exists(transcript_path):
+    if transcript_tail:
+        turn = _parse_assistant_turn_from_lines(transcript_tail.splitlines())
+    elif transcript_path and os.path.exists(transcript_path):
+        turn = _extract_last_assistant_turn(transcript_path)
+    else:
         logger.info(f"{log_prefix} ALLOW: no transcript")
         return {}
 
-    # ── Extract last assistant turn ──
-    turn = _extract_last_assistant_turn(transcript_path)
+    turn = turn  # (re-binding for clarity below)
     if not turn:
         logger.info(f"{log_prefix} ALLOW: no assistant turn found")
         return {}
