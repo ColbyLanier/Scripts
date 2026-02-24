@@ -62,10 +62,13 @@ def _get_gcloud_credentials() -> Any:
     Application Default Credentials (ADC). ADC uses a restricted OAuth client
     that may lack Cloud SQL scopes on cross-project instances.
     """
+    import shutil
+
     import google.oauth2.credentials
 
+    gcloud = shutil.which("gcloud") or "/snap/bin/gcloud"
     result = subprocess.run(
-        ["gcloud", "auth", "print-access-token"],
+        [gcloud, "auth", "print-access-token"],
         capture_output=True,
         text=True,
         timeout=10,

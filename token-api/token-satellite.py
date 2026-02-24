@@ -12,6 +12,8 @@ Endpoints:
     POST /tts/speak   — speak text via Windows SAPI (blocking)
     POST /tts/skip    — skip current TTS playback
     POST /restart     — git pull + restart
+    GET  /kvm/status  — DeskFlow watchdog state
+    POST /kvm/control — manual DeskFlow start/stop/hold
 """
 
 import json
@@ -23,6 +25,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import requests as http_requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
@@ -224,6 +227,383 @@ class TTSEngine:
 # Global TTS engine instance
 tts_engine = TTSEngine()
 
+
+# ─── DeskFlow KVM Watchdog ──────────────────────────────────────────────
+
+MAC_API_BASE = "http://100.95.109.23:7777"
+MAC_TAILSCALE_IP = "100.95.109.23"
+DESKFLOW_EXE = r"C:\Tools\Deskflow\deskflow.exe"
+DESKFLOW_POLL_INTERVAL = 30          # seconds between checks
+DESKFLOW_CONFIRM_CHECKS = 2          # consecutive checks before state transition
+DESKFLOW_STABLE_TIMEOUT = 900        # 15 min: stop polling after this long in RUNNING
+DESKFLOW_PROCESS_CHECK_INTERVAL = 300 # verify DeskFlow process every 5 min
+
+
+class DeskFlowWatchdog:
+    """Background watchdog for DeskFlow KVM server lifecycle.
+
+    Manages the Windows DeskFlow server and coordinates with the Mac Mini
+    DeskFlow client via token-api endpoints. Runs as a daemon thread.
+
+    States:
+        starting  — boot: waiting for Tailscale + DeskFlow startup
+        running   — both sides up, periodic health checks
+        idle      — stable for 15min, polling stopped
+        mac_down  — Mac unreachable (confirmed), DeskFlow stopped
+        held      — manual override, watchdog paused for N minutes
+    """
+
+    def __init__(self):
+        self.state = "starting"
+        self.consecutive_up = 0
+        self.consecutive_down = 0
+        self.last_process_check = 0.0
+        self.hold_until: Optional[float] = None
+        self.last_mac_status: Optional[bool] = None
+        self.last_state_change = time.time()
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+
+    def start(self):
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="deskflow-watchdog"
+        )
+        self._thread.start()
+        logger.info("KVM watchdog: Started")
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=10)
+
+    # ── Tailscale ──
+
+    def _wait_for_tailscale(self):
+        """Block until Tailscale is up and can reach the Mac's IP."""
+        logger.info("KVM watchdog: Waiting for Tailscale...")
+        for attempt in range(30):  # up to ~60s
+            if self._stop_event.is_set():
+                return False
+            try:
+                result = subprocess.run(
+                    ["tailscale", "status", "--json"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0:
+                    data = json.loads(result.stdout)
+                    peers = data.get("Peer", {})
+                    for peer in peers.values():
+                        addrs = peer.get("TailscaleIPs", [])
+                        if MAC_TAILSCALE_IP in addrs and peer.get("Online"):
+                            logger.info("KVM watchdog: Tailscale ready, Mac peer online")
+                            return True
+            except Exception:
+                pass
+            self._stop_event.wait(2)
+        logger.warning("KVM watchdog: Tailscale timeout, proceeding anyway")
+        return False
+
+    # ── Main loop ──
+
+    def _run(self):
+        self._wait_for_tailscale()
+        if self._stop_event.is_set():
+            return
+
+        # Start DeskFlow server immediately
+        self._start_deskflow_server()
+        time.sleep(5)
+
+        # Best-effort: try to start Mac client on boot
+        if self._check_mac_reachable():
+            self._ensure_mac_client_connected()
+            self.state = "running"
+            self.last_state_change = time.time()
+            self.last_process_check = time.time()
+            logger.info("KVM watchdog: Mac reachable on boot → RUNNING")
+        else:
+            logger.info("KVM watchdog: Mac not reachable on boot, will keep polling")
+
+        while not self._stop_event.is_set():
+            self._stop_event.wait(DESKFLOW_POLL_INTERVAL)
+            if self._stop_event.is_set():
+                break
+            try:
+                self._tick()
+            except Exception as e:
+                logger.error(f"KVM watchdog: tick error: {e}")
+
+    def _tick(self):
+        # Held: wait for expiry
+        if self.state == "held":
+            if self.hold_until and time.time() > self.hold_until:
+                logger.info("KVM watchdog: Hold expired, resuming")
+                self.state = "mac_down"
+                self.consecutive_up = 0
+                self.consecutive_down = 0
+            return
+
+        # Idle: polling stopped, nothing to do
+        if self.state == "idle":
+            return
+
+        mac_up = self._check_mac_reachable()
+        self.last_mac_status = mac_up
+
+        if mac_up:
+            self.consecutive_up += 1
+            self.consecutive_down = 0
+        else:
+            self.consecutive_down += 1
+            self.consecutive_up = 0
+
+        # State transitions
+        if self.state in ("starting", "mac_down") and mac_up:
+            if self.consecutive_up >= DESKFLOW_CONFIRM_CHECKS:
+                self._transition_to_running()
+
+        elif self.state in ("starting", "running") and not mac_up:
+            if self.consecutive_down >= DESKFLOW_CONFIRM_CHECKS:
+                self._transition_to_mac_down()
+
+        elif self.state == "running" and mac_up:
+            # Check if stable long enough to go idle
+            elapsed = time.time() - self.last_state_change
+            if elapsed >= DESKFLOW_STABLE_TIMEOUT:
+                logger.info(
+                    f"KVM watchdog: Stable for {int(elapsed)}s → IDLE (polling stopped)"
+                )
+                self.state = "idle"
+                self.last_state_change = time.time()
+                return
+            self._periodic_health_check()
+
+    # ── Reachability ──
+
+    def _check_mac_reachable(self) -> bool:
+        try:
+            resp = http_requests.get(f"{MAC_API_BASE}/health", timeout=5)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    # ── Connection check ──
+
+    def _check_deskflow_connected(self) -> bool:
+        """Check if DeskFlow server has an ESTABLISHED client connection.
+
+        This catches the case where the Mac process is running but its
+        socket is CLOSED/dead — pgrep alone won't detect that.
+        """
+        try:
+            # Check for ESTABLISHED connections on port 24800
+            result = subprocess.run(
+                [POWERSHELL_EXE, "-NoProfile", "-Command",
+                 "Get-NetTCPConnection -LocalPort 24800 "
+                 "-State Established -ErrorAction SilentlyContinue | "
+                 "Select-Object -First 1 RemoteAddress"],
+                capture_output=True, text=True, timeout=10,
+            )
+            return bool(result.stdout.strip())
+        except Exception:
+            return False
+
+    # ── Windows DeskFlow management ──
+
+    def _check_deskflow_running(self) -> bool:
+        try:
+            result = subprocess.run(
+                [POWERSHELL_EXE, "-NoProfile", "-Command",
+                 "Get-Process deskflow-core -ErrorAction SilentlyContinue"],
+                capture_output=True, text=True, timeout=10,
+            )
+            return bool(result.stdout.strip())
+        except Exception:
+            return False
+
+    def _start_deskflow_server(self):
+        if self._check_deskflow_running():
+            logger.info("KVM watchdog: DeskFlow already running, skipping start")
+            return
+        logger.info("KVM watchdog: Starting DeskFlow server")
+        try:
+            subprocess.run(
+                [POWERSHELL_EXE, "-NoProfile", "-Command",
+                 f"Start-Process '{DESKFLOW_EXE}' -WindowStyle Minimized"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except Exception as e:
+            logger.error(f"KVM watchdog: Failed to start DeskFlow: {e}")
+
+    def _stop_deskflow_server(self):
+        logger.info("KVM watchdog: Stopping DeskFlow server")
+        try:
+            subprocess.run(
+                [POWERSHELL_EXE, "-NoProfile", "-Command",
+                 "Stop-Process -Name deskflow, deskflow-core "
+                 "-Force -ErrorAction SilentlyContinue"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception as e:
+            logger.error(f"KVM watchdog: Failed to stop DeskFlow: {e}")
+
+    # ── Mac client management ──
+
+    def _wake_mac_display(self) -> bool:
+        try:
+            result = subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                 "mini", "caffeinate -u -t 5"],
+                capture_output=True, text=True, timeout=12,
+            )
+            return result.returncode == 0
+        except Exception as e:
+            logger.warning(f"KVM watchdog: Failed to wake Mac display: {e}")
+            return False
+
+    def _restart_mac_client(self):
+        """Force-kill and restart the Mac DeskFlow client via SSH.
+
+        The API-based stop (pkill) is too gentle — the GUI can respawn
+        the core before the start call, leaving a stuck socket. SSH with
+        kill -9 + fresh open is reliable.
+        """
+        logger.info("KVM watchdog: Restarting Mac client via SSH (kill → wake → open)")
+        try:
+            result = subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                 "mini",
+                 "killall -9 Deskflow deskflow-core 2>/dev/null; "
+                 "sleep 2; caffeinate -u -t 5 & open -a Deskflow"],
+                capture_output=True, text=True, timeout=20,
+            )
+            if result.returncode == 0:
+                logger.info("KVM watchdog: Mac client restarted via SSH")
+            else:
+                logger.warning(
+                    f"KVM watchdog: SSH restart returned {result.returncode}: "
+                    f"{result.stderr.strip()}"
+                )
+        except Exception as e:
+            logger.error(f"KVM watchdog: SSH restart failed: {e}")
+            # Fallback to API
+            try:
+                http_requests.post(f"{MAC_API_BASE}/api/kvm/stop", timeout=10)
+                time.sleep(2)
+                http_requests.post(f"{MAC_API_BASE}/api/kvm/start", timeout=10)
+            except Exception:
+                pass
+
+    def _ensure_mac_client_connected(self):
+        """Start Mac client if needed, restart if connection is dead."""
+        self._wake_mac_display()
+        time.sleep(2)
+        try:
+            resp = http_requests.post(
+                f"{MAC_API_BASE}/api/kvm/start", timeout=10
+            )
+            data = resp.json()
+            logger.info(f"KVM watchdog: Mac client → {data.get('message', 'unknown')}")
+        except Exception as e:
+            logger.error(f"KVM watchdog: Failed to start Mac client: {e}")
+            return
+
+        # Wait for connection to establish, then verify
+        time.sleep(5)
+        if not self._check_deskflow_connected():
+            logger.warning(
+                "KVM watchdog: Mac client running but no ESTABLISHED connection, "
+                "restarting client"
+            )
+            self._restart_mac_client()
+
+    # ── State transitions ──
+
+    def _transition_to_running(self):
+        logger.info("KVM watchdog: Mac confirmed reachable → RUNNING")
+        if not self._check_deskflow_running():
+            self._start_deskflow_server()
+            time.sleep(5)
+        self._ensure_mac_client_connected()
+        self.state = "running"
+        self.last_state_change = time.time()
+        self.last_process_check = time.time()
+
+    def _transition_to_mac_down(self):
+        logger.info("KVM watchdog: Mac confirmed unreachable → MAC_DOWN")
+        self._stop_deskflow_server()
+        self.state = "mac_down"
+        self.last_state_change = time.time()
+
+    def _periodic_health_check(self):
+        now = time.time()
+        if now - self.last_process_check < DESKFLOW_PROCESS_CHECK_INTERVAL:
+            return
+        self.last_process_check = now
+
+        if not self._check_deskflow_running():
+            logger.warning("KVM watchdog: DeskFlow server died, restarting")
+            self._start_deskflow_server()
+            time.sleep(5)
+            self._ensure_mac_client_connected()
+            return
+
+        if not self._check_deskflow_connected():
+            logger.warning(
+                "KVM watchdog: No ESTABLISHED connection on port 24800, "
+                "restarting Mac client"
+            )
+            self._restart_mac_client()
+
+    # ── API helpers ──
+
+    def get_status(self) -> dict:
+        connected = False
+        running = False
+        if self.state not in ("mac_down",):
+            running = self._check_deskflow_running()
+            if running:
+                connected = self._check_deskflow_connected()
+        return {
+            "state": self.state,
+            "mac_reachable": self.last_mac_status,
+            "deskflow_running": running,
+            "deskflow_connected": connected,
+            "consecutive_up": self.consecutive_up,
+            "consecutive_down": self.consecutive_down,
+            "last_state_change": datetime.fromtimestamp(
+                self.last_state_change
+            ).isoformat(),
+            "hold_until": (
+                datetime.fromtimestamp(self.hold_until).isoformat()
+                if self.hold_until else None
+            ),
+        }
+
+    def hold(self, minutes: int = 30):
+        self.hold_until = time.time() + (minutes * 60)
+        self.state = "held"
+        logger.info(f"KVM watchdog: Held for {minutes} minutes")
+
+    def force_start(self):
+        self._start_deskflow_server()
+        time.sleep(5)
+        if self._check_mac_reachable():
+            self._ensure_mac_client_connected()
+        self.state = "running"
+        self.last_state_change = time.time()
+        self.last_process_check = time.time()
+
+    def force_stop(self):
+        self._stop_deskflow_server()
+        self.state = "mac_down"
+        self.last_state_change = time.time()
+
+
+# Global watchdog instance
+deskflow_watchdog = DeskFlowWatchdog()
+
+
 # Mapping of app aliases to Windows executables
 APP_TARGETS = {
     "brave": "brave.exe",
@@ -246,13 +626,19 @@ class TTSSpeakRequest(BaseModel):
     rate: int = 0
 
 
+class KvmControlRequest(BaseModel):
+    action: str  # "start", "stop", "hold"
+    hold_minutes: int = 30
+
+
 @app.on_event("startup")
 async def startup_event():
-    """Warm up the TTS engine on server start."""
+    """Warm up TTS engine and start DeskFlow watchdog."""
     try:
         tts_engine.start()
     except Exception as e:
         logger.warning(f"TTS engine warm-up failed (will retry on first speak): {e}")
+    deskflow_watchdog.start()
 
 
 @app.get("/health")
@@ -262,6 +648,7 @@ async def health():
         "service": "token-satellite",
         "timestamp": datetime.now().isoformat(),
         "tts_engine": "running" if tts_engine._process and tts_engine._process.poll() is None else "stopped",
+        "kvm_watchdog": deskflow_watchdog.state,
     }
 
 
@@ -373,6 +760,35 @@ async def tts_skip():
     return {"success": True, "was_speaking": was_speaking}
 
 
+@app.get("/kvm/status")
+async def kvm_watchdog_status():
+    """Get DeskFlow watchdog state."""
+    return deskflow_watchdog.get_status()
+
+
+@app.post("/kvm/control")
+async def kvm_control(request: KvmControlRequest):
+    """Manual control over DeskFlow watchdog."""
+    action = request.action.lower()
+    if action == "start":
+        deskflow_watchdog.force_start()
+        return {"success": True, "action": "start", "state": deskflow_watchdog.state}
+    elif action == "stop":
+        deskflow_watchdog.force_stop()
+        return {"success": True, "action": "stop", "state": deskflow_watchdog.state}
+    elif action == "hold":
+        deskflow_watchdog.hold(request.hold_minutes)
+        return {
+            "success": True, "action": "hold",
+            "minutes": request.hold_minutes, "state": deskflow_watchdog.state,
+        }
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown action: {action}. Valid: start, stop, hold",
+        )
+
+
 @app.post("/restart")
 async def restart_satellite(pull: bool = True):
     """Git pull, write TUI signals, then exit for systemd restart."""
@@ -402,7 +818,8 @@ async def restart_satellite(pull: bool = True):
         (signal_dir / f"tui-restart-{suffix}.signal").write_text(signal_data)
     result["tui_signals"] = True
 
-    # 3. Shutdown TTS engine cleanly
+    # 3. Shutdown cleanly
+    deskflow_watchdog.stop()
     tts_engine.shutdown()
 
     # 4. Schedule exit after response is sent (systemd Restart=always brings us back)

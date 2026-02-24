@@ -31,6 +31,31 @@ except ImportError:
     IPTypes = None  # type: ignore[assignment, misc]
 
 
+def _get_gcloud_credentials() -> Any:
+    """Get credentials from the active gcloud account.
+
+    Uses `gcloud auth print-access-token` which has broader permissions than
+    Application Default Credentials (ADC).
+    """
+    import shutil
+
+    import google.oauth2.credentials
+
+    gcloud = shutil.which("gcloud") or "/snap/bin/gcloud"
+    result = subprocess.run(
+        [gcloud, "auth", "print-access-token"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    token = result.stdout.strip()
+    if not token or result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to get gcloud access token: {result.stderr.strip()}"
+        )
+    return google.oauth2.credentials.Credentials(token=token)
+
+
 # Deploy YAML directory in ProcurementAgentAI
 DEPLOY_DIR = Path.home() / "ProcAgentDir" / "ProcurementAgentAI" / "deploy"
 
@@ -341,7 +366,8 @@ async def execute_query_with_connector(
     conn = None
     try:
         loop = asyncio.get_running_loop()
-        connector = Connector(loop=loop)
+        creds = _get_gcloud_credentials()
+        connector = Connector(loop=loop, credentials=creds, quota_project="")
 
         async def getconn() -> Any:
             return await connector.connect_async(

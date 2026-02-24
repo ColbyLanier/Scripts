@@ -123,13 +123,17 @@ GET    /health                          # Health check (includes tts_backend sta
 
 ### Satellite Endpoints (WSL, port 7777)
 ```
-GET    /health                          # Heartbeat (includes tts_engine status)
+GET    /health                          # Heartbeat (includes tts_engine + kvm_watchdog status)
 POST   /enforce                         # Close Windows process by alias
 GET    /processes                       # List distraction-relevant processes
 POST   /tts/speak                       # Speak via Windows SAPI (blocking, persistent PS engine)
 POST   /tts/skip                        # Skip current TTS playback
+GET    /kvm/status                      # DeskFlow watchdog state (state, mac_reachable, deskflow_running)
+POST   /kvm/control                     # Manual DeskFlow control (action: start|stop|hold, hold_minutes: 30)
 POST   /restart                         # Git pull + systemd restart
 ```
+
+**KVM Watchdog**: Background thread manages DeskFlow lifecycle. Starts DeskFlow at boot, monitors Mac via token-api health check (30s interval), wakes Mac display + starts client when Mac is reachable, stops DeskFlow when Mac goes down. Replaces the old "Deskflow" Windows scheduled task (now disabled).
 
 ## Instance Naming
 
