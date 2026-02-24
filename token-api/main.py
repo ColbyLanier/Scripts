@@ -1083,6 +1083,8 @@ async def lifespan(app: FastAPI):
     # Stash cleanup on startup + hourly
     stash_cleanup()
     scheduler.add_job(stash_cleanup, IntervalTrigger(hours=1), id="stash_cleanup", replace_existing=True)
+    # 9 AM daily timer reset (clear accumulated break + wipe prior-day timer events)
+    scheduler.add_job(timer_9am_reset, CronTrigger(hour=9, minute=0), id="timer_9am_reset", replace_existing=True)
     scheduler.start()
     print("Scheduler started")
     # Start TTS queue worker
@@ -2884,6 +2886,35 @@ def timer_load_from_db():
     print("TIMER: Fresh start (no DB state found)")
 
 
+async def timer_9am_reset():
+    """9 AM daily reset: clear accumulated break, wipe prior-day timer events."""
+    import sqlite3
+    today = datetime.now().strftime("%Y-%m-%d")
+    now_ms = int(time.monotonic() * 1000)
+
+    result = timer_engine.force_daily_reset(now_ms, today)
+    await timer_save_to_db()
+
+    # Wipe timer_mode_change and break events from previous days
+    try:
+        def _wipe_old_timer_events():
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute(
+                "DELETE FROM events WHERE event_type IN ('timer_mode_change','break_exhausted_enforcement')"
+                " AND DATE(created_at) < DATE('now','localtime')"
+            )
+            conn.commit()
+            conn.close()
+
+        await asyncio.to_thread(_wipe_old_timer_events)
+    except Exception as e:
+        print(f"TIMER: Failed to wipe old timer events: {e}")
+
+    print(f"TIMER: 9 AM daily reset complete (productivity_score={result.productivity_score})")
+    await log_event("timer_daily_reset", details={"source": "9am_scheduler", "productivity_score": result.productivity_score, "date": today})
+
+
 # ============ Audio Proxy State ============
 # Tracks phone audio proxy status for routing phone audio through PC
 
@@ -3735,6 +3766,17 @@ async def resume_work_mode():
         DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
         await log_event("timer_mode_change", details={"new_mode": "work_silence", "source": "api"})
     return {"status": "work_silence", "changed": changed}
+
+
+@app.post("/api/timer/daily-reset")
+async def manual_daily_reset():
+    """Manually trigger the 9 AM daily reset (clears accumulated break + wipes prior-day timer events)."""
+    await timer_9am_reset()
+    return {
+        "status": "reset",
+        "accumulated_break_ms": timer_engine.accumulated_break_ms,
+        "daily_start_date": timer_engine.daily_start_date,
+    }
 
 
 # ============ Pavlok Endpoints ============

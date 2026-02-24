@@ -279,6 +279,27 @@ class TimerEngine:
 
         return result
 
+    def force_daily_reset(self, now_mono_ms: int, today_date: str) -> TickResult:
+        """Force a daily reset regardless of date. Used for the 9 AM scheduled reset."""
+        productivity_score = max(0, self._accumulated_break_ms // (1000 * 60))
+
+        result = TickResult()
+        result.events.append(TimerEvent.DAILY_RESET)
+        result.productivity_score = productivity_score
+        result.reset_date = self._daily_start_date or today_date
+
+        self._current_mode = TimerMode.WORK_SILENCE
+        self._total_work_time_ms = 0
+        self._total_break_time_ms = 0
+        self._accumulated_break_ms = 0
+        self._break_backlog_ms = 0
+        self._daily_start_date = today_date
+        self._last_tick_ms = now_mono_ms
+        self._manual_mode_lock = False
+        self._manual_mode_lock_until_ms = None
+
+        return result
+
     def _apply_break_delta(self, break_delta_ms: int, result: TickResult) -> None:
         """Apply break time change. Handles backlog offset and exhaustion."""
         if self._break_backlog_ms > 0:
