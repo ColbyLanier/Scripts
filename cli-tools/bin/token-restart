@@ -80,9 +80,9 @@ remote_restart() {
     echo -e "${BOLD}=== Token Restart (remote → Mac) ===${NC}"
     echo ""
 
-    # Sync local changes so Mac can pull them
+    # Sync local changes and pull on Mac so it has the latest code before we invoke it
     if [[ "${NO_PUSH}" != true ]]; then
-        scripts_sync --no-pull || true
+        scripts_sync || true
         echo ""
     fi
 
@@ -95,7 +95,7 @@ remote_restart() {
     [[ "${ACTION}" == "wsl-only" ]] && flags="$flags --wsl-only"
     [[ "${ACTION}" == "tui-only" ]] && flags="$flags --tui-only"
 
-    if ssh -o ConnectTimeout=5 -o BatchMode=yes mini "token-restart${flags}" 2>&1; then
+    if ssh -o ConnectTimeout=5 -o BatchMode=yes mini "~/Scripts/cli-tools/bin/token-restart${flags}" 2>&1; then
         echo ""
         echo -e "  ${GREEN}✓${NC} Remote restart completed"
     else
