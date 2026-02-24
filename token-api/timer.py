@@ -284,8 +284,8 @@ class TimerEngine:
         # If current_hour < reset_hour, we haven't hit the reset time yet today
         # (e.g., it's 7 AM but reset_hour is 9, so don't reset yet)
         if current_hour is not None and current_hour < self._reset_hour:
-            # Haven't reached reset hour yet today - update date but don't reset timer
-            self._daily_start_date = today_date
+            # Haven't reached reset hour yet today — do NOT update daily_start_date.
+            # Keeping it as yesterday ensures the reset fires once we reach reset_hour.
             return None
 
         # Day changed (and past reset hour) — calculate productivity score and reset
