@@ -1450,6 +1450,22 @@ def is_pid_claude(pid: int) -> bool:
         return False
 
 
+def get_parent_pid(pid: int) -> Optional[int]:
+    """Get the parent PID of a process from /proc/<pid>/stat."""
+    try:
+        with open(f"/proc/{pid}/stat", "r") as f:
+            fields = f.read().split()
+            return int(fields[3])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def is_subagent_pid(pid: int) -> bool:
+    """Return True if this claude process was spawned by another claude process."""
+    parent = get_parent_pid(pid)
+    return bool(parent and parent != 1 and is_pid_claude(parent))
+
+
 @app.post("/api/instances/{instance_id}/kill")
 async def kill_instance(instance_id: str):
     """Kill a frozen Claude instance process and mark it stopped.
@@ -6703,6 +6719,171 @@ async def handle_post_tool_use(payload: dict) -> dict:
     return {"success": True, "action": "heartbeat", "instance_id": session_id}
 
 
+def _extract_last_assistant_turn(transcript_path: str, max_retries: int = 8, retry_delay: float = 0.25) -> Optional[dict]:
+    """Extract last assistant turn from a transcript file, polling briefly for flush."""
+    for attempt in range(max_retries):
+        try:
+            with open(transcript_path, "r") as f:
+                lines = f.readlines()
+        except OSError:
+            return None
+
+        blocks: list = []
+        found = False
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            line_type = d.get("type", "")
+            if line_type == "assistant":
+                found = True
+                content = d.get("message", {}).get("content", [])
+                if isinstance(content, list):
+                    blocks = content + blocks
+                elif isinstance(content, str):
+                    blocks.insert(0, {"type": "text", "text": content})
+            elif line_type == "user" and found:
+                break
+
+        if blocks and any(b.get("type") == "text" for b in blocks):
+            return {
+                "text": "\n".join(b["text"] for b in blocks if b.get("type") == "text"),
+                "tool_names": [b.get("name", "") for b in blocks if b.get("type") == "tool_use"],
+                "last_block_type": blocks[-1].get("type", "unknown"),
+            }
+
+        if attempt < max_retries - 1:
+            time.sleep(retry_delay)
+
+    return None
+
+
+def _check_stop_patterns(text: str) -> Optional[str]:
+    """Return a block reason if text contains unverified action suggestions, else None."""
+    # Pattern 1: User-directed instructions with action verbs
+    if re.search(
+        r'(please |you (can|should|need to|will need to|might want to|may want to) )'
+        r'(run|execute|try running|start|launch|restart|open|install|add|create|update|configure|set up)',
+        text, re.IGNORECASE
+    ):
+        return "Detected instruction for user to perform an action"
+
+    # Pattern 2: Imperative sentences starting with action verbs
+    if re.search(
+        r'(^|\n)\s*(Run|Execute|Start|Launch|Install|Open|Add|Create|Configure|Set up|Copy|Paste'
+        r'|Navigate to|Go to|Visit|Type|Enter) (the |this |these |following |it |a |your )',
+        text, re.MULTILINE
+    ):
+        return "Detected imperative instruction to user"
+
+    # Pattern 3: Shell command with $ prompt
+    if re.search(r'(^|\n)\s*\$\s+\w', text, re.MULTILINE):
+        return "Detected shell command with $ prompt"
+
+    # Pattern 4: Copy/paste instructions
+    if re.search(r'(copy and paste|paste (this|the|it) )', text, re.IGNORECASE):
+        return "Detected copy/paste instruction"
+
+    # Pattern 5: Open browser/terminal instructions
+    if re.search(r'open (your |a |the )(browser|terminal|editor|file manager|console)', text, re.IGNORECASE):
+        return "Detected instruction to open a tool manually"
+
+    # Pattern 6 & 7: Shell code blocks with manual/offered instruction
+    if re.search(r'```(bash|shell|sh|zsh|console|terminal)', text):
+        if re.search(r'(you (can|should|need to)|please )(run|execute|add|copy|paste|use)', text, re.IGNORECASE):
+            return "Detected shell code block with manual instruction"
+        if re.search(
+            r'(want me to|would you like me to|shall I|should I|I can )\s*'
+            r'(run|execute|restart|start|launch|do|try|fix|update|install|create|set up)',
+            text, re.IGNORECASE
+        ):
+            return "Detected offered action with code block — should just do it or use AskUserQuestion"
+
+    # Pattern 9: "manually" in instructional context
+    if re.search(
+        r'(you.{0,20}manual(ly)?|manual(ly)? (run|execute|add|edit|update|configure|restart|start|set))',
+        text, re.IGNORECASE
+    ):
+        return "Detected instruction for manual action"
+
+    # Pattern 10: "add this/the following to your"
+    if re.search(r'add (this|the following|these) to (your|the) ', text, re.IGNORECASE):
+        return "Detected instruction to manually add content"
+
+    return None
+
+
+async def handle_stop_validate(payload: dict) -> dict:
+    """
+    Synchronous stop validator — blocks the agent's stop if it's instructing the user
+    to perform unverified manual actions instead of doing them autonomously.
+
+    Returns {"decision": "block", "reason": "..."} to block, or {} to allow.
+    Called by stop-validator.sh (thin shim).
+    """
+    session_id = payload.get("session_id", "")
+    pid = payload.get("pid")
+    log_prefix = f"StopValidate {session_id[:12]}..."
+
+    # ── Subagent detection: Task tool subagents fire Stop on every subtask completion.
+    # Suppress the validator for them — their exits don't need instruction-quality checks.
+    if pid and is_subagent_pid(pid):
+        logger.info(f"{log_prefix} ALLOW: subagent (parent PID {get_parent_pid(pid)} is claude)")
+        return {}
+
+    # ── Escape hatch: second attempt is always allowed ──
+    if payload.get("stop_hook_active"):
+        logger.info(f"{log_prefix} ALLOW: stop_hook_active")
+        return {}
+
+    # ── No transcript → allow ──
+    transcript_path = payload.get("transcript_path")
+    if not transcript_path or not os.path.exists(transcript_path):
+        logger.info(f"{log_prefix} ALLOW: no transcript")
+        return {}
+
+    # ── Extract last assistant turn ──
+    turn = _extract_last_assistant_turn(transcript_path)
+    if not turn:
+        logger.info(f"{log_prefix} ALLOW: no assistant turn found")
+        return {}
+
+    # ── Short-circuit allows ──
+    if "AskUserQuestion" in turn["tool_names"] or "EnterPlanMode" in turn["tool_names"]:
+        logger.info(f"{log_prefix} ALLOW: last turn uses {turn['tool_names']}")
+        return {}
+
+    if not turn["text"]:
+        logger.info(f"{log_prefix} ALLOW: no text content")
+        return {}
+
+    if turn["last_block_type"] == "tool_use":
+        logger.info(f"{log_prefix} ALLOW: last block is tool_use")
+        return {}
+
+    # ── Pattern detection ──
+    reason = _check_stop_patterns(turn["text"])
+    if reason:
+        logger.info(f"{log_prefix} BLOCK: {reason}")
+        full_reason = (
+            f"{reason}. Rules: (1) Do not end by telling the user to execute commands or perform "
+            "manual actions — verify autonomously using your tools instead. (2) If verification "
+            "requires a tool you don't have, use the Task tool with subagent_type=tool-creator to "
+            "create one. (3) If you genuinely cannot verify or act autonomously, use AskUserQuestion "
+            "to present options rather than ending with unverified instructions. "
+            "(4) If you believe this block is incorrect and have completed your work, you may stop "
+            "on the next attempt (stop_hook_active will be true)."
+        )
+        return {"decision": "block", "reason": full_reason}
+
+    logger.info(f"{log_prefix} ALLOW: no patterns detected")
+    return {}
+
+
 async def handle_stop(payload: dict) -> dict:
     """Handle Stop hook - response completed, trigger TTS/notifications."""
     session_id = payload.get("session_id")
@@ -6746,6 +6927,15 @@ async def handle_stop(payload: dict) -> dict:
         "instance_id": session_id,
         "device_id": device_id
     }
+
+    # ── Subagent detection: skip all notifications for subagents ──
+    # DB flag covers subagent-CLI spawned instances; PID check covers Task tool subagents.
+    pid = payload.get("pid")
+    is_subagent_instance = bool(instance.get("is_subagent")) or bool(pid and is_subagent_pid(pid))
+    if is_subagent_instance:
+        result["action"] = "stop_processed_subagent"
+        logger.info(f"Hook: Stop {session_id[:12]}... subagent — state updated, skipping notifications")
+        return result
 
     # Mobile path: send webhook notification
     if device_id == "Token-S24":
@@ -6936,6 +7126,7 @@ async def dispatch_hook(action_type: str, payload: dict) -> dict:
         "UserPromptSubmit": handle_prompt_submit,
         "PostToolUse": handle_post_tool_use,
         "Stop": handle_stop,
+        "StopValidate": handle_stop_validate,
         "PreToolUse": handle_pre_tool_use,
         "Notification": handle_notification,
     }
