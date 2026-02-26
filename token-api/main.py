@@ -2198,6 +2198,54 @@ async def change_instance_voice(instance_id: str, request: VoiceChangeRequest):
     }
 
 
+@app.patch("/api/instances/{instance_id}/tts-mode")
+async def set_instance_tts_mode(instance_id: str, request: Request):
+    """Set TTS mode for an instance: verbose, muted, or silent."""
+    body = await request.json()
+    mode = body.get("mode", "verbose")
+    if mode not in ("verbose", "muted", "silent"):
+        raise HTTPException(status_code=400, detail=f"Invalid mode: {mode}. Must be verbose, muted, or silent")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT id, tts_voice, notification_sound FROM claude_instances WHERE id = ?", (instance_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Instance not found")
+
+        old_voice = row["tts_voice"]
+        old_sound = row["notification_sound"]
+
+        if mode == "silent":
+            # Release voice slot
+            await db.execute(
+                "UPDATE claude_instances SET tts_mode = ?, tts_voice = NULL, notification_sound = NULL WHERE id = ?",
+                (mode, instance_id)
+            )
+        elif mode == "verbose" and not old_voice:
+            # Re-assign voice from pool
+            cursor2 = await db.execute(
+                "SELECT tts_voice FROM claude_instances WHERE status IN ('processing', 'idle') AND tts_voice IS NOT NULL"
+            )
+            rows = await cursor2.fetchall()
+            used_voices = {r[0] for r in rows}
+            profile, _ = get_next_available_profile(used_voices)
+            await db.execute(
+                "UPDATE claude_instances SET tts_mode = ?, tts_voice = ?, notification_sound = ? WHERE id = ?",
+                (mode, profile["wsl_voice"], profile["notification_sound"], instance_id)
+            )
+        else:
+            # muted or verbose (with existing voice)
+            await db.execute(
+                "UPDATE claude_instances SET tts_mode = ? WHERE id = ?",
+                (mode, instance_id)
+            )
+        await db.commit()
+
+    await log_event("tts_mode_changed", instance_id=instance_id, details={"mode": mode})
+    return {"status": "ok", "instance_id": instance_id, "mode": mode}
+
+
 @app.post("/api/instances/{instance_id}/activity")
 async def update_instance_activity(instance_id: str, request: ActivityRequest):
     """Update instance processing state. Called by hooks on prompt_submit and stop."""
@@ -2395,6 +2443,11 @@ TTS_BACKEND = {
     "satellite_available": None,  # True/False/None (unknown)
     "last_health_check": 0,
     "health_check_ttl": 30,   # Re-probe satellite every 30s
+}
+
+# Global TTS mute state (in-memory, resets to "verbose" on server restart)
+TTS_GLOBAL_MODE = {
+    "mode": "verbose",  # "verbose" | "muted" | "silent"
 }
 
 
@@ -5458,6 +5511,7 @@ async def health_check():
             "current": TTS_BACKEND["current"],
             "satellite_available": TTS_BACKEND["satellite_available"],
         },
+        "tts_global_mode": TTS_GLOBAL_MODE["mode"],
     }
 
 
@@ -6236,6 +6290,7 @@ def get_tts_queue_status() -> dict:
         "queue_length": len(queue_list),
         "backend": TTS_BACKEND["current"],
         "satellite_available": TTS_BACKEND["satellite_available"],
+        "global_mode": TTS_GLOBAL_MODE["mode"],
         "voice_pool": {
             "total": len(PROFILES),
             "fallback_count": len(FALLBACK_VOICES),
@@ -6482,6 +6537,51 @@ async def api_tts_skip(clear_queue: bool = False):
     result = await skip_tts(clear_queue)
     await log_event("tts_skipped", details=result)
     return result
+
+
+@app.post("/api/tts/global-mode")
+async def set_global_tts_mode(request: Request):
+    """Set global TTS mode. Overrides all instances."""
+    body = await request.json()
+    mode = body.get("mode", "verbose")
+    if mode not in ("verbose", "muted", "silent"):
+        raise HTTPException(status_code=400, detail=f"Invalid mode: {mode}")
+
+    old_mode = TTS_GLOBAL_MODE["mode"]
+    TTS_GLOBAL_MODE["mode"] = mode
+
+    # Update all active instances to match
+    async with aiosqlite.connect(DB_PATH) as db:
+        if mode == "silent":
+            # Release all voice slots for non-subagent active instances
+            await db.execute(
+                "UPDATE claude_instances SET tts_mode = ?, tts_voice = NULL, notification_sound = NULL WHERE status IN ('processing', 'idle') AND is_subagent = 0",
+                (mode,)
+            )
+        elif mode == "verbose" and old_mode == "silent":
+            # Re-assign voices to all active instances that lost theirs
+            cursor = await db.execute(
+                "SELECT id FROM claude_instances WHERE status IN ('processing', 'idle') AND tts_voice IS NULL AND is_subagent = 0"
+            )
+            rows = await cursor.fetchall()
+            used_voices = set()
+            for row in rows:
+                profile, _ = get_next_available_profile(used_voices)
+                await db.execute(
+                    "UPDATE claude_instances SET tts_mode = ?, tts_voice = ?, notification_sound = ? WHERE id = ?",
+                    (mode, profile["wsl_voice"], profile["notification_sound"], row[0])
+                )
+                used_voices.add(profile["wsl_voice"])
+        else:
+            # muted or verbose (voices already assigned)
+            await db.execute(
+                "UPDATE claude_instances SET tts_mode = ? WHERE status IN ('processing', 'idle') AND is_subagent = 0",
+                (mode,)
+            )
+        await db.commit()
+
+    await log_event("tts_global_mode_changed", details={"mode": mode, "old_mode": old_mode})
+    return {"status": "ok", "mode": mode, "old_mode": old_mode}
 
 
 @app.get("/api/notify/test")
