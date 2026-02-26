@@ -4308,6 +4308,9 @@ async def get_timer_state():
         "manual_trigger": timer_engine.manual_trigger,
         "desktop_mode": DESKTOP_STATE.get("current_mode", "silence"),
         "work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
+        "location_zone": DESKTOP_STATE.get("location_zone"),
+        "phone_app": PHONE_STATE.get("current_app"),
+        "ahk_reachable": DESKTOP_STATE.get("ahk_reachable"),
     }
 
 

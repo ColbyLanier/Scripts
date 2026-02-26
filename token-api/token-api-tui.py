@@ -653,6 +653,12 @@ def _read_timer() -> dict:
             "backlog_secs": round(data.get("break_backlog_ms", 0) / 1000),
             "mode": data.get("current_mode", "working"),
             "work_mode": data.get("work_mode", "clocked_in"),
+            "desktop_mode": data.get("desktop_mode", "silence"),
+            "phone_app": data.get("phone_app"),
+            "location_zone": data.get("location_zone"),
+            "activity": data.get("activity", "working"),
+            "productivity_active": data.get("productivity_active", False),
+            "ahk_reachable": data.get("ahk_reachable"),
         }
     except Exception:
         pass
@@ -2055,14 +2061,71 @@ def _mode_bar(mode_dist: dict, width: int = 36) -> Text:
     return text
 
 
+def _format_context_section() -> list:
+    """Build 'what the system thinks' context lines from live timer state."""
+    timer = _read_timer()
+    lines = []
+
+    # Activity inference: what does the system think I'm doing?
+    desktop_mode = timer.get("desktop_mode", "silence")
+    phone_app = timer.get("phone_app")
+    activity = timer.get("activity", "working")
+    productivity = timer.get("productivity_active", False)
+
+    ACTIVITY_LABELS = {
+        "silence": "Focused work (silence)",
+        "music": "Focused work (music)",
+        "video": "Watching video",
+        "scrolling": "Scrolling (social media)",
+        "gaming": "Gaming",
+    }
+    doing = ACTIVITY_LABELS.get(desktop_mode, desktop_mode)
+    if phone_app:
+        doing += f" + phone: {phone_app}"
+    doing_color = "green" if activity == "working" else "yellow"
+    lines.append(Text.from_markup(f"  [bold]Activity[/bold]  [{doing_color}]{doing}[/{doing_color}]"))
+
+    # Location inference
+    location = timer.get("location_zone")
+    loc_label = {"home": "Home", "gym": "Gym", "campus": "Campus"}.get(location, "Unknown")
+    lines.append(Text.from_markup(f"  [bold]Location[/bold]  {loc_label}"))
+
+    # Productivity state
+    prod_style = "green" if productivity else "red"
+    prod_label = "Active" if productivity else "Inactive"
+    lines.append(Text.from_markup(f"  [bold]Prod[/bold]     [{prod_style}]{prod_label}[/{prod_style}]"))
+
+    # AHK reachable?
+    ahk = timer.get("ahk_reachable")
+    if ahk is True:
+        lines.append(Text.from_markup("  [bold]Desktop[/bold]  [green]AHK connected[/green]"))
+    elif ahk is False:
+        lines.append(Text.from_markup("  [bold]Desktop[/bold]  [red]AHK unreachable[/red]"))
+
+    return lines
+
+
 def create_timer_stats_panel(max_lines: int = 10) -> Panel:
-    """Create timer stats panel with line graph, mode distribution, and shift stats."""
+    """Create timer stats panel with context awareness, line graph, mode distribution, and shift stats."""
     data = _fetch_timer_shifts()
 
-    if not data or data.get("total_shifts", 0) == 0:
-        return Panel("[dim]No timer shifts recorded today[/dim]", title="Timer Stats", border_style="magenta")
+    # Context section (always show even without shifts)
+    lines = _format_context_section()
 
-    lines = []
+    if not data or data.get("total_shifts", 0) == 0:
+        content = Text()
+        for i, line in enumerate(lines):
+            if i > 0:
+                content.append("\n")
+            if isinstance(line, Text):
+                content.append_text(line)
+            else:
+                content.append_text(Text.from_markup(line))
+        if not lines:
+            content.append_text(Text.from_markup("[dim]No timer shifts recorded today[/dim]"))
+        return Panel(content, title="Timer Stats", border_style="magenta")
+
+    lines.append("")  # spacer
 
     # Break balance line graph (braille)
     series = data.get("balance_series", [])
