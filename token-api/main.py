@@ -7355,34 +7355,40 @@ async def handle_stop(payload: dict) -> dict:
         return result
 
     # Desktop path: TTS and notification
-    # Extract TTS text from transcript
+    # Extract TTS text from transcript (prefer embedded tail for remote access,
+    # fall back to direct file read if local)
+    transcript_tail = payload.get("transcript_tail")
     transcript_path = payload.get("transcript_path")
     tts_text = None
 
-    if transcript_path and os.path.exists(transcript_path):
+    # Determine lines to parse: embedded tail (from hook shim) or direct file read
+    transcript_lines = None
+    if transcript_tail:
+        transcript_lines = transcript_tail.splitlines()
+    elif transcript_path and os.path.exists(transcript_path):
         try:
             with open(transcript_path, 'r') as f:
-                lines = f.readlines()
-
-            # Find last assistant message
-            for line in reversed(lines):
-                if '"role":"assistant"' in line:
-                    try:
-                        data = json.loads(line)
-                        content = data.get("message", {}).get("content")
-                        if isinstance(content, str):
-                            tts_text = content
-                        elif isinstance(content, list):
-                            # Extract text from content array
-                            texts = [c.get("text", "") for c in content if c.get("type") == "text"]
-                            tts_text = "\n".join(texts)
-                        elif isinstance(content, dict) and "text" in content:
-                            tts_text = content["text"]
-                        break
-                    except json.JSONDecodeError:
-                        continue
+                transcript_lines = f.readlines()
         except Exception as e:
             logger.warning(f"Failed to read transcript: {e}")
+
+    if transcript_lines:
+        for line in reversed(transcript_lines):
+            if '"role":"assistant"' in line:
+                try:
+                    data = json.loads(line)
+                    content = data.get("message", {}).get("content")
+                    if isinstance(content, str):
+                        tts_text = content
+                    elif isinstance(content, list):
+                        # Extract text from content array
+                        texts = [c.get("text", "") for c in content if c.get("type") == "text"]
+                        tts_text = "\n".join(texts)
+                    elif isinstance(content, dict) and "text" in content:
+                        tts_text = content["text"]
+                    break
+                except json.JSONDecodeError:
+                    continue
 
     # Check TTS config
     tts_config_file = Path.home() / ".claude" / ".tts-config.json"
