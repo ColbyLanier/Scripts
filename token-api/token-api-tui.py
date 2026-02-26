@@ -101,6 +101,7 @@ layout_mode_forced = False  # True if user used --mobile, --vertical, --compact,
 sort_mode = "recent_activity"  # "status", "recent_activity", "recent_stopped", "created"
 filter_mode = "all"  # "all", "active", "stopped"
 show_subagents = False  # Hide subagents by default, toggle with 'a'
+global_tts_mode = "verbose"  # Cached from API
 table_mode = "instances"  # "instances" or "cron"
 cron_selected_index = 0
 panel_page = 0  # 0 = events view, 1 = server logs view, 2 = deploy logs view
@@ -505,6 +506,39 @@ def cycle_instance_tts_mode(instance_id: str, current_mode: str) -> dict | None:
         )
         with urllib.request.urlopen(req, timeout=3) as response:
             result = json.loads(response.read().decode())
+            return result
+    except Exception:
+        return None
+
+
+def refresh_global_tts_mode():
+    """Fetch global TTS mode from server."""
+    global global_tts_mode
+    try:
+        req = urllib.request.Request(f"{API_URL}/health", method="GET")
+        with urllib.request.urlopen(req, timeout=1) as response:
+            data = json.loads(response.read().decode())
+            global_tts_mode = data.get("tts_global_mode", "verbose")
+    except Exception:
+        pass
+
+
+def cycle_global_tts_mode() -> dict | None:
+    """Cycle global TTS mode: verbose -> muted -> silent -> verbose."""
+    global global_tts_mode
+    mode_cycle = {"verbose": "muted", "muted": "silent", "silent": "verbose"}
+    new_mode = mode_cycle.get(global_tts_mode, "muted")
+    try:
+        data = json.dumps({"mode": new_mode}).encode()
+        req = urllib.request.Request(
+            f"{API_URL}/api/tts/global-mode",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            result = json.loads(response.read().decode())
+            global_tts_mode = result.get("mode", global_tts_mode)
             return result
     except Exception:
         return None
@@ -2062,6 +2096,13 @@ def create_status_bar(instances: list, selected_idx: int) -> Text:
         if hidden_sub_count > 0:
             subagent_indicator = f"  [dim]+{hidden_sub_count} sub[/dim]"
 
+    # Global TTS mode indicator
+    tts_mode_indicator = ""
+    if global_tts_mode == "muted":
+        tts_mode_indicator = "  [yellow]TTS:muted[/yellow]"
+    elif global_tts_mode == "silent":
+        tts_mode_indicator = "  [red]TTS:silent[/red]"
+
     # Table mode indicator
     if table_mode == "cron":
         table_indicator = "[yellow bold]\\[Cron][/yellow bold]"
@@ -2078,6 +2119,8 @@ def create_status_bar(instances: list, selected_idx: int) -> Text:
         text.append_text(Text.from_markup(filter_indicator))
     if subagent_indicator:
         text.append_text(Text.from_markup(subagent_indicator))
+    if tts_mode_indicator:
+        text.append_text(Text.from_markup(tts_mode_indicator))
     text.append("  |  ", style="white")
 
     # Check for feedback messages (show for 3 seconds)
@@ -2108,7 +2151,7 @@ def create_status_bar(instances: list, selected_idx: int) -> Text:
         else:
             text.append_text(Text.from_markup(f"[yellow bold]{feedback_msg}[/yellow bold]"))
     else:
-        text.append_text(Text.from_markup("[dim]jk=nav r=rename s=stop d=del y=copy f=filter R=restart q=quit[/dim]"))
+        text.append_text(Text.from_markup("[dim]jk=nav r=rename s=stop m=mute M=global q=quit[/dim]"))
 
     return text
 
@@ -2473,7 +2516,7 @@ def main():
     """Main entry point."""
     global selected_index, instances_cache, api_healthy, api_error_message, layout_mode, layout_mode_forced, sort_mode, filter_mode, show_subagents, panel_page
     global deploy_active, deploy_log_path, deploy_metadata, deploy_previous_page, deploy_auto_switched
-    global table_mode, cron_selected_index, unstick_feedback
+    global table_mode, cron_selected_index, unstick_feedback, global_tts_mode
 
     parser = argparse.ArgumentParser(description="Token-API TUI Dashboard")
     parser.add_argument("--mobile", "-m", action="store_true",
@@ -2635,6 +2678,10 @@ def main():
                         with action_lock:
                             action_queue.append('mute_toggle')
                         update_flag.set()
+                    elif key == 'M':
+                        with action_lock:
+                            action_queue.append('global_mute_toggle')
+                        update_flag.set()
                     elif key == 'f':
                         with action_lock:
                             action_queue.append('filter')
@@ -2675,6 +2722,7 @@ def main():
     listener_thread.start()
 
     instances_cache = get_instances()
+    refresh_global_tts_mode()
     prev_instance_ids = set(i.get("id") for i in instances_cache)
 
     def _get_displayed():
@@ -2896,6 +2944,15 @@ def main():
                                 mode_display = {"verbose": "Verbose (TTS+Sound)", "muted": "Muted (Sound only)", "silent": "Silent"}
                                 unstick_feedback = (time.time(), f"TTS: {mode_display.get(new_mode, new_mode)}")
                                 instances_cache = get_instances()
+                                refresh_global_tts_mode()
+
+                    elif action == 'global_mute_toggle':
+                        result = cycle_global_tts_mode()
+                        if result:
+                            new_mode = result.get("mode", "?")
+                            mode_display = {"verbose": "Verbose", "muted": "Muted", "silent": "Silent"}
+                            unstick_feedback = (time.time(), f"Global TTS: {mode_display.get(new_mode, new_mode)}")
+                            instances_cache = get_instances()
 
                     elif action == 'delete_all':
                         total_count = len(instances_cache) if instances_cache else 0
