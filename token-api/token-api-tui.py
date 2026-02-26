@@ -2405,7 +2405,9 @@ def generate_compact_dashboard(instances: list, selected_idx: int) -> Layout:
     # Single header panel with health dot inline
     health_dot = "[green]●[/green]" if api_healthy else "[red]●[/red]"
     timer_text = get_timer_header_text()
-    timer_text.insert(0, "● ", style="green" if api_healthy else "red")
+    dot = Text("● ", style="green" if api_healthy else "red")
+    dot.append_text(timer_text)
+    timer_text = dot
     timer_text.justify = "center"
     layout["header"].update(Panel(
         timer_text,
@@ -2485,7 +2487,9 @@ def generate_vertical_dashboard(instances: list, selected_idx: int) -> Layout:
 
     # Single header panel with health dot inline
     timer_text = get_timer_header_text()
-    timer_text.insert(0, "● ", style="green" if api_healthy else "red")
+    dot = Text("● ", style="green" if api_healthy else "red")
+    dot.append_text(timer_text)
+    timer_text = dot
     timer_text.justify = "center"
     layout["header"].update(Panel(
         timer_text,
