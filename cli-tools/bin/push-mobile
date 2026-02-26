@@ -53,7 +53,7 @@ Combine flags:  push-mobile -bp       (bashrc + properties)
                 push-mobile --sync -a (sync + everything)
 
 Files:
-    -b  mobile/termux-bashrc-template      → phone:~/.bashrc
+    -b  mobile/termux-bashrc-template      → phone:~/.zshrc
     -p  mobile/termux-properties-template   → phone:~/.termux/termux.properties
     -m  mobile/macros/                      → phone:~/macros/
 EOF
@@ -116,10 +116,10 @@ if $PUSH_BASHRC; then
     if [[ ! -f "$src" ]]; then
         log_err "Not found: ${src}"
     elif [[ "$DRY_RUN" == true ]]; then
-        log_dry "bashrc → phone:~/.bashrc"
+        log_dry "bashrc → phone:~/.zshrc"
     else
         log_info "Pushing bashrc..."
-        if scp -q "$src" phone:~/.bashrc; then
+        if scp -q "$src" phone:~/.zshrc; then
             log_ok "bashrc"; ((++pushed))
         else
             log_err "bashrc failed"
@@ -171,5 +171,5 @@ if [[ "$DRY_RUN" == true ]]; then
     echo -e "${YELLOW}Dry run complete.${NC}"
 elif [[ $pushed -gt 0 ]]; then
     echo -e "${GREEN}${BOLD}Pushed ${pushed} target(s).${NC}"
-    $PUSH_BASHRC && echo -e "  Run ${BOLD}source ~/.bashrc${NC} on phone to reload."
+    $PUSH_BASHRC && echo -e "  Run ${BOLD}source ~/.zshrc${NC} on phone to reload."
 fi
