@@ -111,7 +111,7 @@ fetch-bashrc() {
     echo "Syncing Scripts repo (WSL → Mac)..."
     ssh mac "~/Scripts/cli-tools/bin/scripts-sync pull" 2>/dev/null
     echo "Fetching bashrc from Mac..."
-    scp mac:~/Scripts/mobile/termux-bashrc-template ~/.bashrc && source ~/.bashrc && echo "bashrc updated and reloaded"
+    scp mac:~/Scripts/mobile/termux-bashrc-template ~/.zshrc && source ~/.zshrc && echo "zshrc updated and reloaded"
 }
 
 # Fetch and update termux.properties from Mac (syncs WSL→Mac first, then copies)
@@ -126,19 +126,20 @@ fetch-properties() {
 # HISTORY
 # ====================================================
 HISTCONTROL=ignoreboth
-shopt -s histappend
 HISTSIZE=1000
 HISTFILESIZE=2000
+# zsh history options
+setopt APPEND_HISTORY HIST_IGNORE_DUPS HIST_IGNORE_SPACE 2>/dev/null
 
 # ====================================================
 # SHELL OPTIONS
 # ====================================================
-shopt -s checkwinsize
+setopt AUTO_CD 2>/dev/null
 
 # ====================================================
 # PROMPT
 # ====================================================
-PS1='\[\033[01;32m\]\u@phone\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+PS1='%F{green}%n@phone%f:%F{blue}%~%f%# '
 
 # ====================================================
 # SMART CD SYSTEM - Shorthand path expansion with enhancements
@@ -209,7 +210,7 @@ alias ~="cd ~"
 alias b="cd -"
 
 # Enable autocd - type directory name without 'cd'
-shopt -s autocd 2>/dev/null
+setopt AUTO_CD 2>/dev/null
 
 # cd + ls - change directory and list contents
 cdl() { cd "$@" && ls -l; }
@@ -290,6 +291,7 @@ alias ll='ls -alF'
 alias la='ls -A'
 alias l='ls -CF'
 alias lsg="ls | grep"
+alias duh="du -h -d 1 | sort -h"
 
 # ====================================================
 # GREP ALIASES
@@ -312,14 +314,93 @@ alias c="clear"
 alias cc="clear &&"
 alias python="python3"
 
-# cdc - cd to path and run claude with optional prompt
+# cdc - run claude on Mac (not installed on phone) with optional path/args
 cdc() {
-    if [[ -n "$1" ]]; then
-        cd "$1" || return 1
-    fi
-    clear
-    claude "${@:2}"
+    ssh mac "cdc $*"
 }
+
+# ====================================================
+# COMMAND NOT FOUND — INTERACTIVE ROUTING MODAL
+# ====================================================
+# Fires only for genuinely missing commands (bash exit 127 hook).
+# --local in any arg position suppresses the modal entirely.
+command_not_found_handler() {
+    local cmd="$1"; shift
+    local args=("$@")
+
+    # --local flag: suppress remote fallback, return 127 normally
+    for arg in "${args[@]}"; do
+        [[ "$arg" == "--local" ]] && { echo "Command not found: $cmd"; return 127; }
+    done
+
+    echo ""
+    echo "Command not found: $cmd"
+    echo "  1) Run on Mac"
+    echo "  2) Run on WSL"
+    echo "  3) Don't run remotely"
+    printf "Route to: "
+    read -r choice
+
+    case "$choice" in
+        1) ssh mac "$cmd" "${args[@]}" ;;
+        2) ssh wsl "$cmd" "${args[@]}" ;;
+        *) return 127 ;;
+    esac
+}
+
+# ====================================================
+# UTILITY FUNCTIONS
+# ====================================================
+# Timestamps
+alias now="date '+%Y-%m-%d %H:%M:%S'"
+alias nowdate="date '+%Y-%m-%d'"
+alias nowtime="date '+%H:%M:%S'"
+
+# Quick file preview (head + tail)
+peek() {
+    local n="${2:-5}"
+    echo "=== head $n ==="
+    head -n "$n" "$1"
+    echo "..."
+    echo "=== tail $n ==="
+    tail -n "$n" "$1"
+}
+
+# Process grep
+psg() { ps aux | grep "$@" | grep -v grep; }
+
+# Find in files
+fif() { grep -rn "$@" .; }
+
+# Extract archives
+extract() {
+    if [[ -f "$1" ]]; then
+        case "$1" in
+            *.tar.bz2)  tar xjf "$1"   ;;
+            *.tar.gz)   tar xzf "$1"   ;;
+            *.tar.xz)   tar xJf "$1"   ;;
+            *.bz2)      bunzip2 "$1"   ;;
+            *.gz)       gunzip "$1"    ;;
+            *.tar)      tar xf "$1"    ;;
+            *.tbz2)     tar xjf "$1"   ;;
+            *.tgz)      tar xzf "$1"   ;;
+            *.zip)      unzip "$1"     ;;
+            *.Z)        uncompress "$1";;
+            *.7z)       7z x "$1"      ;;
+            *)          echo "'$1' cannot be extracted via extract()" ;;
+        esac
+    else
+        echo "'$1' is not a valid file"
+    fi
+}
+
+# ====================================================
+# MAC-SIDE COMMANDS — explicit aliases (bypass routing modal)
+# ====================================================
+alias monitor="ssh mac monitor"
+alias token-restart="ssh mac token-restart"
+alias token-status="ssh mac token-status"
+alias instance-name="ssh mac instance-name"
 
 # ====================================================
 # GIT
