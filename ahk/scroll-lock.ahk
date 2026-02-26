@@ -12,8 +12,7 @@ SCROLL_LOCK_MULTIPLIER := 0.4     ; Velocity added per scroll event
 SCROLL_LOCK_DECAY := 0.85         ; Velocity multiplier per tick (lower = faster stop)
 SCROLL_LOCK_TICK_MS := 8          ; Timer interval for smooth output
 SCROLL_LOCK_MIN_VELOCITY := 0.2   ; Stop threshold
-SCROLL_LOCK_WINDOW := 4           ; Rolling window size for consensus check
-SCROLL_LOCK_CONSENSUS := 3        ; Break lock if this many of last N are opposite
+SCROLL_LOCK_CONSENSUS := 3        ; Break lock after this many net opposite inputs
 ; ===========================================
 
 ; State
@@ -21,39 +20,33 @@ global scrollLockDir := 0           ; 0=unlocked, 1=up, -1=down
 global scrollLockVelocity := 0.0
 global scrollLockAccum := 0.0
 global scrollLockTimerRunning := false
-global scrollLockHistory := []      ; Rolling window of recent directions
+global scrollLockOpposite := 0      ; Net opposite direction counter (++ opposite, -- locked)
 
 WheelUp::HandleLockedScroll(1)
 WheelDown::HandleLockedScroll(-1)
 
 HandleLockedScroll(direction) {
-    global scrollLockDir, scrollLockVelocity, scrollLockTimerRunning, scrollLockHistory
+    global scrollLockDir, scrollLockVelocity, scrollLockAccum, scrollLockTimerRunning
+    global scrollLockOpposite
     global SCROLL_LOCK_RELEASE_MS, SCROLL_LOCK_MULTIPLIER, SCROLL_LOCK_TICK_MS
-    global SCROLL_LOCK_WINDOW, SCROLL_LOCK_CONSENSUS
+    global SCROLL_LOCK_CONSENSUS
 
     ; Lock direction on first event in sequence
     if (scrollLockDir == 0)
         scrollLockDir := direction
 
-    ; Track rolling window of recent directions
-    scrollLockHistory.Push(direction)
-    if (scrollLockHistory.Length > SCROLL_LOCK_WINDOW)
-        scrollLockHistory.RemoveAt(1)
+    ; Track net opposite pressure (opposite++ locked-- floored at 0)
+    if (direction != scrollLockDir)
+        scrollLockOpposite++
+    else
+        scrollLockOpposite := Max(0, scrollLockOpposite - 1)
 
-    ; Consensus check: if N of last M inputs are opposite, break and re-lock
-    if (scrollLockHistory.Length >= SCROLL_LOCK_WINDOW) {
-        oppositeCount := 0
-        for d in scrollLockHistory {
-            if (d != scrollLockDir)
-                oppositeCount++
-        }
-        if (oppositeCount >= SCROLL_LOCK_CONSENSUS) {
-            ; Genuine direction change — reset and re-lock opposite
-            scrollLockVelocity := 0
-            scrollLockAccum := 0
-            scrollLockDir := direction
-            scrollLockHistory := [direction]
-        }
+    ; Consensus: sustained opposite input breaks the lock and re-locks
+    if (scrollLockOpposite >= SCROLL_LOCK_CONSENSUS) {
+        scrollLockVelocity := 0
+        scrollLockAccum := 0
+        scrollLockDir := direction
+        scrollLockOpposite := 0
     }
 
     ; Reset the lock release timer
@@ -108,10 +101,12 @@ ScrollLockTick() {
 
 ReleaseScrollLock() {
     global scrollLockDir, scrollLockVelocity, scrollLockAccum, scrollLockTimerRunning
+    global scrollLockOpposite
 
     scrollLockDir := 0
     scrollLockVelocity := 0
     scrollLockAccum := 0
+    scrollLockOpposite := 0
     scrollLockTimerRunning := false
     SetTimer(ScrollLockTick, 0)
 }
