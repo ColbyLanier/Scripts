@@ -111,7 +111,7 @@ fetch-bashrc() {
     echo "Syncing Scripts repo (WSL → Mac)..."
     ssh mac "~/Scripts/cli-tools/bin/scripts-sync pull" 2>/dev/null
     echo "Fetching bashrc from Mac..."
-    scp mac:~/Scripts/mobile/termux-bashrc-template ~/.zshrc && source ~/.zshrc && echo "zshrc updated and reloaded"
+    scp mac:~/Scripts/mobile/termux-bashrc-template ~/.bashrc && source ~/.bashrc && echo "bashrc updated and reloaded"
 }
 
 # Fetch and update termux.properties from Mac (syncs WSL→Mac first, then copies)
@@ -126,20 +126,19 @@ fetch-properties() {
 # HISTORY
 # ====================================================
 HISTCONTROL=ignoreboth
+shopt -s histappend
 HISTSIZE=1000
 HISTFILESIZE=2000
-# zsh history options
-setopt APPEND_HISTORY HIST_IGNORE_DUPS HIST_IGNORE_SPACE 2>/dev/null
 
 # ====================================================
 # SHELL OPTIONS
 # ====================================================
-setopt AUTO_CD 2>/dev/null
+shopt -s checkwinsize
 
 # ====================================================
 # PROMPT
 # ====================================================
-PS1='%F{green}%n@phone%f:%F{blue}%~%f%# '
+PS1='\[\033[01;32m\]\u@phone\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
 
 # ====================================================
 # SMART CD SYSTEM - Shorthand path expansion with enhancements
@@ -210,7 +209,7 @@ alias ~="cd ~"
 alias b="cd -"
 
 # Enable autocd - type directory name without 'cd'
-setopt AUTO_CD 2>/dev/null
+shopt -s autocd 2>/dev/null
 
 # cd + ls - change directory and list contents
 cdl() { cd "$@" && ls -l; }
@@ -325,7 +324,7 @@ cdc() {
 # ====================================================
 # Fires only for genuinely missing commands (bash exit 127 hook).
 # --local in any arg position suppresses the modal entirely.
-command_not_found_handler() {
+command_not_found_handle() {
     local cmd="$1"; shift
     local args=("$@")
 
