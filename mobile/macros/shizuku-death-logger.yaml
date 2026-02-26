@@ -1,0 +1,144 @@
+# Shizuku Death Logger
+#
+# Detects Shizuku death and logs rich context to understand WHEN and WHY it dies:
+#   - Timestamp
+#   - Screen state (on/locked/off)
+#   - WiFi SSID
+#   - Battery level + charging state
+#   - Whether Shizuku was previously known alive
+#
+# Triggers on screen on AND screen off to catch Samsung's screen-lock kill behavior.
+# Uses RUNNING/STOPPED string outputs to avoid empty-string comparison issues.
+# Tracks state via global shizuku_dead to suppress repeat notifications.
+
+name: "Shizuku Death Logger"
+category: "System"
+description: "Logs Shizuku state changes with context on screen on/off"
+enabled: true
+
+variables:
+  - name: shizuku_status
+    type: string
+    value: ""
+  - name: log_line
+    type: string
+    value: ""
+
+global_variables:
+  - name: shizuku_dead
+    type: boolean
+    value: false
+
+triggers:
+  - type: screen_on
+    screen_on: true
+
+  - type: screen_on
+    screen_on: false
+
+actions:
+  # Check Shizuku process
+  - type: shell
+    command: 'pidof moe.shizuku.privileged.api > /dev/null 2>&1 && echo RUNNING || echo STOPPED'
+    output_var: "shizuku_status"
+
+  # Build log line with context
+  - type: shell
+    command: >
+      BAT=$(dumpsys battery 2>/dev/null | grep -m1 'level:' | awk '{print $2}')
+      CHG=$(dumpsys battery 2>/dev/null | grep -m1 'status:' | awk '{print $2}')
+      echo "{system_date} {system_time} shizuku={lv=shizuku_status} wifi={wifi_ssid} bat=${BAT}% charge_status=${CHG} screen={trigger_type}"
+    output_var: "log_line"
+
+  # Write to log
+  - type: shell
+    command: 'mkdir -p /storage/emulated/0/MacroDroid/logs && echo "{lv=log_line}" >> /storage/emulated/0/MacroDroid/logs/shizuku.log'
+    block: false
+
+  # === Newly dead: was alive, now stopped ===
+  - type: if
+    conditions:
+      - type: variable
+        variable: "shizuku_status"
+        var_type: string
+        comparison: equals
+        value: "STOPPED"
+        local_var: true
+
+  - type: if
+    conditions:
+      - type: variable
+        variable: "shizuku_dead"
+        var_type: boolean
+        comparison: equals
+        value: "false"
+
+  - type: set_variable
+    name: "shizuku_dead"
+    value: "true"
+    var_type: boolean
+
+  - type: notification
+    title: "Shizuku Died"
+    text: "wifi={wifi_ssid} bat={battery_level}% — tap to restart"
+    channel_type: 1
+
+  - type: vibrate
+    pattern: [0, 300, 200, 300]
+
+  # Log the death event explicitly
+  - type: shell
+    command: 'echo "{system_date} {system_time} SHIZUKU_DIED wifi={wifi_ssid} bat={battery_level}% screen={trigger_type}" >> /storage/emulated/0/MacroDroid/logs/shizuku.log'
+    block: false
+
+  - type: launch_app
+    app: "Shizuku"
+    package: "moe.shizuku.privileged.api"
+
+  - type: http_request
+    url: "http://100.66.10.74:7777/phone"
+    method: POST
+    body: '{"event": "shizuku_died", "wifi": "{wifi_ssid}", "battery": "{battery_level}", "screen": "{trigger_type}", "time": "{system_time}"}'
+    content_type: "application/json"
+    block: false
+
+  - type: end_if  # was previously alive
+
+  - type: end_if  # STOPPED
+
+  # === Recovered: was dead, now running ===
+  - type: if
+    conditions:
+      - type: variable
+        variable: "shizuku_status"
+        var_type: string
+        comparison: equals
+        value: "RUNNING"
+        local_var: true
+
+  - type: if
+    conditions:
+      - type: variable
+        variable: "shizuku_dead"
+        var_type: boolean
+        comparison: equals
+        value: "true"
+
+  - type: set_variable
+    name: "shizuku_dead"
+    value: "false"
+    var_type: boolean
+
+  - type: shell
+    command: 'echo "{system_date} {system_time} SHIZUKU_RESTORED wifi={wifi_ssid} bat={battery_level}%" >> /storage/emulated/0/MacroDroid/logs/shizuku.log'
+    block: false
+
+  - type: http_request
+    url: "http://100.66.10.74:7777/phone"
+    method: POST
+    body: '{"event": "shizuku_restored", "wifi": "{wifi_ssid}", "time": "{system_time}"}'
+    content_type: "application/json"
+    block: false
+
+  - type: end_if  # was previously dead
+  - type: end_if  # RUNNING

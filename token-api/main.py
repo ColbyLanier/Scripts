@@ -2495,9 +2495,11 @@ def is_satellite_tts_available() -> bool:
 DESKTOP_STATE = {
     "current_mode": "silence",
     "last_detection": None,
-    # Work mode: "clocked_in" (normal enforcement), "clocked_out" (no enforcement), "gym" (gym timer)
+    # Work mode: MANUAL only now (2026-02-26). User explicitly clocks in/out via /api/clock-in /api/clock-out.
+    # Geofence no longer auto-sets work_mode (location ≠ work status).
+    # Values: "clocked_in" (enforcement), "clocked_out" (no enforcement), "gym" (manual gym mode)
     "work_mode": "clocked_in",
-    # Location zone tracking (state machine for geofence sequencing)
+    # Location zone tracking (geofence - just tracks where you are, doesn't affect work_mode)
     "location_zone": None,  # None = outside all zones, else: "home", "gym", "campus"
     # Grace period: ignore silence detections for 15s after startup to avoid
     # AHK restart race (AHK initializes with silence before detecting real state)
@@ -4629,13 +4631,18 @@ async def set_work_mode(request: WorkModeRequest):
     }
 
 
+# Geofence mapping: location + action → work_mode
+# NOTE: As of 2026-02-26, work_mode is MANUAL only (user explicitly clocks in/out).
+# This map is kept for reference but NO LONGER AUTO-APPLIED.
+# The timer layer (current_mode) and location_zone track your state independently.
+# Gym bounty (+30min break) is still applied on gym exit.
 LOCATION_MODE_MAP = {
-    ("home", "exit"):    "clocked_out",
-    ("home", "enter"):   "clocked_in",
-    ("gym", "enter"):    "gym",
-    ("gym", "exit"):     "clocked_out",
-    ("campus", "enter"): "clocked_out",
-    ("campus", "exit"):  None,  # tracking only, no mode change
+    # ("home", "exit"):    "clocked_out",   # DEPRECATED: was auto-setting
+    # ("home", "enter"):   "clocked_in",    # DEPRECATED: was auto-setting
+    # ("gym", "enter"):    "gym",           # DEPRECATED: was auto-setting
+    # ("gym", "exit"):     "clocked_out",   # DEPRECATED: was auto-setting
+    # ("campus", "enter"): "clocked_out",   # DEPRECATED: was auto-setting
+    # ("campus", "exit"):  None,             # DEPRECATED: was tracking only
 }
 
 
@@ -4694,17 +4701,21 @@ async def handle_location_event(request: LocationEventRequest):
         DESKTOP_STATE["location_zone"] = None
 
     # --- Mode change ---
-    new_mode = LOCATION_MODE_MAP.get(key)
+    # DEPRECATED: work_mode is now MANUAL only (user explicitly clocks in/out via /api/clock-in /api/clock-out)
+    # Location events only track location_zone, they no longer auto-change work_mode.
+    # This decoupling ensures location ≠ work status (you can be home but not working).
+    new_mode = LOCATION_MODE_MAP.get(key)  # Always None now, kept for reference
     result = {}
 
     if new_mode is not None:
+        # This branch is now dead code (new_mode is always None) - kept for future flexibility
         work_mode_req = WorkModeRequest(
             mode=new_mode,
             source=f"macrodroid:{location}:{action}"
         )
         result = await set_work_mode(work_mode_req)
     else:
-        print(f">>> Location tracking only for {key}, no mode change")
+        print(f">>> Location tracked: {location}:{action} (work_mode unchanged - manual control only)")
 
     # Gym bounty: +30 min break on gym exit
     if location == "gym" and action == "exit":
@@ -6189,10 +6200,11 @@ async def timer_worker():
 
             now = time.time()
 
-            # Update idle_timeout_exempt based on work_mode/location
-            work_mode = DESKTOP_STATE.get("work_mode", "clocked_in")
+            # Update idle_timeout_exempt based on location only
+            # NOTE: work_mode is manual-only now (user clocks in/out explicitly).
+            # Location-based exemptions still apply (e.g., campus = studying).
             location_zone = DESKTOP_STATE.get("location_zone")
-            timer_engine.idle_timeout_exempt = (work_mode == "gym" or location_zone == "campus")
+            timer_engine.idle_timeout_exempt = (location_zone == "campus")
 
             # Productivity layer update (every 10s) — poll DB for active instances
             if now - last_db_save >= 10:  # piggyback on DB save interval
