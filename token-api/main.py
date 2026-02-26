@@ -6200,7 +6200,7 @@ async def timer_worker():
                 async with aiosqlite.connect(DB_PATH) as db:
                     cursor = await db.execute(
                         """SELECT COUNT(*) FROM claude_instances
-                           WHERE status = 'processing'
+                           WHERE is_processing = 1
                            AND last_activity > datetime('now', '-2 minutes', 'localtime')"""
                     )
                     row = await cursor.fetchone()

@@ -2041,7 +2041,7 @@ def _mode_bar(mode_dist: dict, width: int = 36) -> Text:
     }
     MODE_CHARS = {
         "working": "░",
-        "multitasking": "▒",
+        "multitasking": "▓",
         "idle": "·",
         "break": "▒",
         "distracted": "█",
@@ -2173,7 +2173,7 @@ def create_timer_stats_panel(max_lines: int = 10) -> Panel:
         total = sum(mode_dist.values())
         MODE_SHORTS = {
             "working": ("░ wrk", "bright_white"),
-            "multitasking": ("▒ multi", "yellow"),
+            "multitasking": ("▓ multi", "yellow"),
             "idle": ("· idle", "dim"),
             "break": ("▒ brk", "blue"),
             "distracted": ("█ dist", "red"),
