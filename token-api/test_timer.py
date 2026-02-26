@@ -437,26 +437,42 @@ class TestBreakConsumption:
 
 class TestBreakExhaustion:
     def test_break_exhaustion_event(self):
-        """Consume all break time → BREAK_EXHAUSTED event."""
+        """Consume all break time → BREAK_EXHAUSTED event (fires once on 0-crossing).
+
+        BREAK_EXHAUSTED fires when accumulated_break_ms crosses from >0 to <0
+        in a single tick (overshoot). If break lands exactly on 0, no event fires.
+        Use a non-round amount (500ms sub-second tick) so the 1s-tick consumption
+        overshoots from 500 → -500, triggering the event.
+        """
         engine = make_engine(0)
         advance(engine, 0, 10)  # 10_000ms break (1:1 rate)
+        # Consume 500ms so remaining is 9_500 (not a multiple of 1000)
         engine.enter_break(10_000)
-        result = advance(engine, 10_000, 11)  # 11s > 10s available
-        assert TimerEvent.BREAK_EXHAUSTED in result.events
+        engine.tick(10_500, "2026-02-11")  # consume 500ms → 9_500 remaining
+        # Now advance 10s: tick 10 will go from 500 → -500 (overshoot → BREAK_EXHAUSTED)
+        events = collect_events(engine, 10_500, 10)
+        assert TimerEvent.BREAK_EXHAUSTED in events
         assert engine.accumulated_break_ms == 0
         assert engine.break_backlog_ms > 0
 
     def test_distracted_exhaustion(self):
-        """DISTRACTED penalty can exhaust break."""
+        """DISTRACTED penalty can exhaust break (fires once on 0-crossing).
+
+        Earn a non-round amount so DISTRACTED's -1:1 penalty overshoots past 0
+        in a single tick, triggering the event.
+        """
         engine = make_engine(0)
-        advance(engine, 0, 20)  # 20_000ms break (1:1 rate)
-        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=True, now_mono_ms=20_000)
-        # Advance past 10min threshold then continue
+        # Earn 20_500ms break: 20s WORKING + 500ms sub-second tick
+        advance(engine, 0, 20)
+        engine.tick(20_500, "2026-02-11")  # +500ms → 20_500ms total
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=True, now_mono_ms=20_500)
+        # Advance past 10min threshold (MULTITASKING, neutral rate — break unchanged)
         timeout_secs = DISTRACTION_TIMEOUT_MS // 1000
-        advance(engine, 20_000, timeout_secs)
+        advance(engine, 20_500, timeout_secs)
         # Now in DISTRACTED, penalty -1:1
-        # Need 20s more to exhaust remaining break
-        events = collect_events(engine, 20_000 + timeout_secs * 1000, 30)
+        # 20_500ms / 1000ms per tick = tick 21 will cross from 500 → -500
+        t_start = 20_500 + timeout_secs * 1000
+        events = collect_events(engine, t_start, 25)
         assert TimerEvent.BREAK_EXHAUSTED in events
 
     def test_break_exhaustion_exact_zero(self):
@@ -624,6 +640,59 @@ class TestManualMode:
         engine = make_engine(0)
         engine.enter_break(0)
         assert engine.manual_mode_lock
+
+    def test_break_trigger_is_user(self):
+        """Manual break entry sets trigger='user'."""
+        engine = make_engine(0)
+        engine.enter_break(0)
+        assert engine.manual_trigger == "user"
+
+    def test_sleeping_trigger_is_user(self):
+        """Manual sleeping entry sets trigger='user'."""
+        engine = make_engine(0)
+        engine.enter_sleeping(0)
+        assert engine.manual_trigger == "user"
+
+    def test_idle_timeout_break_trigger(self):
+        """Idle timeout sets trigger='idle_timeout'."""
+        engine = make_engine(0)
+        engine.set_productivity(False, 0)
+        timeout_secs = IDLE_TIMEOUT_FROM_WORKING_MS // 1000
+        advance(engine, 0, timeout_secs)
+        assert engine.effective_mode == TimerMode.BREAK
+        assert engine.manual_trigger == "idle_timeout"
+
+    def test_idle_timeout_break_auto_clears_on_productivity(self):
+        """set_productivity(True) auto-clears BREAK if trigger was 'idle_timeout'."""
+        engine = make_engine(0)
+        engine.set_productivity(False, 0)
+        timeout_secs = IDLE_TIMEOUT_FROM_WORKING_MS // 1000
+        advance(engine, 0, timeout_secs)
+        assert engine.effective_mode == TimerMode.BREAK
+        assert engine.manual_trigger == "idle_timeout"
+        # Becoming productive again should auto-clear the idle-timeout break
+        engine.set_productivity(True, timeout_secs * 1000 + 1000)
+        assert engine.effective_mode == TimerMode.WORKING
+        assert engine.manual_mode is None
+        assert engine.manual_trigger is None
+
+    def test_user_break_not_auto_cleared_on_productivity(self):
+        """set_productivity(True) does NOT auto-clear BREAK if trigger was 'user'."""
+        engine = make_engine(0)
+        engine.enter_break(0)
+        assert engine.manual_trigger == "user"
+        engine.set_productivity(True, 1000)
+        # User break should persist
+        assert engine.effective_mode == TimerMode.BREAK
+        assert engine.manual_trigger == "user"
+
+    def test_resume_clears_trigger(self):
+        """resume() clears manual_trigger."""
+        engine = make_engine(0)
+        engine.enter_break(0)
+        assert engine.manual_trigger == "user"
+        engine.resume(1000)
+        assert engine.manual_trigger is None
 
     def test_sleeping_neutral(self):
         """SLEEPING: no accumulation of any kind."""

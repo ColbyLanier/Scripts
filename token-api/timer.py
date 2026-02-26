@@ -93,6 +93,18 @@ class TimerEngine:
         self._productivity_active: bool = True
         self._manual_mode: TimerMode | None = None  # BREAK or SLEEPING
 
+        # Layer substates — grouped per-layer, reset when layer value changes.
+        # Manual: {trigger: str, lock_until_ms: int|None}
+        self._manual_substate: dict | None = None
+        # Activity: {distraction_started_ms: int|None, is_scrolling_gaming: bool}
+        self._activity_substate: dict = {"distraction_started_ms": None, "is_scrolling_gaming": False}
+        # Productivity: {idle_entered_ms: int|None, idle_timeout_ms: int, idle_timeout_exempt: bool}
+        self._productivity_substate: dict = {
+            "idle_entered_ms": None,
+            "idle_timeout_ms": IDLE_TIMEOUT_FROM_WORKING_MS,
+            "idle_timeout_exempt": False,
+        }
+
         # Counters
         self._total_work_time_ms: int = 0
         self._total_break_time_ms: int = 0
@@ -103,19 +115,6 @@ class TimerEngine:
         self._daily_start_date: str | None = None
         self._last_tick_ms: int = now_mono_ms
         self._reset_hour: int = reset_hour
-
-        # Manual mode lock (blocks auto-resume from break/sleeping)
-        self._manual_mode_lock: bool = False
-        self._manual_mode_lock_until_ms: int | None = None
-
-        # Idle tracking
-        self._idle_entered_ms: int | None = None
-        self._idle_timeout_ms: int = IDLE_TIMEOUT_FROM_WORKING_MS
-        self._idle_timeout_exempt: bool = False
-
-        # Distraction tracking
-        self._distraction_started_ms: int | None = None
-        self._distraction_is_scrolling_gaming: bool = False
 
     # ---- Read-only properties ----
 
@@ -132,9 +131,10 @@ class TimerEngine:
 
         # 3-4. Active + distraction
         if self._productivity_active and self._activity == Activity.DISTRACTION:
-            if (self._distraction_is_scrolling_gaming
-                    and self._distraction_started_ms is not None
-                    and self._last_tick_ms - self._distraction_started_ms >= DISTRACTION_TIMEOUT_MS):
+            asub = self._activity_substate
+            if (asub["is_scrolling_gaming"]
+                    and asub["distraction_started_ms"] is not None
+                    and self._last_tick_ms - asub["distraction_started_ms"] >= DISTRACTION_TIMEOUT_MS):
                 return TimerMode.DISTRACTED  # 3. scrolling/gaming ≥10min
             return TimerMode.MULTITASKING    # 4. distraction <10min or video
 
@@ -160,7 +160,15 @@ class TimerEngine:
 
     @property
     def manual_mode_lock(self) -> bool:
-        return self._manual_mode_lock
+        if self._manual_substate is None:
+            return False
+        return self._manual_substate.get("lock_until_ms") is not None
+
+    @property
+    def manual_trigger(self) -> str | None:
+        if self._manual_substate is None:
+            return None
+        return self._manual_substate.get("trigger")
 
     @property
     def total_work_time_ms(self) -> int:
@@ -176,11 +184,11 @@ class TimerEngine:
 
     @property
     def idle_timeout_exempt(self) -> bool:
-        return self._idle_timeout_exempt
+        return self._productivity_substate["idle_timeout_exempt"]
 
     @idle_timeout_exempt.setter
     def idle_timeout_exempt(self, value: bool) -> None:
-        self._idle_timeout_exempt = value
+        self._productivity_substate["idle_timeout_exempt"] = value
 
     @property
     def activity(self) -> Activity:
@@ -196,11 +204,27 @@ class TimerEngine:
 
     @property
     def idle_timeout_ms(self) -> int:
-        return self._idle_timeout_ms
+        return self._productivity_substate["idle_timeout_ms"]
 
     @property
     def distraction_started_ms(self) -> int | None:
-        return self._distraction_started_ms
+        return self._activity_substate["distraction_started_ms"]
+
+    # ---- Manual mode helpers ----
+
+    def _set_manual_mode(self, mode: TimerMode, trigger: str, now_mono_ms: int,
+                         lock_duration_ms: int = MANUAL_LOCK_DURATION_MS) -> None:
+        """Set manual mode with substate. All manual mode entry goes through here."""
+        self._manual_mode = mode
+        self._manual_substate = {
+            "trigger": trigger,
+            "lock_until_ms": now_mono_ms + lock_duration_ms,
+        }
+
+    def _clear_manual_mode(self) -> None:
+        """Clear manual mode and its substate. All manual mode exit goes through here."""
+        self._manual_mode = None
+        self._manual_substate = None
 
     # ---- Layer mutation methods ----
 
@@ -209,23 +233,23 @@ class TimerEngine:
         old_mode = self.effective_mode
         result = self._advance(now_mono_ms)
 
+        sub = self._activity_substate
         if activity == Activity.DISTRACTION:
             if self._activity != Activity.DISTRACTION:
                 # Entering distraction — start timer
-                self._distraction_started_ms = now_mono_ms
-                self._distraction_is_scrolling_gaming = is_scrolling_gaming
-            elif is_scrolling_gaming and not self._distraction_is_scrolling_gaming:
+                sub["distraction_started_ms"] = now_mono_ms
+                sub["is_scrolling_gaming"] = is_scrolling_gaming
+            elif is_scrolling_gaming and not sub["is_scrolling_gaming"]:
                 # Upgrading from video to scrolling/gaming — reset timer
-                self._distraction_started_ms = now_mono_ms
-                self._distraction_is_scrolling_gaming = True
-            elif not is_scrolling_gaming and self._distraction_is_scrolling_gaming:
-                # Downgrading from scrolling/gaming to video — clear distraction timer
-                self._distraction_is_scrolling_gaming = False
-                # Don't reset start time, just clear the scrolling flag
+                sub["distraction_started_ms"] = now_mono_ms
+                sub["is_scrolling_gaming"] = True
+            elif not is_scrolling_gaming and sub["is_scrolling_gaming"]:
+                # Downgrading from scrolling/gaming to video — clear scrolling flag
+                sub["is_scrolling_gaming"] = False
         else:
-            # Back to working — clear distraction state
-            self._distraction_started_ms = None
-            self._distraction_is_scrolling_gaming = False
+            # Back to working — reset activity substate
+            sub["distraction_started_ms"] = None
+            sub["is_scrolling_gaming"] = False
 
         self._activity = activity
 
@@ -241,20 +265,26 @@ class TimerEngine:
         result = self._advance(now_mono_ms)
 
         was_active = self._productivity_active
+        sub = self._productivity_substate
 
         if active and not was_active:
             # Becoming active — clear idle state
             self._productivity_active = active
-            self._idle_entered_ms = None
+            sub["idle_entered_ms"] = None
+            # Auto-clear break if it was set by idle timeout (user is back)
+            if (self._manual_mode == TimerMode.BREAK
+                    and self._manual_substate
+                    and self._manual_substate.get("trigger") == "idle_timeout"):
+                self._clear_manual_mode()
         elif not active and was_active:
             # Becoming inactive — parameterize idle timeout based on CURRENT mode
             # (before changing productivity, so effective_mode still reflects active state)
             if old_mode in (TimerMode.MULTITASKING, TimerMode.DISTRACTED):
-                self._idle_timeout_ms = IDLE_TIMEOUT_FROM_MULTITASKING_MS
+                sub["idle_timeout_ms"] = IDLE_TIMEOUT_FROM_MULTITASKING_MS
             else:
-                self._idle_timeout_ms = IDLE_TIMEOUT_FROM_WORKING_MS
+                sub["idle_timeout_ms"] = IDLE_TIMEOUT_FROM_WORKING_MS
             self._productivity_active = active
-            self._idle_entered_ms = now_mono_ms
+            sub["idle_entered_ms"] = now_mono_ms
         else:
             self._productivity_active = active
 
@@ -272,9 +302,7 @@ class TimerEngine:
         old_mode = self.effective_mode
         result = self._advance(now_mono_ms)
 
-        self._manual_mode = TimerMode.BREAK
-        self._manual_mode_lock = True
-        self._manual_mode_lock_until_ms = now_mono_ms + MANUAL_LOCK_DURATION_MS
+        self._set_manual_mode(TimerMode.BREAK, "user", now_mono_ms)
 
         new_mode = self.effective_mode
         if new_mode != old_mode:
@@ -290,9 +318,7 @@ class TimerEngine:
         old_mode = self.effective_mode
         result = self._advance(now_mono_ms)
 
-        self._manual_mode = TimerMode.SLEEPING
-        self._manual_mode_lock = True
-        self._manual_mode_lock_until_ms = now_mono_ms + MANUAL_LOCK_DURATION_MS
+        self._set_manual_mode(TimerMode.SLEEPING, "user", now_mono_ms)
 
         new_mode = self.effective_mode
         if new_mode != old_mode:
@@ -308,9 +334,7 @@ class TimerEngine:
         old_mode = self.effective_mode
         result = self._advance(now_mono_ms)
 
-        self._manual_mode = None
-        self._manual_mode_lock = False
-        self._manual_mode_lock_until_ms = None
+        self._clear_manual_mode()
 
         new_mode = self.effective_mode
         if new_mode != old_mode:
@@ -338,9 +362,7 @@ class TimerEngine:
                 and self._manual_mode == TimerMode.SLEEPING):
             old_mode = self.effective_mode
             result = self._advance(now_mono_ms)
-            self._manual_mode = None
-            self._manual_mode_lock = False
-            self._manual_mode_lock_until_ms = None
+            self._clear_manual_mode()
             new_mode = self.effective_mode
             if new_mode != old_mode:
                 result.events.append(TimerEvent.MODE_CHANGED)
@@ -353,17 +375,26 @@ class TimerEngine:
 
     def to_dict(self, now_mono_ms: int) -> dict:
         """Serialize state for DB persistence (snake_case keys)."""
+        # Manual substate
         lock_remaining_ms = 0
-        if self._manual_mode_lock and self._manual_mode_lock_until_ms is not None:
-            lock_remaining_ms = max(0, self._manual_mode_lock_until_ms - now_mono_ms)
+        manual_trigger = None
+        if self._manual_substate:
+            manual_trigger = self._manual_substate.get("trigger")
+            lock_until = self._manual_substate.get("lock_until_ms")
+            if lock_until is not None:
+                lock_remaining_ms = max(0, lock_until - now_mono_ms)
 
+        # Productivity substate
+        psub = self._productivity_substate
         idle_entered_elapsed_ms = 0
-        if self._idle_entered_ms is not None:
-            idle_entered_elapsed_ms = max(0, now_mono_ms - self._idle_entered_ms)
+        if psub["idle_entered_ms"] is not None:
+            idle_entered_elapsed_ms = max(0, now_mono_ms - psub["idle_entered_ms"])
 
+        # Activity substate
+        asub = self._activity_substate
         distraction_elapsed_ms = 0
-        if self._distraction_started_ms is not None:
-            distraction_elapsed_ms = max(0, now_mono_ms - self._distraction_started_ms)
+        if asub["distraction_started_ms"] is not None:
+            distraction_elapsed_ms = max(0, now_mono_ms - asub["distraction_started_ms"])
 
         return {
             "format_version": 2,
@@ -371,6 +402,10 @@ class TimerEngine:
             "activity": self._activity.value,
             "productivity_active": self._productivity_active,
             "manual_mode": self._manual_mode.value if self._manual_mode else None,
+            # Manual substate
+            "manual_trigger": manual_trigger,
+            "manual_mode_lock": self.manual_mode_lock,
+            "manual_mode_lock_remaining_ms": lock_remaining_ms,
             # Counters
             "total_work_time_ms": self._total_work_time_ms,
             "total_break_time_ms": self._total_break_time_ms,
@@ -378,15 +413,13 @@ class TimerEngine:
             "break_backlog_ms": self._break_backlog_ms,
             # Timing
             "daily_start_date": self._daily_start_date,
-            "manual_mode_lock": self._manual_mode_lock,
-            "manual_mode_lock_remaining_ms": lock_remaining_ms,
-            # Idle
+            # Productivity substate
             "idle_entered_elapsed_ms": idle_entered_elapsed_ms,
-            "idle_timeout_ms": self._idle_timeout_ms,
-            "idle_timeout_exempt": self._idle_timeout_exempt,
-            # Distraction
+            "idle_timeout_ms": psub["idle_timeout_ms"],
+            "idle_timeout_exempt": psub["idle_timeout_exempt"],
+            # Activity substate
             "distraction_elapsed_ms": distraction_elapsed_ms,
-            "distraction_is_scrolling_gaming": self._distraction_is_scrolling_gaming,
+            "distraction_is_scrolling_gaming": asub["is_scrolling_gaming"],
         }
 
     def to_export_dict(self) -> dict:
@@ -425,80 +458,86 @@ class TimerEngine:
         self._break_backlog_ms = int(data.get("break_backlog_ms", 0))
         self._daily_start_date = data.get("daily_start_date")
 
-        # Manual mode lock
-        self._manual_mode_lock = data.get("manual_mode_lock", False)
-        remaining = int(data.get("manual_mode_lock_remaining_ms", 0))
-        if remaining > 0 and self._manual_mode_lock:
-            self._manual_mode_lock_until_ms = now_mono_ms + remaining
+        # Manual substate
+        if self._manual_mode is not None:
+            has_lock = data.get("manual_mode_lock", False)
+            remaining = int(data.get("manual_mode_lock_remaining_ms", 0))
+            trigger = data.get("manual_trigger", "user")  # default to "user" for pre-substate data
+            self._manual_substate = {
+                "trigger": trigger,
+                "lock_until_ms": now_mono_ms + remaining if has_lock and remaining > 0 else None,
+            }
         else:
-            self._manual_mode_lock = False
-            self._manual_mode_lock_until_ms = None
+            self._manual_substate = None
 
-        # Idle state
+        # Productivity substate
+        psub = self._productivity_substate
         idle_elapsed = int(data.get("idle_entered_elapsed_ms", 0))
         if idle_elapsed > 0 and not self._productivity_active:
-            self._idle_entered_ms = now_mono_ms - idle_elapsed
+            psub["idle_entered_ms"] = now_mono_ms - idle_elapsed
         else:
-            self._idle_entered_ms = None
-        self._idle_timeout_ms = int(data.get("idle_timeout_ms", IDLE_TIMEOUT_FROM_WORKING_MS))
-        self._idle_timeout_exempt = data.get("idle_timeout_exempt", False)
+            psub["idle_entered_ms"] = None
+        psub["idle_timeout_ms"] = int(data.get("idle_timeout_ms", IDLE_TIMEOUT_FROM_WORKING_MS))
+        psub["idle_timeout_exempt"] = data.get("idle_timeout_exempt", False)
 
-        # Distraction state
+        # Activity substate
+        asub = self._activity_substate
         distraction_elapsed = int(data.get("distraction_elapsed_ms", 0))
         if distraction_elapsed > 0 and self._activity == Activity.DISTRACTION:
-            self._distraction_started_ms = now_mono_ms - distraction_elapsed
+            asub["distraction_started_ms"] = now_mono_ms - distraction_elapsed
         else:
-            self._distraction_started_ms = None
-        self._distraction_is_scrolling_gaming = data.get("distraction_is_scrolling_gaming", False)
+            asub["distraction_started_ms"] = None
+        asub["is_scrolling_gaming"] = data.get("distraction_is_scrolling_gaming", False)
 
         self._last_tick_ms = now_mono_ms
 
     def _load_legacy(self, data: dict, now_mono_ms: int) -> None:
         """Migrate v1 (flat mode) format to v2 layers."""
         old_mode = data.get("current_mode", "work_silence")
+        asub = self._activity_substate
 
         # Map old mode → new layers
         if old_mode in ("work_silence", "work_music"):
             self._activity = Activity.WORKING
             self._productivity_active = True
-            self._manual_mode = None
+            self._clear_manual_mode()
         elif old_mode == "work_video":
             self._activity = Activity.DISTRACTION
             self._productivity_active = True
-            self._distraction_is_scrolling_gaming = False
-            self._distraction_started_ms = now_mono_ms
-            self._manual_mode = None
+            asub["is_scrolling_gaming"] = False
+            asub["distraction_started_ms"] = now_mono_ms
+            self._clear_manual_mode()
         elif old_mode in ("work_scrolling", "work_gaming"):
             self._activity = Activity.DISTRACTION
             self._productivity_active = True
-            self._distraction_is_scrolling_gaming = True
-            self._distraction_started_ms = now_mono_ms
-            self._manual_mode = None
+            asub["is_scrolling_gaming"] = True
+            asub["distraction_started_ms"] = now_mono_ms
+            self._clear_manual_mode()
         elif old_mode == "idle":
             self._activity = Activity.WORKING
             self._productivity_active = False
-            self._manual_mode = None
+            self._clear_manual_mode()
         elif old_mode == "break":
             self._activity = Activity.WORKING
             self._productivity_active = True
-            self._manual_mode = TimerMode.BREAK
+            self._set_manual_mode(TimerMode.BREAK, "user", now_mono_ms)
         elif old_mode == "pause":
             self._activity = Activity.WORKING
             self._productivity_active = False
-            self._manual_mode = None
+            self._clear_manual_mode()
         elif old_mode in ("gym", "work_gym"):
             self._activity = Activity.WORKING
             self._productivity_active = True
-            self._manual_mode = None
+            self._clear_manual_mode()
         elif old_mode == "sleeping":
             self._activity = Activity.WORKING
             self._productivity_active = True
-            self._manual_mode = TimerMode.SLEEPING
+            self._set_manual_mode(TimerMode.SLEEPING, "user", now_mono_ms)
         else:
             # Unknown mode — default to working
             self._activity = Activity.WORKING
             self._productivity_active = True
-            self._manual_mode = None
+            self._clear_manual_mode()
 
         # Restore counters
         self._total_work_time_ms = int(data.get("total_work_time_ms", 0))
@@ -507,31 +546,31 @@ class TimerEngine:
         self._break_backlog_ms = int(data.get("break_backlog_ms", 0))
         self._daily_start_date = data.get("daily_start_date")
 
-        # Restore manual mode lock
-        self._manual_mode_lock = data.get("manual_mode_lock", False)
-        remaining = int(data.get("manual_mode_lock_remaining_ms", 0))
-        if remaining > 0 and self._manual_mode_lock:
-            self._manual_mode_lock_until_ms = now_mono_ms + remaining
-        elif self._manual_mode_lock and data.get("manual_mode_lock_until"):
-            import time as _time
-            remaining_s = float(data["manual_mode_lock_until"]) - _time.time()
-            if remaining_s > 0:
-                self._manual_mode_lock_until_ms = now_mono_ms + int(remaining_s * 1000)
-            else:
-                self._manual_mode_lock = False
-                self._manual_mode_lock_until_ms = None
-        else:
-            self._manual_mode_lock = False
-            self._manual_mode_lock_until_ms = None
+        # Restore manual substate from legacy lock fields
+        if self._manual_mode is not None:
+            has_lock = data.get("manual_mode_lock", False)
+            remaining = int(data.get("manual_mode_lock_remaining_ms", 0))
+            lock_until = None
+            if has_lock and remaining > 0:
+                lock_until = now_mono_ms + remaining
+            elif has_lock and data.get("manual_mode_lock_until"):
+                import time as _time
+                remaining_s = float(data["manual_mode_lock_until"]) - _time.time()
+                if remaining_s > 0:
+                    lock_until = now_mono_ms + int(remaining_s * 1000)
+            # Merge lock_until into existing substate (set by _set_manual_mode above)
+            if self._manual_substate:
+                self._manual_substate["lock_until_ms"] = lock_until
 
-        # Restore idle state
+        # Productivity substate
+        psub = self._productivity_substate
         idle_elapsed = int(data.get("idle_entered_elapsed_ms", 0))
         if idle_elapsed > 0 and not self._productivity_active:
-            self._idle_entered_ms = now_mono_ms - idle_elapsed
+            psub["idle_entered_ms"] = now_mono_ms - idle_elapsed
         else:
-            self._idle_entered_ms = None
-        self._idle_timeout_ms = IDLE_TIMEOUT_FROM_WORKING_MS
-        self._idle_timeout_exempt = data.get("idle_timeout_exempt", False)
+            psub["idle_entered_ms"] = None
+        psub["idle_timeout_ms"] = IDLE_TIMEOUT_FROM_WORKING_MS
+        psub["idle_timeout_exempt"] = data.get("idle_timeout_exempt", False)
 
         self._last_tick_ms = now_mono_ms
 
@@ -572,10 +611,11 @@ class TimerEngine:
             self._total_work_time_ms += elapsed_ms
             # 0:0 neutral — no break delta
             # Check if this tick crosses the distraction timeout (scrolling/gaming only)
-            if (self._distraction_is_scrolling_gaming
-                    and self._distraction_started_ms is not None):
-                was_before = (self._last_tick_ms - elapsed_ms - self._distraction_started_ms) < DISTRACTION_TIMEOUT_MS
-                is_after = (now_mono_ms - self._distraction_started_ms) >= DISTRACTION_TIMEOUT_MS
+            asub = self._activity_substate
+            if (asub["is_scrolling_gaming"]
+                    and asub["distraction_started_ms"] is not None):
+                was_before = (self._last_tick_ms - elapsed_ms - asub["distraction_started_ms"]) < DISTRACTION_TIMEOUT_MS
+                is_after = (now_mono_ms - asub["distraction_started_ms"]) >= DISTRACTION_TIMEOUT_MS
                 if was_before and is_after:
                     result.events.append(TimerEvent.DISTRACTION_TIMEOUT)
                     result.events.append(TimerEvent.MODE_CHANGED)
@@ -590,25 +630,26 @@ class TimerEngine:
 
         elif mode == TimerMode.IDLE:
             # No accumulation. Check idle timeout → auto-break.
-            if (self._idle_entered_ms is not None
-                    and not self._idle_timeout_exempt
-                    and now_mono_ms - self._idle_entered_ms >= self._idle_timeout_ms):
+            psub = self._productivity_substate
+            if (psub["idle_entered_ms"] is not None
+                    and not psub["idle_timeout_exempt"]
+                    and now_mono_ms - psub["idle_entered_ms"] >= psub["idle_timeout_ms"]):
                 old_mode = self.effective_mode
-                self._manual_mode = TimerMode.BREAK
-                self._manual_mode_lock = True
-                self._manual_mode_lock_until_ms = now_mono_ms + MANUAL_LOCK_DURATION_MS
-                self._idle_entered_ms = None
+                self._set_manual_mode(TimerMode.BREAK, "idle_timeout", now_mono_ms)
+                psub["idle_entered_ms"] = None
                 result.events.append(TimerEvent.IDLE_TIMEOUT)
                 result.events.append(TimerEvent.MODE_CHANGED)
                 result.old_mode = old_mode
 
         elif mode == TimerMode.BREAK:
             self._total_break_time_ms += elapsed_ms
+            was_positive = self._accumulated_break_ms > 0
             self._accumulated_break_ms -= elapsed_ms
             if self._accumulated_break_ms < 0:
                 self._break_backlog_ms += abs(self._accumulated_break_ms)
                 self._accumulated_break_ms = 0
-                result.events.append(TimerEvent.BREAK_EXHAUSTED)
+                if was_positive:  # Only fire on 0-crossing, not every tick
+                    result.events.append(TimerEvent.BREAK_EXHAUSTED)
 
         # SLEEPING: no accumulation
 
@@ -642,19 +683,19 @@ class TimerEngine:
         """Reset all state for a new day."""
         self._activity = Activity.WORKING
         self._productivity_active = True
-        self._manual_mode = None
+        self._clear_manual_mode()
+        self._activity_substate = {"distraction_started_ms": None, "is_scrolling_gaming": False}
+        self._productivity_substate = {
+            "idle_entered_ms": None,
+            "idle_timeout_ms": IDLE_TIMEOUT_FROM_WORKING_MS,
+            "idle_timeout_exempt": self._productivity_substate.get("idle_timeout_exempt", False),
+        }
         self._total_work_time_ms = 0
         self._total_break_time_ms = 0
         self._accumulated_break_ms = DEFAULT_BREAK_BUFFER_MS if with_buffer else 0
         self._break_backlog_ms = 0
         self._daily_start_date = today_date
         self._last_tick_ms = now_mono_ms
-        self._manual_mode_lock = False
-        self._manual_mode_lock_until_ms = None
-        self._idle_entered_ms = None
-        self._idle_timeout_ms = IDLE_TIMEOUT_FROM_WORKING_MS
-        self._distraction_started_ms = None
-        self._distraction_is_scrolling_gaming = False
 
     def _apply_break_delta(self, break_delta_ms: int, result: TickResult) -> None:
         """Apply break time change. Handles backlog offset and exhaustion."""
@@ -666,8 +707,10 @@ class TimerEngine:
             else:
                 self._break_backlog_ms -= break_delta_ms
         else:
+            was_positive = self._accumulated_break_ms > 0
             self._accumulated_break_ms += break_delta_ms
             if self._accumulated_break_ms < 0:
                 self._break_backlog_ms += abs(self._accumulated_break_ms)
                 self._accumulated_break_ms = 0
-                result.events.append(TimerEvent.BREAK_EXHAUSTED)
+                if was_positive:  # Only fire on 0-crossing, not every tick
+                    result.events.append(TimerEvent.BREAK_EXHAUSTED)

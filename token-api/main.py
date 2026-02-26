@@ -3998,10 +3998,9 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         if app_name in ("twitter", "x", "com.twitter.android"):
             PHONE_STATE["twitter_open_since"] = None
             PHONE_STATE["twitter_zapped"] = False  # reset zap latch on confirmed close
-            # Clear manual lock so close event restores work mode
-            timer_engine._manual_mode_lock = False
-            timer_engine._manual_mode_lock_until_ms = None
-            print(f"    Twitter closed, lock cleared")
+            # Clear manual mode so close event restores work mode
+            timer_engine._clear_manual_mode()
+            print(f"    Twitter closed, manual mode cleared")
 
         # Switch timer activity to working when distraction app closes
         timer_updated = False
@@ -4306,6 +4305,7 @@ async def get_timer_state():
         "is_in_backlog": timer_engine.break_backlog_ms > 0,
         "daily_start_date": timer_engine.daily_start_date,
         "manual_mode_lock": timer_engine.manual_mode_lock,
+        "manual_trigger": timer_engine.manual_trigger,
         "desktop_mode": DESKTOP_STATE.get("current_mode", "silence"),
         "work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
     }
@@ -6258,10 +6258,9 @@ async def _async_enforce_twitter_timeout():
     # Send low-intensity Pavlok zap
     send_pavlok_stimulus(stimulus_type="zap", value=30, reason="twitter_timeout")
 
-    # Force timer into BREAK mode (bypass lock)
+    # Force timer into BREAK mode (clear any existing manual mode first)
     old_mode = timer_engine.current_mode.value
-    timer_engine._manual_mode_lock = False
-    timer_engine._manual_mode_lock_until_ms = None
+    timer_engine._clear_manual_mode()
     changed, _ = timer_engine.enter_break(now_ms)
     if changed:
         today = datetime.now().strftime("%Y-%m-%d")
