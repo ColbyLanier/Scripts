@@ -491,6 +491,25 @@ def change_instance_voice(instance_id: str, voice: str) -> dict:
         return {"success": False}
 
 
+def cycle_instance_tts_mode(instance_id: str, current_mode: str) -> dict | None:
+    """Cycle TTS mode: verbose -> muted -> silent -> verbose."""
+    mode_cycle = {"verbose": "muted", "muted": "silent", "silent": "verbose"}
+    new_mode = mode_cycle.get(current_mode, "muted")
+    try:
+        data = json.dumps({"mode": new_mode}).encode()
+        req = urllib.request.Request(
+            f"{API_URL}/api/instances/{instance_id}/tts-mode",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="PATCH"
+        )
+        with urllib.request.urlopen(req, timeout=3) as response:
+            result = json.loads(response.read().decode())
+            return result
+    except Exception:
+        return None
+
+
 def delete_all_instances() -> tuple[bool, int]:
     """Delete all instances via the API. Returns (success, count)."""
     try:
@@ -1536,7 +1555,13 @@ def create_instance_details_panel(instance: dict, todos_data: dict, compact: boo
         # Build compact line: status icon, name, device, voice, dir, progress, current task
         parts = [f"{status_icon} [bold]{name}[/bold]"]
         parts.append(f"[dim]({device})[/dim]")
-        parts.append(f"[cyan]Voice:[/cyan] {voice_short}")
+        tts_mode = instance.get("tts_mode", "verbose") or "verbose"
+        if tts_mode == "verbose":
+            parts.append(f"[cyan]Voice:[/cyan] {voice_short}")
+        elif tts_mode == "muted":
+            parts.append(f"[cyan]Voice:[/cyan] [yellow]muted[/yellow]")
+        else:
+            parts.append(f"[cyan]Voice:[/cyan] [red]silent[/red]")
         parts.append(f"[dim]{working_dir_short}[/dim]")
 
         if total > 0:
@@ -1551,7 +1576,13 @@ def create_instance_details_panel(instance: dict, todos_data: dict, compact: boo
         return Panel(content, title="Instance Details", border_style="magenta")
 
     lines.append(f"{status_icon} [bold]{name}[/bold]  [dim]({device})[/dim]")
-    lines.append(f"[cyan]Voice:[/cyan] {voice_short}  [dim](profile {profile_num})[/dim]")
+    tts_mode = instance.get("tts_mode", "verbose") or "verbose"
+    if tts_mode == "verbose":
+        lines.append(f"[cyan]Voice:[/cyan] {voice_short}  [dim](profile {profile_num})[/dim]")
+    elif tts_mode == "muted":
+        lines.append(f"[cyan]Voice:[/cyan] [yellow]muted[/yellow]  [dim]({voice_short} reserved)[/dim]")
+    else:  # silent
+        lines.append(f"[cyan]Voice:[/cyan] [red]silent[/red]")
     lines.append(f"[cyan]Dir:[/cyan]   [dim]{working_dir_short}[/dim]")
     lines.append("")
 
@@ -2442,7 +2473,7 @@ def main():
     """Main entry point."""
     global selected_index, instances_cache, api_healthy, api_error_message, layout_mode, layout_mode_forced, sort_mode, filter_mode, show_subagents, panel_page
     global deploy_active, deploy_log_path, deploy_metadata, deploy_previous_page, deploy_auto_switched
-    global table_mode, cron_selected_index
+    global table_mode, cron_selected_index, unstick_feedback
 
     parser = argparse.ArgumentParser(description="Token-API TUI Dashboard")
     parser.add_argument("--mobile", "-m", action="store_true",
@@ -2599,6 +2630,10 @@ def main():
                     elif key == 'a':
                         with action_lock:
                             action_queue.append('toggle_subagents')
+                        update_flag.set()
+                    elif key == 'm':
+                        with action_lock:
+                            action_queue.append('mute_toggle')
                         update_flag.set()
                     elif key == 'f':
                         with action_lock:
@@ -2850,6 +2885,18 @@ def main():
                             live.start()
                             _refresh(live)
 
+                    elif action == 'mute_toggle' and displayed and table_mode == "instances":
+                        if 0 <= selected_index < len(displayed):
+                            instance = displayed[selected_index]
+                            instance_id = instance.get("id")
+                            current_mode = instance.get("tts_mode", "verbose") or "verbose"
+                            result = cycle_instance_tts_mode(instance_id, current_mode)
+                            if result:
+                                new_mode = result.get("mode", "?")
+                                mode_display = {"verbose": "Verbose (TTS+Sound)", "muted": "Muted (Sound only)", "silent": "Silent"}
+                                unstick_feedback = (time.time(), f"TTS: {mode_display.get(new_mode, new_mode)}")
+                                instances_cache = get_instances()
+
                     elif action == 'delete_all':
                         total_count = len(instances_cache) if instances_cache else 0
 
@@ -2914,7 +2961,6 @@ def main():
                             level_desc = "Interrupting" if level == 2 else "Nudging"
 
                             # Non-destructive: no confirmation needed, run in background
-                            global unstick_feedback
                             unstick_feedback = (time.time(), f"{level_desc} {instance_name}...")
                             _refresh(live)
 
