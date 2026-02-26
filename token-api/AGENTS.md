@@ -30,8 +30,8 @@ Mac Mini (100.95.109.23:7777)     ← primary server, all state lives here
 | `main.py` | FastAPI server (~5000 lines) |
 | `token-satellite.py` | WSL companion server: TTS engine, enforcement (systemd: `token-satellite.service`) |
 | `tts-studio.py` | TUI for auditioning/selecting Windows SAPI voices (run on WSL) |
-| `timer.py` | TimerEngine class — pure logic, no I/O |
-| `test_timer.py` | Unit tests for TimerEngine (48 tests) |
+| `timer.py` | TimerEngine v2 — layered composite model, pure logic, no I/O |
+| `test_timer.py` | Unit tests for TimerEngine v2 (83 tests) |
 | `token-api-tui.py` | TUI dashboard (~1500 lines) |
 | `init_db.py` | Database initialization |
 | `DESIGN.md` | Original design doc (partially outdated) |
@@ -134,6 +134,81 @@ POST   /restart                         # Git pull + systemd restart
 ```
 
 **KVM Watchdog**: Background thread manages DeskFlow lifecycle. Starts DeskFlow at boot, monitors Mac via token-api health check (30s interval), wakes Mac display + starts client when Mac is reachable, stops DeskFlow when Mac goes down. Replaces the old "Deskflow" Windows scheduled task (now disabled).
+
+## Timer State Machine (v2 — Layered Composite Model)
+
+Three independent layers compose into 6 effective modes:
+
+### Layers
+
+| Layer | Values | Source |
+|-------|--------|--------|
+| **Activity** | `working`, `distraction` | AHK audio-monitor, phone app detection |
+| **Productivity** | `active`, `inactive` | Claude instances processing, work-action calls |
+| **Manual** | `None`, `BREAK`, `SLEEPING` | User-initiated overrides |
+
+### Effective Mode Derivation (priority order)
+
+| Priority | Condition | Mode |
+|----------|-----------|------|
+| 1 | Manual override set | **BREAK** or **SLEEPING** |
+| 2 | Prod inactive + distraction | **BREAK** (auto) |
+| 3 | Prod active + scrolling/gaming ≥10min | **DISTRACTED** |
+| 4 | Prod active + distraction <10min | **MULTITASKING** |
+| 5 | Prod inactive + working | **IDLE** |
+| 6 | Prod active + working | **WORKING** |
+
+### Break Rates (integer 1:1)
+
+| Mode | Rate | Effect |
+|------|------|--------|
+| WORKING | +1:1 | Earns 60 min/hr |
+| MULTITASKING | 0:0 | Neutral |
+| IDLE | 0:0 | Neutral |
+| DISTRACTED | -1:1 | Spends 60 min/hr |
+| BREAK | -1:1 | Spends 60 min/hr |
+| SLEEPING | 0:0 | Neutral |
+
+### Key Rules
+
+- **DISTRACTED requires productivity** — only scrolling/gaming trigger it after 10min. Video stays MULTITASKING.
+- **Parameterized idle timeout**: 2hr from WORKING, 2min from MULTITASKING.
+- **Gym bounty**: +30 min break on gym exit (`apply_gym_bounty()`).
+- **Daily reset**: 7 AM (CronTrigger hour=7).
+- **Serialization**: `format_version: 2` in DB. Legacy v1 flat modes auto-migrated on load.
+
+### Timer API Endpoints
+
+```
+GET    /api/timer                     # Full state: effective_mode + layers + counters
+POST   /api/timer/break               # Enter break (manual override)
+POST   /api/timer/pause               # Set productivity inactive (→ IDLE)
+POST   /api/timer/resume              # Exit break/sleeping, set prod active
+POST   /api/timer/sleep               # Enter sleeping (manual override)
+POST   /api/work-action               # Signal productivity active
+POST   /api/timer/daily-reset         # Force daily reset
+POST   /api/timer/reset               # Reset to fresh state
+POST   /api/timer/set-break           # Debug: set break time directly
+GET    /api/timer/shifts              # Today's shift analytics
+```
+
+### Timer Engine Methods (timer.py)
+
+- `set_activity(activity, is_scrolling_gaming, now_ms)` — AHK/phone detection
+- `set_productivity(active, now_ms)` — Claude instances / work actions
+- `enter_break(now_ms)` / `enter_sleeping(now_ms)` — manual overrides
+- `resume(now_ms)` — exit manual mode
+- `apply_gym_bounty(now_ms)` — +30min on gym exit
+- `effective_mode` — derived property from layers
+- `tick(now_ms, date, hour)` — main loop (1s interval)
+
+### Integration Points (main.py)
+
+- **Desktop detection** (`handle_desktop_detection`): silence/music → `set_activity(WORKING)`, video/scrolling/gaming → `set_activity(DISTRACTION)`
+- **Phone activity** (`handle_phone_activity`): same activity-layer mapping
+- **Timer worker** (every 10s): polls DB for processing instances → `set_productivity()`
+- **Hook handlers** (`prompt_submit`, `post_tool_use`): → `set_productivity(True)`
+- **Location events**: gym exit → `apply_gym_bounty()`, gym/campus → `idle_timeout_exempt`
 
 ## Instance Naming
 
@@ -324,9 +399,9 @@ timer-status                     # One-line: mode, break, work time
 timer-status --watch             # Live updating (1s refresh)
 timer-status --json              # Raw JSON
 timer-mode break                 # Enter break mode
-timer-mode pause                 # Enter pause mode
-timer-mode resume                # Back to work_silence
-timer-mode status                # Show mode + lock state
+timer-mode pause                 # Set productivity inactive (→ IDLE)
+timer-mode resume                # Exit break/sleeping, set prod active
+timer-mode status                # Show mode + layer state
 
 # Hit any endpoint
 token-ping                       # List all endpoints (from OpenAPI)
