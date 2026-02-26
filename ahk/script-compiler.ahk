@@ -24,6 +24,7 @@ PragmaOnce(A_ScriptFullPath, A_ScriptHwnd)
 
 #Include audio-monitor.ahk
 #Include discord-ipc-mute.ahk
+#Include scroll-lock.ahk
 #Include *i private.ahk  ; Optional include - won't error if missing
 
 ^Up:: Send "{Up}{Up}{Up}"

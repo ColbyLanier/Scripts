@@ -305,15 +305,22 @@ case "$SERVICE" in
             echo "Starting local development environment (backend=$TARGET)..."
 
             # Trap to cleanup on exit (cd to project root for state file)
-            trap 'echo "Cleaning up..."; rm -f "'"$TARGET_ENV"'"; cd "'"$PROJECT_DIR"'" && node "$DEPLOY_DIR/stop-local-server.js" 2>/dev/null; exit 0' INT TERM
+            # Only stop backend if we started it (BACKEND_ALREADY_RUNNING=false)
+            trap 'echo "Cleaning up..."; rm -f "'"$TARGET_ENV"'"; if [[ "$BACKEND_ALREADY_RUNNING" != "true" ]]; then cd "'"$PROJECT_DIR"'" && node "$DEPLOY_DIR/stop-local-server.js" 2>/dev/null; fi; exit 0' INT TERM
 
-            # Start backend (local or debug mode)
-            echo "Starting backend in $TARGET mode..."
-            node "$DEPLOY_DIR/trigger-deploy.js" "$TARGET"
+            # Start backend (local or debug mode) — skip if already running
+            if curl -sf http://localhost:8080/health >/dev/null 2>&1; then
+                echo "Backend already running on :8080 — skipping startup"
+                BACKEND_ALREADY_RUNNING=true
+            else
+                BACKEND_ALREADY_RUNNING=false
+                echo "Starting backend in $TARGET mode..."
+                node "$DEPLOY_DIR/trigger-deploy.js" "$TARGET"
 
-            # Wait for backend health
-            echo "Waiting for backend health check..."
-            node "$DEPLOY_DIR/wait-for-health.js" http://localhost:8080
+                # Wait for backend health
+                echo "Waiting for backend health check..."
+                node "$DEPLOY_DIR/wait-for-health.js" http://localhost:8080
+            fi
 
             # Try to capture the freshest ngrok URL from the local server state file
             NGROK_URL=""
@@ -457,7 +464,7 @@ PY
                 NPM_PID=$!
 
                 # Re-set trap to include npm process cleanup (cd back to project root for state file)
-                trap 'echo "Cleaning up..."; kill $NPM_PID 2>/dev/null; rm -f "'"$TARGET_ENV"'"; cd "'"$PROJECT_DIR"'" && node "$DEPLOY_DIR/stop-local-server.js" 2>/dev/null; exit 0' INT TERM
+                trap 'echo "Cleaning up..."; kill $NPM_PID 2>/dev/null; rm -f "'"$TARGET_ENV"'"; if [[ "$BACKEND_ALREADY_RUNNING" != "true" ]]; then cd "'"$PROJECT_DIR"'" && node "$DEPLOY_DIR/stop-local-server.js" 2>/dev/null; fi; exit 0' INT TERM
 
                 wait $NPM_PID
             fi

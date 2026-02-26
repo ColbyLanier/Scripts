@@ -97,10 +97,13 @@ def cmd_apply(args: argparse.Namespace) -> int:
             print("  (dry-run: changes will be rolled back)")
         print("=" * 60)
         print()
-        confirmation = input("Type YES to proceed: ")
-        if confirmation != "YES":
-            print("Aborted.")
-            return 1
+        if getattr(args, "pre_approved", False):
+            print("Proceeding (--pre-approved flag set by user instruction).")
+        else:
+            confirmation = input("Type YES to proceed: ")
+            if confirmation != "YES":
+                print("Aborted.")
+                return 1
         print()
 
     # Get password
@@ -186,6 +189,11 @@ Production migrations require typing YES to confirm.
         type=str,
         default=None,
         help="SQL SELECT to run after migration to verify results",
+    )
+    apply_parser.add_argument(
+        "--pre-approved",
+        action="store_true",
+        help="Skip interactive confirmation. Only use when explicitly instructed by the user — never autonomously.",
     )
     apply_parser.set_defaults(func=cmd_apply)
 
