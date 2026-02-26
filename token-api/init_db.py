@@ -58,6 +58,8 @@ def init_database():
         cursor.execute("ALTER TABLE claude_instances ADD COLUMN is_subagent INTEGER DEFAULT 0")
     if 'spawner' not in columns:
         cursor.execute("ALTER TABLE claude_instances ADD COLUMN spawner TEXT")
+    if 'tts_mode' not in columns:
+        cursor.execute("ALTER TABLE claude_instances ADD COLUMN tts_mode TEXT DEFAULT 'verbose'")
 
     # Migration: Convert two-field status (status + is_processing) to single enum
     # Old: status='active' + is_processing=0/1 → New: status='processing'/'idle'/'stopped'
