@@ -2402,29 +2402,15 @@ def generate_compact_dashboard(instances: list, selected_idx: int) -> Layout:
         Layout(name="footer", size=1)
     )
 
-    # Compact header: title + server status
-    header_layout = Layout()
-    header_layout.split_row(
-        Layout(name="title", ratio=2),
-        Layout(name="server_status", ratio=1)
-    )
-
-    if api_healthy:
-        server_text = "[green]●[/green] Server OK"
-    else:
-        server_text = f"[red]●[/red] {api_error_message or 'Error'}"
-
+    # Single header panel with health dot inline
+    health_dot = "[green]●[/green]" if api_healthy else "[red]●[/red]"
     timer_text = get_timer_header_text()
+    timer_text.insert(0, "● ", style="green" if api_healthy else "red")
     timer_text.justify = "center"
-    header_layout["title"].update(Panel(
+    layout["header"].update(Panel(
         timer_text,
-        border_style="cyan"
+        border_style="cyan" if api_healthy else "red"
     ))
-    header_layout["server_status"].update(Panel(
-        Text.from_markup(server_text, justify="center"),
-        border_style="green" if api_healthy else "red"
-    ))
-    layout["header"].update(header_layout)
 
     if table_mode == "cron":
         cron_jobs = get_cached_cron_jobs()
@@ -2497,29 +2483,14 @@ def generate_vertical_dashboard(instances: list, selected_idx: int) -> Layout:
         Layout(name="footer", size=footer_size)
     )
 
-    # Compact header: title + server status side by side
-    header_layout = Layout()
-    header_layout.split_row(
-        Layout(name="title", ratio=2),
-        Layout(name="server_status", ratio=1)
-    )
-
-    if api_healthy:
-        server_text = "[green]●[/green] Server OK"
-    else:
-        server_text = f"[red]●[/red] {api_error_message or 'Error'}"
-
+    # Single header panel with health dot inline
     timer_text = get_timer_header_text()
+    timer_text.insert(0, "● ", style="green" if api_healthy else "red")
     timer_text.justify = "center"
-    header_layout["title"].update(Panel(
+    layout["header"].update(Panel(
         timer_text,
-        border_style="cyan"
+        border_style="cyan" if api_healthy else "red"
     ))
-    header_layout["server_status"].update(Panel(
-        Text.from_markup(server_text, justify="center"),
-        border_style="green" if api_healthy else "red"
-    ))
-    layout["header"].update(header_layout)
 
     # Calculate how many lines fit in the info panel (panel has 2 border lines)
     info_lines = max(1, events_size - 2)
