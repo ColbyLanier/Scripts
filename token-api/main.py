@@ -5839,61 +5839,64 @@ async def tts_queue_worker():
                         logger.warning(f"Sound failed: {sound_result.get('error')}")
                     await asyncio.sleep(0.3)  # Brief pause after sound
 
-                # Look up profile by WSL voice (DB tts_voice stores WSL voice name)
-                # to get mac_voice fallback and wsl_rate
-                wsl_voice = tts_current.voice
-                mac_voice = "Daniel"  # default fallback
-                wsl_rate = 0
-                for p in PROFILES + FALLBACK_VOICES:
-                    if p["wsl_voice"] == wsl_voice:
-                        mac_voice = p.get("mac_voice", "Daniel")
-                        wsl_rate = p.get("wsl_rate", 0)
-                        break
+                if tts_current.message:
+                    # Look up profile by WSL voice (DB tts_voice stores WSL voice name)
+                    # to get mac_voice fallback and wsl_rate
+                    wsl_voice = tts_current.voice
+                    mac_voice = "Daniel"  # default fallback
+                    wsl_rate = 0
+                    for p in PROFILES + FALLBACK_VOICES:
+                        if p["wsl_voice"] == wsl_voice:
+                            mac_voice = p.get("mac_voice", "Daniel")
+                            wsl_rate = p.get("wsl_rate", 0)
+                            break
 
-                # Speak the message (run in executor to allow skip API to interrupt)
-                logger.info(f"TTS worker: speaking {len(tts_current.message)} chars with {wsl_voice} (mac={mac_voice})")
-                loop = asyncio.get_event_loop()
-                tts_result = await loop.run_in_executor(
-                    None, functools.partial(
-                        speak_tts, tts_current.message, mac_voice,
-                        0, tts_current.instance_id, wsl_voice, wsl_rate
-                    )
-                )
-                logger.info(f"TTS worker: speak result = {json.dumps(tts_result)}")
-
-                # Log completion, skip, or failure
-                if tts_result.get("success"):
-                    if tts_result.get("method") == "skipped":
-                        logger.info(f"TTS skipped for {tts_current.instance_id}")
-                        await log_event(
-                            "tts_skipped",
-                            instance_id=tts_current.instance_id,
-                            details={
-                                "message": tts_current.message[:50],
-                                "voice": tts_current.voice
-                            }
+                    # Speak the message (run in executor to allow skip API to interrupt)
+                    logger.info(f"TTS worker: speaking {len(tts_current.message)} chars with {wsl_voice} (mac={mac_voice})")
+                    loop = asyncio.get_event_loop()
+                    tts_result = await loop.run_in_executor(
+                        None, functools.partial(
+                            speak_tts, tts_current.message, mac_voice,
+                            0, tts_current.instance_id, wsl_voice, wsl_rate
                         )
+                    )
+                    logger.info(f"TTS worker: speak result = {json.dumps(tts_result)}")
+
+                    # Log completion, skip, or failure
+                    if tts_result.get("success"):
+                        if tts_result.get("method") == "skipped":
+                            logger.info(f"TTS skipped for {tts_current.instance_id}")
+                            await log_event(
+                                "tts_skipped",
+                                instance_id=tts_current.instance_id,
+                                details={
+                                    "message": tts_current.message[:50],
+                                    "voice": tts_current.voice
+                                }
+                            )
+                        else:
+                            await log_event(
+                                "tts_completed",
+                                instance_id=tts_current.instance_id,
+                                details={
+                                    "message": tts_current.message[:50],
+                                    "voice": tts_current.voice
+                                }
+                            )
                     else:
+                        logger.error(f"TTS failed for {tts_current.instance_id}: {tts_result.get('error')}")
                         await log_event(
-                            "tts_completed",
+                            "tts_failed",
                             instance_id=tts_current.instance_id,
                             details={
                                 "message": tts_current.message[:50],
-                                "voice": tts_current.voice
+                                "voice": tts_current.voice,
+                                "error": tts_result.get("error", "Unknown error"),
+                                "sound_result": sound_result
                             }
                         )
                 else:
-                    logger.error(f"TTS failed for {tts_current.instance_id}: {tts_result.get('error')}")
-                    await log_event(
-                        "tts_failed",
-                        instance_id=tts_current.instance_id,
-                        details={
-                            "message": tts_current.message[:50],
-                            "voice": tts_current.voice,
-                            "error": tts_result.get("error", "Unknown error"),
-                            "sound_result": sound_result
-                        }
-                    )
+                    logger.info(f"TTS worker: muted mode, sound only for {tts_current.instance_id}")
 
                 tts_current = None
                 await asyncio.sleep(0.5)  # Brief pause between items
@@ -6219,7 +6222,7 @@ async def queue_tts(instance_id: str, message: str) -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT tab_name, tts_voice, notification_sound FROM claude_instances WHERE id = ?",
+            "SELECT tab_name, tts_voice, notification_sound, tts_mode FROM claude_instances WHERE id = ?",
             (instance_id,)
         )
         row = await cursor.fetchone()
@@ -6231,13 +6234,34 @@ async def queue_tts(instance_id: str, message: str) -> dict:
     sound = row["notification_sound"] or "chimes.wav"
     tab_name = row["tab_name"] or instance_id
 
-    item = TTSQueueItem(
-        instance_id=instance_id,
-        message=message,
-        voice=voice,
-        sound=sound,
-        tab_name=tab_name
-    )
+    # Check TTS mode (per-instance and global, most restrictive wins)
+    instance_mode = row["tts_mode"] or "verbose"
+    global_mode = TTS_GLOBAL_MODE["mode"]
+    # Restrictiveness order: silent > muted > verbose
+    mode_rank = {"verbose": 0, "muted": 1, "silent": 2}
+    effective_mode = max(instance_mode, global_mode, key=lambda m: mode_rank.get(m, 0))
+
+    if effective_mode == "silent":
+        logger.info(f"TTS suppressed (silent mode): {message[:80]}")
+        return {"success": True, "queued": False, "reason": "silent"}
+
+    if effective_mode == "muted":
+        # Sound only, no TTS speech
+        item = TTSQueueItem(
+            instance_id=instance_id,
+            message="",  # Empty message = no speech
+            voice=voice,
+            sound=sound,
+            tab_name=tab_name
+        )
+    else:
+        item = TTSQueueItem(
+            instance_id=instance_id,
+            message=message,
+            voice=voice,
+            sound=sound,
+            tab_name=tab_name
+        )
 
     async with tts_queue_lock:
         tts_queue.append(item)
