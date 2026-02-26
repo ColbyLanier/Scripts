@@ -1,0 +1,137 @@
+# Shizuku Watchdog
+# Detects when Shizuku dies and alerts the user + notifies the server
+# Checks every 5 minutes if Shizuku's persistent notification is gone
+# Also triggers on screen unlock for faster detection
+
+name: "Shizuku Watchdog"
+category: "Telemetry"
+description: "Detects Shizuku death, alerts user, notifies server, opens Shizuku for quick restart"
+enabled: true
+
+variables:
+  - name: shizuku_alive
+    type: string
+    value: ""
+
+global_variables:
+  - name: shizuku_dead
+    type: boolean
+    value: false
+
+triggers:
+  # Check periodically
+  - type: regular_interval
+    interval: 5
+    unit: minutes
+
+  # Also check on screen unlock for faster detection
+  - type: screen_on
+    screen_on: true
+
+actions:
+  # Use shell to check if Shizuku process is running
+  # dumpsys checks if the Shizuku binder service is registered
+  - type: shell
+    command: 'dumpsys activity services moe.shizuku.privileged.api 2>/dev/null | head -1'
+    output_var: "shizuku_alive"
+
+  # If output is empty or says "nothing", Shizuku is dead
+  - type: if
+    conditions:
+      - type: variable
+        variable: "shizuku_alive"
+        var_type: string
+        comparison: equals
+        value: ""
+        local_var: true
+
+  # Only alert if we haven't already flagged it (prevent notification spam)
+  - type: if
+    conditions:
+      - type: variable
+        variable: "shizuku_dead"
+        var_type: boolean
+        comparison: equals
+        value: "false"
+
+  # Mark as dead to prevent repeat alerts
+  - type: set_variable
+    name: "shizuku_dead"
+    value: "true"
+    var_type: boolean
+
+  # Alert the user
+  - type: notification
+    title: "Shizuku Down"
+    text: "Shizuku service died. Tap to restart. Enforcement is offline."
+    channel_type: 1
+
+  - type: vibrate
+    pattern: [0, 300, 200, 300]
+
+  # Log it
+  - type: shell
+    command: 'mkdir -p /storage/emulated/0/MacroDroid/logs && echo "{system_time} WARN shizuku-watchdog SHIZUKU_DIED" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false
+
+  # Notify the server so it knows enforcement is degraded
+  - type: http_request
+    url: "http://100.66.10.74:7777/phone"
+    method: POST
+    body: '{"event": "shizuku_died", "time": "{system_time}"}'
+    content_type: "application/json"
+    block: false
+
+  # Open Shizuku app so user can hit Start quickly
+  - type: launch_app
+    app: "Shizuku"
+    package: "moe.shizuku.privileged.api"
+
+  - type: end_if  # end shizuku_dead == false
+
+  - type: end_if  # end shizuku_alive == ""
+
+  # If Shizuku IS alive and we previously flagged it dead, clear the flag
+  - type: if
+    conditions:
+      - type: variable
+        variable: "shizuku_alive"
+        var_type: string
+        comparison: not_equals
+        value: ""
+        local_var: true
+
+  - type: if
+    conditions:
+      - type: variable
+        variable: "shizuku_dead"
+        var_type: boolean
+        comparison: equals
+        value: "true"
+
+  # Recovery detected
+  - type: set_variable
+    name: "shizuku_dead"
+    value: "false"
+    var_type: boolean
+
+  - type: notification
+    title: "Shizuku Restored"
+    text: "Shizuku service is back online. Enforcement active."
+    channel_type: 1
+
+  # Log recovery
+  - type: shell
+    command: 'mkdir -p /storage/emulated/0/MacroDroid/logs && echo "{system_time} INFO shizuku-watchdog SHIZUKU_RESTORED" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false
+
+  # Notify server
+  - type: http_request
+    url: "http://100.66.10.74:7777/phone"
+    method: POST
+    body: '{"event": "shizuku_restored", "time": "{system_time}"}'
+    content_type: "application/json"
+    block: false
+
+  - type: end_if  # end shizuku_dead == true
+  - type: end_if  # end shizuku_alive != ""

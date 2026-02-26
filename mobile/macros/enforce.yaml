@@ -1,10 +1,20 @@
-# Enforcement Endpoint + Logging
-# Listens for commands from desktop server to enable/disable apps
-# Server pushes enforcement decisions here
+# Enforce v2 - Server-Pushed App Enforcement
+#
+# Flow:
+#   1. HTTP request arrives with action + app params
+#   2. Gate on action (disable/enable)
+#   3. Switch on app name (if/else_if chain)
+#   4. After disable: wait_until app closes (5s timeout)
+#   5. If timed out → Shizuku is dead → call restart macro
+#   6. Return status to server
+#
+# The wait_until timeout IS the Shizuku health check:
+#   - disable_app succeeds → app force-closes → wait_until fires → ok
+#   - Shizuku dead → disable silently fails → app stays open → timeout
 
 name: "Enforce"
-category: "Telemetry"
-description: "HTTP endpoint for server-pushed enforcement commands"
+category: "Enforcement"
+description: "Server-pushed enforcement with Shizuku health detection via wait_until timeout"
 enabled: true
 
 variables:
@@ -14,9 +24,17 @@ variables:
   - name: app
     type: string
     value: ""
-  - name: response_code
-    type: integer
-    value: 0
+  - name: response_msg
+    type: string
+    value: '{"status": "ok"}'
+  - name: timed_out
+    type: boolean
+    value: false
+
+global_variables:
+  - name: shizuku_dead
+    type: boolean
+    value: false
 
 triggers:
   - type: http_server
@@ -24,15 +42,22 @@ triggers:
     send_response: true
 
 actions:
-  # Log: enforcement command received
-  - type: shell
-    command: 'mkdir -p /storage/emulated/0/MacroDroid/logs && echo "{system_time} INFO enforce RECEIVED action={lv=action} app={lv=app}" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
-    block: false
+  # Defaults
+  - type: set_variable
+    name: "response_msg"
+    value: '{"status": "ok"}'
+    var_type: string
+    local: true
 
-  # Parse the request - action and app come from query params or body
-  # {action: "disable", app: "twitter"}
+  - type: set_variable
+    name: "timed_out"
+    value: "false"
+    var_type: boolean
+    local: true
 
-  # Check if action is "disable"
+  # ========================================
+  # DISABLE
+  # ========================================
   - type: if
     conditions:
       - type: variable
@@ -41,11 +66,8 @@ actions:
         comparison: equals
         value: "disable"
         local_var: true
-    or_conditions: false
 
-  # Disable the requested app
-  # Note: In practice, we'd need separate if blocks per app
-  # For now, handle twitter
+  # --- App switch: disable + wait for close ---
   - type: if
     conditions:
       - type: variable
@@ -60,15 +82,17 @@ actions:
     packages: ["com.twitter.android"]
     disable: true
 
-  - type: notification
-    title: "App Blocked"
-    text: "Twitter disabled by server"
-    channel_type: 1
+  - type: wait_until
+    triggers:
+      - type: app_launched
+        apps: ["X"]
+        packages: ["com.twitter.android"]
+        launched: false
+    timeout: 5
+    continue_on_timeout: true
+    timeout_var: "timed_out"
 
-  - type: end_if
-
-  # YouTube
-  - type: if
+  - type: else_if
     conditions:
       - type: variable
         variable: "app"
@@ -82,15 +106,17 @@ actions:
     packages: ["app.revanced.android.youtube", "com.google.android.youtube"]
     disable: true
 
-  - type: notification
-    title: "App Blocked"
-    text: "YouTube disabled by server"
-    channel_type: 1
+  - type: wait_until
+    triggers:
+      - type: app_launched
+        apps: ["YouTube", "YouTube"]
+        packages: ["app.revanced.android.youtube", "com.google.android.youtube"]
+        launched: false
+    timeout: 5
+    continue_on_timeout: true
+    timeout_var: "timed_out"
 
-  - type: end_if
-
-  # Games
-  - type: if
+  - type: else_if
     conditions:
       - type: variable
         variable: "app"
@@ -108,16 +134,71 @@ actions:
       - "com.GalacticSlice.OneBitAdventure"
     disable: true
 
+  - type: wait_until
+    triggers:
+      - type: app_launched
+        apps: ["Thronefall", "Slice & Dice", "20 Minutes Till Dawn", "OneBit Adventure"]
+        packages:
+          - "com.doghowlgames.thronefall"
+          - "com.com.tann.dice"
+          - "com.Flanne.MinutesTillDawn.roguelike.shooting.gp"
+          - "com.GalacticSlice.OneBitAdventure"
+        launched: false
+    timeout: 5
+    continue_on_timeout: true
+    timeout_var: "timed_out"
+
+  - type: end_if  # app switch
+
+  # --- Shizuku health: timed_out means app never closed ---
+  - type: if
+    conditions:
+      - type: variable
+        variable: "timed_out"
+        var_type: boolean
+        comparison: equals
+        value: "true"
+        local_var: true
+
+  - type: set_variable
+    name: "response_msg"
+    value: '{"status": "shizuku_dead", "app": "{lv=app}"}'
+    var_type: string
+    local: true
+
+  - type: run_macro
+    macro_name: "Shizuku Restart"
+
+  - type: else
+  # Not timed out = disable worked. Clear shizuku_dead if previously set.
+
+  - type: if
+    conditions:
+      - type: variable
+        variable: "shizuku_dead"
+        var_type: boolean
+        comparison: equals
+        value: "true"
+
+  - type: set_variable
+    name: "shizuku_dead"
+    value: "false"
+    var_type: boolean
+
   - type: notification
-    title: "App Blocked"
-    text: "Game disabled by server"
+    title: "Shizuku Restored"
+    text: "Enforcement working again."
     channel_type: 1
 
-  - type: end_if
+  - type: end_if  # shizuku_dead was true
 
-  - type: end_if  # end action == disable
+  - type: end_if  # timed_out check
 
-  # Handle "enable" action
+  - type: end_if  # action == disable
+
+  # ========================================
+  # ENABLE
+  # ========================================
   - type: if
     conditions:
       - type: variable
@@ -127,7 +208,6 @@ actions:
         value: "enable"
         local_var: true
 
-  # Twitter enable
   - type: if
     conditions:
       - type: variable
@@ -142,10 +222,7 @@ actions:
     packages: ["com.twitter.android"]
     disable: false
 
-  - type: end_if
-
-  # YouTube enable
-  - type: if
+  - type: else_if
     conditions:
       - type: variable
         variable: "app"
@@ -159,10 +236,7 @@ actions:
     packages: ["app.revanced.android.youtube", "com.google.android.youtube"]
     disable: false
 
-  - type: end_if
-
-  # Games enable
-  - type: if
+  - type: else_if
     conditions:
       - type: variable
         variable: "app"
@@ -180,11 +254,13 @@ actions:
       - "com.GalacticSlice.OneBitAdventure"
     disable: false
 
-  - type: end_if
+  - type: end_if  # app switch
 
-  - type: end_if  # end action == enable
+  - type: end_if  # action == enable
 
-  # Send response
+  # ========================================
+  # RESPONSE
+  # ========================================
   - type: http_response
     code: "OK"
-    text: '{"status": "ok"}'
+    text: '{lv=response_msg}'

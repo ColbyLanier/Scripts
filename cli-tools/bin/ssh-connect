@@ -74,6 +74,18 @@ if [[ -n "$SSH_CONNECTION" ]] && ! $PROXY; then
 fi
 
 # --- Direct connection (not in SSH session) ---
+# For phone: if SSH fails, try waking sshd via MacroDroid /sshd endpoint
+if [[ "$TARGET" == "phone" ]]; then
+    if ! ssh -o ConnectTimeout=3 -o BatchMode=yes "$HOST" "echo ok" &>/dev/null; then
+        PHONE_IP="100.102.92.24"
+        echo "Phone sshd not responding, sending wake request..."
+        if curl -s --connect-timeout 5 "http://$PHONE_IP:7777/sshd" &>/dev/null; then
+            echo "Waiting for sshd startup..."
+            sleep 3
+        fi
+    fi
+fi
+
 # Wrapper loop: after SSH exits, check for redirect file
 while true; do
     if [[ $# -gt 0 ]]; then

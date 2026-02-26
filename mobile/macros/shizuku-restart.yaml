@@ -1,0 +1,44 @@
+# Shizuku Restart Helper
+# Called by other macros when Shizuku is detected as dead
+# Launches Shizuku app, notifies user, notifies server
+
+name: "Shizuku Restart"
+category: "System"
+description: "Restart helper - launches Shizuku app and alerts user/server"
+enabled: true
+
+global_variables:
+  - name: shizuku_dead
+    type: boolean
+    value: false
+
+triggers: []
+
+actions:
+  - type: set_variable
+    name: "shizuku_dead"
+    value: "true"
+    var_type: boolean
+
+  - type: notification
+    title: "Shizuku Down"
+    text: "Enforcement failed. Tap to restart Shizuku."
+    channel_type: 1
+
+  - type: vibrate
+    pattern: [0, 300, 200, 300]
+
+  - type: launch_app
+    app: "Shizuku"
+    package: "moe.shizuku.privileged.api"
+
+  - type: http_request
+    url: "http://100.66.10.74:7777/phone"
+    method: POST
+    body: '{"event": "shizuku_died", "time": "{system_time}"}'
+    content_type: "application/json"
+    block: false
+
+  - type: shell
+    command: 'echo "{system_time} WARN shizuku-restart SHIZUKU_DEAD" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    block: false

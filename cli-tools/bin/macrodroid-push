@@ -70,15 +70,33 @@ if [[ ! -f "$SOURCE" ]]; then
     exit 1
 fi
 
-# Test SSH connection
+# Wake phone sshd via MacroDroid HTTP endpoint if SSH fails
+PHONE_TAILSCALE_IP="${PHONE_TAILSCALE_IP:-100.102.92.24}"
+PHONE_HTTP_PORT="${PHONE_HTTP_PORT:-7777}"
+
+wake_phone_sshd() {
+    echo "SSH failed, waking sshd via MacroDroid /sshd endpoint..."
+    if curl -s --connect-timeout 5 "http://$PHONE_TAILSCALE_IP:$PHONE_HTTP_PORT/sshd" &>/dev/null; then
+        echo "Sent sshd wake request, waiting for startup..."
+        sleep 3
+        return 0
+    fi
+    return 1
+}
+
+# Test SSH connection (with /sshd fallback)
 echo "Testing connection to phone..."
 if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$SSH_HOST" "echo ok" &>/dev/null; then
-    echo "Error: Cannot connect to phone" >&2
-    echo "Make sure:" >&2
-    echo "  1. Termux is running with sshd" >&2
-    echo "  2. Tailscale is connected" >&2
-    echo "  3. SSH key is set up (see 'sshp' docs)" >&2
-    exit 1
+    if wake_phone_sshd && ssh -o ConnectTimeout=5 -o BatchMode=yes "$SSH_HOST" "echo ok" &>/dev/null; then
+        echo "Connected after sshd wake."
+    else
+        echo "Error: Cannot connect to phone" >&2
+        echo "Make sure:" >&2
+        echo "  1. Tailscale is connected" >&2
+        echo "  2. MacroDroid HTTP server is running (port 7777)" >&2
+        echo "  3. SSH key is set up (see 'sshp' docs)" >&2
+        exit 1
+    fi
 fi
 
 # Expand ~ on remote side and create destination directory

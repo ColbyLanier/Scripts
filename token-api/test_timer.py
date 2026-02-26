@@ -9,6 +9,7 @@ from timer import (
     format_timer_time,
     MANUAL_LOCK_DURATION_MS,
     MAX_IDLE_MS,
+    IDLE_TO_BREAK_TIMEOUT_MS,
 )
 
 
@@ -142,6 +143,15 @@ class TestVideoPenalty:
         engine.set_mode(TimerMode.WORK_VIDEO, is_automatic=False, now_mono_ms=60_000)
         advance(engine, 60_000, 60)  # -15_000ms (video penalty)
         assert engine.accumulated_break_ms == 0
+
+    def test_scrolling_decreases_break_at_gaming_rate(self):
+        """Scrolling (Twitter) drains break at -30 min/hr, same as gaming."""
+        engine = make_engine(0)
+        advance(engine, 0, 60)  # 15_000ms break (silence at 1/4 rate)
+        engine.set_mode(TimerMode.WORK_SCROLLING, is_automatic=False, now_mono_ms=60_000)
+        advance(engine, 60_000, 60)  # -30_000ms (scrolling penalty) → 15k backlog
+        assert engine.accumulated_break_ms == 0
+        assert engine.break_backlog_ms == 15_000
 
     def test_gaming_decreases_break_faster(self):
         """Gaming penalty is twice video."""
@@ -484,3 +494,112 @@ class TestEdgeCases:
         advance(engine, 20_000, 5)
         assert engine.accumulated_break_ms == 0
         assert engine.break_backlog_ms == 0
+
+
+# ---- IDLE mode ----
+
+class TestIdleMode:
+    def test_idle_no_accumulation(self):
+        """IDLE mode: no break earned, no work time tracked."""
+        engine = make_engine(0)
+        # Earn some break first to verify it doesn't change
+        advance(engine, 0, 40)  # 10_000ms break
+        assert engine.accumulated_break_ms == 10_000
+        work_before = engine.total_work_time_ms
+
+        engine.set_mode(TimerMode.IDLE, is_automatic=True, now_mono_ms=40_000)
+        advance(engine, 40_000, 60)
+        assert engine.accumulated_break_ms == 10_000  # unchanged
+        assert engine.total_work_time_ms == work_before  # unchanged
+        assert engine.total_break_time_ms == 0
+
+    def test_idle_timeout_triggers_break(self):
+        """After 15 min of IDLE → auto-transition to BREAK + IDLE_TIMEOUT event."""
+        engine = make_engine(0)
+        engine.set_mode(TimerMode.IDLE, is_automatic=True, now_mono_ms=0)
+
+        # Advance to just before timeout (14 min 59 sec) — should stay IDLE
+        timeout_secs = IDLE_TO_BREAK_TIMEOUT_MS // 1000
+        advance(engine, 0, timeout_secs - 1)
+        assert engine.current_mode == TimerMode.IDLE
+
+        # One more second → timeout
+        result = engine.tick((timeout_secs) * 1000, "2026-02-11")
+        assert engine.current_mode == TimerMode.BREAK
+        assert TimerEvent.IDLE_TIMEOUT in result.events
+        assert TimerEvent.MODE_CHANGED in result.events
+        assert result.old_mode == TimerMode.IDLE
+
+    def test_idle_timeout_exempt(self):
+        """Stays IDLE past 15 min when exempt (gym/campus)."""
+        engine = make_engine(0)
+        engine.idle_timeout_exempt = True
+        engine.set_mode(TimerMode.IDLE, is_automatic=True, now_mono_ms=0)
+
+        timeout_secs = IDLE_TO_BREAK_TIMEOUT_MS // 1000
+        result = advance(engine, 0, timeout_secs + 60)  # 16 minutes
+        assert engine.current_mode == TimerMode.IDLE
+        assert TimerEvent.IDLE_TIMEOUT not in result.events
+
+    def test_idle_to_work_manual(self):
+        """Manual switch from IDLE to WORK_SILENCE works."""
+        engine = make_engine(0)
+        engine.set_mode(TimerMode.IDLE, is_automatic=True, now_mono_ms=0)
+        changed, result = engine.set_mode(TimerMode.WORK_SILENCE, is_automatic=False, now_mono_ms=5_000)
+        assert changed
+        assert engine.current_mode == TimerMode.WORK_SILENCE
+        assert TimerEvent.MODE_CHANGED in result.events
+
+    def test_idle_blocked_by_manual_lock(self):
+        """Auto-IDLE blocked during BREAK/PAUSE lock."""
+        engine = make_engine(0)
+        advance(engine, 0, 60)  # earn break
+        engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=60_000)
+        assert engine.manual_mode_lock
+        changed, _ = engine.set_mode(TimerMode.IDLE, is_automatic=True, now_mono_ms=61_000)
+        assert not changed
+        assert engine.current_mode == TimerMode.BREAK
+
+    def test_idle_serialization(self):
+        """Round-trip preserves idle state."""
+        engine = make_engine(0)
+        engine.idle_timeout_exempt = True
+        engine.set_mode(TimerMode.IDLE, is_automatic=True, now_mono_ms=10_000)
+        # Advance 5 seconds in IDLE
+        advance(engine, 10_000, 5)
+
+        data = engine.to_dict(now_mono_ms=15_000)
+        assert data["idle_entered_elapsed_ms"] == 5_000
+        assert data["idle_timeout_exempt"] is True
+
+        restored = TimerEngine(now_mono_ms=100_000)
+        restored.from_dict(data, now_mono_ms=100_000)
+        assert restored.current_mode == TimerMode.IDLE
+        assert restored.idle_timeout_exempt is True
+        # idle_entered_ms should be restored relative to new now
+        # After restoring, 5s elapsed means idle_entered = 100_000 - 5_000 = 95_000
+        # So timeout would fire at 95_000 + 900_000 = 995_000
+        # Advance to just before that
+        advance(restored, 100_000, 60)  # 1 min, still far from timeout
+        assert restored.current_mode == TimerMode.IDLE  # still idle (exempt)
+
+    def test_idle_daily_reset_clears(self):
+        """Daily reset clears idle state."""
+        engine = make_engine(0, "2026-02-10")
+        engine.set_mode(TimerMode.IDLE, is_automatic=True, now_mono_ms=0)
+        engine.tick(1_000, "2026-02-11")  # trigger reset
+        assert engine.current_mode == TimerMode.WORK_SILENCE
+
+    def test_idle_timeout_emits_mode_changed(self):
+        """Both IDLE_TIMEOUT and MODE_CHANGED events are emitted."""
+        engine = make_engine(0)
+        engine.set_mode(TimerMode.IDLE, is_automatic=True, now_mono_ms=0)
+        timeout_secs = IDLE_TO_BREAK_TIMEOUT_MS // 1000
+        result = advance(engine, 0, timeout_secs)
+        assert TimerEvent.IDLE_TIMEOUT in result.events
+        assert TimerEvent.MODE_CHANGED in result.events
+
+    def test_idle_break_rate_zero(self):
+        """Confirm IDLE has (0, 1) in rate table — neutral."""
+        from timer import BREAK_RATE_TABLE
+        assert BREAK_RATE_TABLE[TimerMode.IDLE] == (0, 1)

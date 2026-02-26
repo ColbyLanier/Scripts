@@ -9,17 +9,17 @@
 # Extra keys toolbar (always visible) - 7x2 with popups
 # Notes:
 #   - Top row: ESC + modifiers + HOME/UP/END nav cluster
-#   - Bottom row: | + common chars (&&, /, -) + LEFT/DOWN/RIGHT arrows
-#   - Hold ESC → Shift+Tab x3 (reverse-tab through completions)
+#   - Bottom row: | + common chars (~, /, -) + LEFT/DOWN/RIGHT arrows
+#   - ESC key (no popup - vol-toggle is via MacroDroid notification)
 #   - Hold SHIFT → Shift+Tab
 #   - Hold ALT → TAB
 #   - Hold CTRL → Ctrl+C x2 (double interrupt, may coalesce to one)
 #   - Hold HOME → DRAWER, hold END → PASTE
 #   - Hold UP → types 'claude' + Enter, hold DOWN → types 'exit' + Enter
-#   - Hold | → types 'ls' + Enter
+#   - Hold | → types '@'
 extra-keys = [ \
   [{key: 'ESC'}, {key: 'SHIFT', popup: {macro: "\u001b[Z", display: '⇧Tab'}}, {key: 'ALT', popup: 'TAB'}, {key: 'CTRL', popup: {macro: "\u0003", display: '^C'}}, {key: 'HOME', popup: 'DRAWER'}, {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'END', popup: 'PASTE'}], \
-  [{key: '|', popup: {macro: "ls\n", display: 'ls↩'}}, {key: '&&', popup: '~'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, 'LEFT', {key: 'DOWN', popup: {macro: "exit\n", display: 'exit↩'}}, 'RIGHT'] \
+  [{key: '|', popup: '@'}, {key: '~', popup: '&&'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, 'LEFT', {key: 'DOWN', popup: {macro: "exit\n", display: 'exit↩'}}, 'RIGHT'] \
 ]
 
 # Better text handling

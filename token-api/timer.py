@@ -14,9 +14,11 @@ class TimerMode(str, Enum):
     WORK_SILENCE = "work_silence"
     WORK_MUSIC = "work_music"
     WORK_VIDEO = "work_video"
+    WORK_SCROLLING = "work_scrolling"
     WORK_GAMING = "work_gaming"
     WORK_GYM = "work_gym"
     GYM = "gym"
+    IDLE = "idle"
     BREAK = "break"
     PAUSE = "pause"
     SLEEPING = "sleeping"
@@ -24,6 +26,7 @@ class TimerMode(str, Enum):
 
 class TimerEvent(Enum):
     BREAK_EXHAUSTED = "break_exhausted"
+    IDLE_TIMEOUT = "idle_timeout"
     DAILY_RESET = "daily_reset"
     MODE_CHANGED = "mode_changed"
 
@@ -42,13 +45,16 @@ BREAK_RATE_TABLE: dict[TimerMode, tuple[int, int]] = {
     TimerMode.WORK_SILENCE: (1, 4),   # +15 min/hr (parity with music)
     TimerMode.WORK_MUSIC: (1, 4),     # +15 min/hr
     TimerMode.WORK_VIDEO: (-1, 4),    # -15 min/hr
+    TimerMode.WORK_SCROLLING: (-1, 2),  # -30 min/hr (same as gaming)
     TimerMode.WORK_GAMING: (-1, 2),   # -30 min/hr
     TimerMode.WORK_GYM: (3, 4),       # +45 min/hr
     TimerMode.GYM: (1, 1),            # +60 min/hr
+    TimerMode.IDLE: (0, 1),             # 0 min/hr - neutral, no accumulation
     TimerMode.SLEEPING: (0, 1),       # 0 min/hr - neutral, doesn't impact break
 }
 
 MAX_IDLE_MS = 10 * 60 * 1000  # 10 minutes
+IDLE_TO_BREAK_TIMEOUT_MS = 15 * 60 * 1000  # 15 minutes idle → auto-break
 MANUAL_LOCK_DURATION_MS = 20 * 60 * 1000  # 20 minutes
 DEFAULT_BREAK_BUFFER_MS = 5 * 60 * 1000   # 5 minutes - starting break on reset
 
@@ -79,6 +85,8 @@ class TimerEngine:
         self._last_tick_ms: int = now_mono_ms
         self._manual_mode_lock: bool = False
         self._manual_mode_lock_until_ms: int | None = None
+        self._idle_entered_ms: int | None = None
+        self._idle_timeout_exempt: bool = False
         self._reset_hour: int = reset_hour  # Hour (0-23) when daily reset happens
 
     # ---- Read-only properties ----
@@ -110,6 +118,14 @@ class TimerEngine:
     @property
     def daily_start_date(self) -> str | None:
         return self._daily_start_date
+
+    @property
+    def idle_timeout_exempt(self) -> bool:
+        return self._idle_timeout_exempt
+
+    @idle_timeout_exempt.setter
+    def idle_timeout_exempt(self, value: bool) -> None:
+        self._idle_timeout_exempt = value
 
     # ---- Core methods ----
 
@@ -145,8 +161,8 @@ class TimerEngine:
         if self._current_mode == mode:
             return False, TickResult()
 
-        # Block automatic switches during manual lock
-        if is_automatic and mode.value.startswith("work_") and self._manual_mode_lock:
+        # Block automatic switches during manual lock (work_* and idle)
+        if is_automatic and (mode.value.startswith("work_") or mode == TimerMode.IDLE) and self._manual_mode_lock:
             if (
                 self._manual_mode_lock_until_ms is not None
                 and now_mono_ms < self._manual_mode_lock_until_ms
@@ -161,6 +177,12 @@ class TimerEngine:
 
         old_mode = self._current_mode
         self._current_mode = mode
+
+        # Idle state tracking
+        if mode == TimerMode.IDLE:
+            self._idle_entered_ms = now_mono_ms
+        else:
+            self._idle_entered_ms = None
 
         # Lock management
         if mode.value.startswith("work_"):
@@ -182,6 +204,10 @@ class TimerEngine:
         if self._manual_mode_lock and self._manual_mode_lock_until_ms is not None:
             lock_remaining_ms = max(0, self._manual_mode_lock_until_ms - now_mono_ms)
 
+        idle_entered_remaining_ms = 0
+        if self._idle_entered_ms is not None:
+            idle_entered_remaining_ms = max(0, now_mono_ms - self._idle_entered_ms)
+
         return {
             "current_mode": self._current_mode.value,
             "total_work_time_ms": self._total_work_time_ms,
@@ -191,6 +217,8 @@ class TimerEngine:
             "daily_start_date": self._daily_start_date,
             "manual_mode_lock": self._manual_mode_lock,
             "manual_mode_lock_remaining_ms": lock_remaining_ms,
+            "idle_entered_elapsed_ms": idle_entered_remaining_ms,
+            "idle_timeout_exempt": self._idle_timeout_exempt,
         }
 
     def to_export_dict(self) -> dict:
@@ -231,6 +259,14 @@ class TimerEngine:
             self._manual_mode_lock = False
             self._manual_mode_lock_until_ms = None
 
+        # Restore idle state
+        idle_elapsed = int(data.get("idle_entered_elapsed_ms", 0))
+        if idle_elapsed > 0 and self._current_mode == TimerMode.IDLE:
+            self._idle_entered_ms = now_mono_ms - idle_elapsed
+        else:
+            self._idle_entered_ms = None
+        self._idle_timeout_exempt = data.get("idle_timeout_exempt", False)
+
         self._last_tick_ms = now_mono_ms
 
     # ---- Internal ----
@@ -254,6 +290,19 @@ class TimerEngine:
                 num, den = rate
                 break_delta_ms = elapsed_ms * num // den
                 self._apply_break_delta(break_delta_ms, result)
+
+        elif mode == TimerMode.IDLE:
+            # No accumulation. Check idle timeout → auto-break.
+            if (self._idle_entered_ms is not None
+                    and not self._idle_timeout_exempt
+                    and now_mono_ms - self._idle_entered_ms >= IDLE_TO_BREAK_TIMEOUT_MS):
+                self._idle_entered_ms = None
+                self._current_mode = TimerMode.BREAK
+                self._manual_mode_lock = True
+                self._manual_mode_lock_until_ms = now_mono_ms + MANUAL_LOCK_DURATION_MS
+                result.events.append(TimerEvent.IDLE_TIMEOUT)
+                result.events.append(TimerEvent.MODE_CHANGED)
+                result.old_mode = TimerMode.IDLE
 
         elif mode == TimerMode.BREAK:
             self._total_break_time_ms += elapsed_ms
@@ -305,6 +354,7 @@ class TimerEngine:
         self._last_tick_ms = now_mono_ms
         self._manual_mode_lock = False
         self._manual_mode_lock_until_ms = None
+        self._idle_entered_ms = None
 
         return result
 
@@ -326,6 +376,7 @@ class TimerEngine:
         self._last_tick_ms = now_mono_ms
         self._manual_mode_lock = False
         self._manual_mode_lock_until_ms = None
+        self._idle_entered_ms = None
 
         return result
 

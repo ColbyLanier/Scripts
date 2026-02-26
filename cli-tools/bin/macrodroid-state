@@ -46,6 +46,17 @@ trigger_export() {
     curl -s --connect-timeout 3 "http://$PHONE_LOCAL_IP:$PHONE_HTTP_PORT/list-exports" >/dev/null 2>&1
 }
 
+# Wake phone sshd via MacroDroid HTTP endpoint if SSH fails
+wake_phone_sshd() {
+    echo "SSH failed, waking sshd via MacroDroid /sshd endpoint..." >&2
+    if curl -s --connect-timeout 5 "http://$PHONE_TAILSCALE_IP:$PHONE_HTTP_PORT/sshd" &>/dev/null; then
+        echo "Sent sshd wake request, waiting for startup..." >&2
+        sleep 3
+        return 0
+    fi
+    return 1
+}
+
 pull_latest() {
     mkdir -p "$SCRATCHPAD"
 
@@ -57,11 +68,19 @@ pull_latest() {
 
     # Pull the canonical export file
     if ! scp -q "$SSH_HOST:~/macros/$EXPORT_FILE" "$SCRATCHPAD/$EXPORT_FILE" 2>/dev/null; then
+        # Fallback: wake sshd and retry
+        if wake_phone_sshd; then
+            if scp -q "$SSH_HOST:~/macros/$EXPORT_FILE" "$SCRATCHPAD/$EXPORT_FILE" 2>/dev/null; then
+                echo "$SCRATCHPAD/$EXPORT_FILE"
+                return 0
+            fi
+        fi
         echo "Failed to pull $EXPORT_FILE from phone" >&2
         echo "" >&2
         echo "Ensure:" >&2
-        echo "  1. sshd is running on phone (run 'sshd' in Termux)" >&2
-        echo "  2. EXPORT.mdr exists in ~/macros/" >&2
+        echo "  1. Tailscale is connected" >&2
+        echo "  2. MacroDroid HTTP server is running (port 7777)" >&2
+        echo "  3. EXPORT.mdr exists in ~/macros/" >&2
         exit 1
     fi
 

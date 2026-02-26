@@ -36,7 +36,7 @@ from pydantic import BaseModel, Field
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
-from timer import TimerEngine, TimerMode, TimerEvent, format_timer_time
+from timer import TimerEngine, TimerMode, TimerEvent, format_timer_time, IDLE_TO_BREAK_TIMEOUT_MS
 
 # Configure logging for TUI capture
 logger = logging.getLogger("token_api")
@@ -1278,6 +1278,15 @@ async def register_instance(request: InstanceRegisterRequest):
         details={"tab_name": request.tab_name, "origin_type": request.origin_type}
     )
 
+    # Push updated instance count to phone widget
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle') AND COALESCE(is_subagent, 0) = 0"
+        )
+        row = await cursor.fetchone()
+        active_count = row[0] if row else 0
+    asyncio.create_task(push_phone_widget_async(timer_engine.current_mode.value, active_count))
+
     return ProfileResponse(
         session_id=session_id,
         profile={
@@ -1391,6 +1400,10 @@ async def stop_instance(instance_id: str):
     # Instance count Pavlok signals (skip subagents)
     if not is_subagent:
         await check_instance_count_pavlok(remaining_non_sub, was_active)
+
+    # Push updated instance count to phone widget
+    if not is_subagent:
+        asyncio.create_task(push_phone_widget_async(timer_engine.current_mode.value, remaining_non_sub))
 
     # If no more active instances and video mode was active, enforce
     if remaining_active == 0 and DESKTOP_STATE.get("current_mode") == "video":
@@ -2491,10 +2504,19 @@ DESKTOP_STATE = {
 }
 
 # Valid desktop detection modes (replaces OBSIDIAN_CONFIG["mode_commands"].keys())
-VALID_DETECTION_MODES = ["silence", "music", "video", "gaming", "gym", "work_gym"]
+VALID_DETECTION_MODES = ["silence", "music", "video", "scrolling", "gaming", "gym", "work_gym"]
 
 # ============ Timer Engine ============
 timer_engine = TimerEngine(now_mono_ms=int(time.monotonic() * 1000))
+
+# Inactivity tracking for idle detection (monotonic ms)
+_last_work_event_ms: int = int(time.monotonic() * 1000)
+
+
+def reset_idle_timer():
+    """Reset the inactivity timer. Called on work actions (prompt_submit, tool_use, work-action, silence/music detection)."""
+    global _last_work_event_ms
+    _last_work_event_ms = int(time.monotonic() * 1000)
 
 # Paths for Obsidian vault (write-only consumer for daily notes)
 OBSIDIAN_VAULT_PATH = Path.home() / "Token-ENV"
@@ -2789,6 +2811,38 @@ PHONE_CONFIG = {
     # =========================================
 }
 
+# Last widget state pushed to phone (dedup)
+_last_widget_push = {"mode": None, "active": None}
+
+
+def push_phone_widget(mode: str, active_count: int):
+    """Push timer mode + active instance count to phone MacroDroid widget endpoint.
+
+    Only pushes if the state actually changed (deduped via _last_widget_push).
+    Runs synchronously via requests (fire-and-forget from async via create_task + to_thread).
+    """
+    if _last_widget_push["mode"] == mode and _last_widget_push["active"] == active_count:
+        return  # no change
+
+    host = PHONE_CONFIG["host"]
+    port = PHONE_CONFIG["port"]
+    timeout = PHONE_CONFIG["timeout"]
+    url = f"http://{host}:{port}/widget-update?mode={mode}&instances={active_count}"
+
+    try:
+        response = requests.get(url, timeout=timeout)
+        _last_widget_push["mode"] = mode
+        _last_widget_push["active"] = active_count
+        print(f"WIDGET: Pushed mode={mode} instances={active_count} -> {response.status_code}")
+    except Exception as e:
+        print(f"WIDGET: Push failed: {e}")
+
+
+async def push_phone_widget_async(mode: str, active_count: int):
+    """Async wrapper for push_phone_widget."""
+    await asyncio.to_thread(push_phone_widget, mode, active_count)
+
+
 # Phone activity state (tracks current app from MacroDroid)
 PHONE_STATE = {
     "current_app": None,  # Current distraction app or None
@@ -2797,14 +2851,16 @@ PHONE_STATE = {
     "reachable": None,  # Last known reachability status
     "last_reachable_check": None,
     "twitter_open_since": None,  # monotonic time when Twitter/X was opened, None when closed
+    "twitter_zapped": False,  # True after 7-min zap fires; blocks re-zap until confirmed close
+    "twitter_last_zap_at": 0,  # monotonic time of last twitter zap (30-min cooldown)
 }
 
 # App categories for phone distraction detection
 PHONE_DISTRACTION_APPS = {
     # Twitter/X
-    "twitter": "video",
-    "x": "video",
-    "com.twitter.android": "video",
+    "twitter": "scrolling",
+    "x": "scrolling",
+    "com.twitter.android": "scrolling",
     # YouTube
     "youtube": "video",
     "com.google.android.youtube": "video",
@@ -3782,11 +3838,21 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
 
         # Update internal timer (automatic = respects manual lock)
         now_ms = int(time.monotonic() * 1000)
-        timer_updated, _ = timer_engine.set_mode(TimerMode("work_" + detected_mode), is_automatic=True, now_mono_ms=now_ms)
+
+        # Distractions (video/scrolling/gaming) → IDLE instead of penalty modes
+        if detected_mode in ("video", "scrolling", "gaming"):
+            timer_target = TimerMode.IDLE
+        else:
+            timer_target = TimerMode("work_" + detected_mode)
+            # Silence/music = real work indicator → reset idle timer
+            reset_idle_timer()
+
+        old_timer_mode = timer_engine.current_mode.value
+        timer_updated, _ = timer_engine.set_mode(timer_target, is_automatic=True, now_mono_ms=now_ms)
 
         if timer_updated:
-            await timer_log_shift("work_" + old_mode if old_mode != "silence" else "work_silence",
-                                  "work_" + detected_mode, trigger="desktop_detection", source="ahk")
+            await timer_log_shift(old_timer_mode,
+                                  timer_target.value, trigger="desktop_detection", source="ahk")
 
         await log_event(
             "desktop_mode_change",
@@ -3931,6 +3997,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         # Clear Twitter tracking on close
         if app_name in ("twitter", "x", "com.twitter.android"):
             PHONE_STATE["twitter_open_since"] = None
+            PHONE_STATE["twitter_zapped"] = False  # reset zap latch on confirmed close
             # Clear manual lock so close event restores work mode
             timer_engine._manual_mode_lock = False
             timer_engine._manual_mode_lock_until_ms = None
@@ -3980,17 +4047,31 @@ async def handle_phone_activity(request: PhoneActivityRequest):
 
     # Helper to sync timer mode for phone distraction
     def _sync_phone_timer():
+        # If twitter was already zapped, don't let phantom opens change timer mode
+        # (this prevents phantom opens from burning break time → break_exhausted zaps)
+        if app_name in ("twitter", "x", "com.twitter.android") and PHONE_STATE.get("twitter_zapped"):
+            print(f"    Skipping timer sync — twitter already zapped")
+            return False, timer_engine.current_mode.value
         old_timer_mode = timer_engine.current_mode.value
         DESKTOP_STATE["current_mode"] = distraction_mode
         DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
         now_ms = int(time.monotonic() * 1000)
-        updated, _ = timer_engine.set_mode(TimerMode("work_" + distraction_mode), is_automatic=True, now_mono_ms=now_ms)
-        print(f"    Phone open -> {distraction_mode} | timer={updated}")
+        # Phone distractions → IDLE instead of penalty modes
+        updated, _ = timer_engine.set_mode(TimerMode.IDLE, is_automatic=True, now_mono_ms=now_ms)
+        print(f"    Phone open -> {distraction_mode} (timer→IDLE) | timer={updated}")
         # Track Twitter open time for 7-minute enforcement
         if app_name in ("twitter", "x", "com.twitter.android"):
-            if PHONE_STATE["twitter_open_since"] is None:
+            if PHONE_STATE["twitter_open_since"] is None and not PHONE_STATE.get("twitter_zapped"):
                 PHONE_STATE["twitter_open_since"] = time.monotonic()
                 print(f"    Twitter timer started")
+            elif PHONE_STATE.get("twitter_zapped"):
+                print(f"    Twitter open (ignoring — already zapped, waiting for confirmed close)")
+        else:
+            # Different app opened — if twitter timer is running, close event was dropped
+            if PHONE_STATE["twitter_open_since"] is not None or PHONE_STATE.get("twitter_zapped"):
+                print(f"    Clearing stale Twitter timer (new app: {app_name})")
+                PHONE_STATE["twitter_open_since"] = None
+                PHONE_STATE["twitter_zapped"] = False
         return updated, old_timer_mode
 
     # Check work mode
@@ -4180,6 +4261,27 @@ async def set_break_time(seconds: int):
     }
 
 
+@app.get("/api/widget/break")
+async def get_widget_break():
+    """Slim break-time endpoint for phone widget on-demand pull."""
+    break_ms = timer_engine.accumulated_break_ms
+    backlog_ms = timer_engine.break_backlog_ms
+    in_backlog = backlog_ms > 0
+    # Show minutes, rounded to 1 decimal
+    if in_backlog:
+        minutes = round(backlog_ms / 60000, 1)
+        label = f"-{minutes}m"
+    else:
+        minutes = round(break_ms / 60000, 1)
+        label = f"{minutes}m"
+    return {
+        "break_minutes": minutes,
+        "in_backlog": in_backlog,
+        "label": label,
+        "mode": timer_engine.current_mode.value,
+    }
+
+
 @app.get("/api/timer")
 async def get_timer_state():
     """Get full timer state (for debugging, dashboards, Stream Deck)."""
@@ -4215,6 +4317,14 @@ async def get_timer_shifts():
     if not rows:
         return {"total_shifts": 0, "balance_series": [], "mode_distribution": {},
                 "shifts_by_trigger": {}, "enforcement_count": 0, "twitter_time_mins": 0}
+
+    # Trim stale left tail: drop leading rows with pre-reset balance
+    # (first shift after daily wipe often carries yesterday's balance)
+    if len(rows) >= 2:
+        first_bal = rows[0]["break_balance_ms"] or 0
+        second_bal = rows[1]["break_balance_ms"] or 0
+        if first_bal > second_bal * 10 and first_bal > 300_000:  # >5min and 10x jump
+            rows = rows[1:]
 
     balance_series = []
     mode_time = defaultdict(int)
@@ -4368,6 +4478,30 @@ async def reset_timer():
 
     await log_event("timer_reset", details={"date": today})
     return {"status": "reset", "total_work_time": "0h 0m", "accumulated_break": "5m", "current_mode": "work_silence"}
+
+
+@app.post("/api/work-action")
+async def work_action():
+    """Manual work action signal — resets idle timer, exits IDLE if active."""
+    global _current_session_id, _session_start_ms
+    reset_idle_timer()
+
+    exited_idle = False
+    if timer_engine.current_mode == TimerMode.IDLE:
+        now_ms = int(time.monotonic() * 1000)
+        changed, _ = timer_engine.set_mode(TimerMode.WORK_SILENCE, is_automatic=False, now_mono_ms=now_ms)
+        if changed:
+            exited_idle = True
+            today = datetime.now().strftime("%Y-%m-%d")
+            await timer_log_shift("idle", "work_silence", trigger="work_action", source="api")
+            if _current_session_id > 0:
+                duration_ms = now_ms - _session_start_ms
+                await timer_end_session(_current_session_id, duration_ms)
+            _current_session_id = await timer_start_session("work_silence", today)
+            _session_start_ms = now_ms
+            print("TIMER: Work-action exited IDLE → WORK_SILENCE")
+
+    return {"idle_timer_reset": True, "exited_idle": exited_idle, "current_mode": timer_engine.current_mode.value}
 
 
 # ============ Pavlok Endpoints ============
@@ -5936,9 +6070,26 @@ async def timer_worker():
             current_hour = now.hour
             result = timer_engine.tick(now_ms, today, current_hour)
 
-            # Handle events
+            # Handle events (IDLE_TIMEOUT handled specially since it also emits MODE_CHANGED)
+            has_idle_timeout = TimerEvent.IDLE_TIMEOUT in result.events
             for event in result.events:
-                if event == TimerEvent.BREAK_EXHAUSTED:
+                if event == TimerEvent.IDLE_TIMEOUT:
+                    print("TIMER: Idle timeout — auto-transitioning to BREAK")
+                    # End idle session, start break session
+                    if _current_session_id > 0:
+                        duration_ms = now_ms - _session_start_ms
+                        await timer_end_session(_current_session_id, duration_ms)
+                    await timer_log_shift("idle", "break", trigger="idle_timeout", source="timer_worker")
+                    _current_session_id = await timer_start_session("break", today)
+                    _session_start_ms = now_ms
+                    _mode_change_count += 1
+                    loop = asyncio.get_event_loop()
+                    loop.run_in_executor(None, speak_tts, "Idle timeout. Entering break mode.")
+                    continue
+                elif event == TimerEvent.MODE_CHANGED and has_idle_timeout:
+                    # Already handled above with IDLE_TIMEOUT
+                    continue
+                elif event == TimerEvent.BREAK_EXHAUSTED:
                     await timer_log_shift(timer_engine.current_mode.value, "break_exhausted",
                                          trigger="enforcement", source="timer_worker")
                     asyncio.create_task(_async_enforce_break_exhausted())
@@ -5980,17 +6131,79 @@ async def timer_worker():
                     # Start new session
                     _current_session_id = await timer_start_session(timer_engine.current_mode.value, today)
                     _session_start_ms = now_ms
+                    # Push mode change to phone widget
+                    async with aiosqlite.connect(DB_PATH) as _wdb:
+                        _cur = await _wdb.execute(
+                            "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle') AND COALESCE(is_subagent, 0) = 0"
+                        )
+                        _row = await _cur.fetchone()
+                        _active = _row[0] if _row else 0
+                    asyncio.create_task(push_phone_widget_async(timer_engine.current_mode.value, _active))
 
             # Twitter 7-minute enforcement
             twitter_since = PHONE_STATE.get("twitter_open_since")
             if twitter_since is not None:
-                twitter_elapsed = time.monotonic() - twitter_since
-                if twitter_elapsed > 420:  # 7 minutes
-                    print(f"TIMER: Twitter open for {twitter_elapsed:.0f}s (>7min). Forcing break.")
-                    PHONE_STATE["twitter_open_since"] = None  # one-shot per session
-                    asyncio.create_task(_async_enforce_twitter_timeout())
+                # Staleness guard: if current_app is no longer twitter, the close
+                # telemetry was likely dropped by MacroDroid — clear the timer
+                current_app = (PHONE_STATE.get("current_app") or "").lower()
+                if current_app not in ("twitter", "x", "com.twitter.android"):
+                    stale_elapsed = time.monotonic() - twitter_since
+                    print(f"TIMER: Twitter timer stale ({stale_elapsed:.0f}s) — current_app={current_app!r}, clearing (dropped close event)")
+                    PHONE_STATE["twitter_open_since"] = None
+                    PHONE_STATE["twitter_zapped"] = False
+                else:
+                    twitter_elapsed = time.monotonic() - twitter_since
+                    if twitter_elapsed > 420:  # 7 minutes
+                        now_mono = time.monotonic()
+                        since_last_zap = now_mono - PHONE_STATE.get("twitter_last_zap_at", 0)
+                        if since_last_zap < 1800:  # 30-minute cooldown
+                            print(f"TIMER: Twitter 7-min hit but cooldown active ({since_last_zap:.0f}s < 1800s). Skipping zap.")
+                            PHONE_STATE["twitter_open_since"] = None
+                        else:
+                            print(f"TIMER: Twitter open for {twitter_elapsed:.0f}s (>7min). Forcing break.")
+                            PHONE_STATE["twitter_open_since"] = None  # one-shot per session
+                            PHONE_STATE["twitter_zapped"] = True  # block re-zap until confirmed close
+                            PHONE_STATE["twitter_last_zap_at"] = now_mono
+                            asyncio.create_task(_async_enforce_twitter_timeout())
 
             now = time.time()
+
+            # Update idle_timeout_exempt based on work_mode/location
+            work_mode = DESKTOP_STATE.get("work_mode", "clocked_in")
+            location_zone = DESKTOP_STATE.get("location_zone")
+            timer_engine.idle_timeout_exempt = (work_mode == "gym" or location_zone == "campus")
+
+            # Inactivity → IDLE detection (check every 10s, only in work_* modes)
+            if now - last_db_save >= 10:  # piggyback on DB save interval
+                current = timer_engine.current_mode
+                if current.value.startswith("work_"):
+                    idle_elapsed_ms = now_ms - _last_work_event_ms
+                    if idle_elapsed_ms >= IDLE_TO_BREAK_TIMEOUT_MS:
+                        # Check if any instance is actively processing (recent activity)
+                        any_processing = False
+                        async with aiosqlite.connect(DB_PATH) as db:
+                            cursor = await db.execute(
+                                """SELECT COUNT(*) FROM claude_instances
+                                   WHERE status = 'processing'
+                                   AND last_activity > datetime('now', '-2 minutes', 'localtime')"""
+                            )
+                            row = await cursor.fetchone()
+                            any_processing = (row[0] if row else 0) > 0
+
+                        if any_processing:
+                            reset_idle_timer()
+                        else:
+                            print(f"TIMER: Inactivity detected ({idle_elapsed_ms // 1000}s). Switching to IDLE.")
+                            changed, _ = timer_engine.set_mode(TimerMode.IDLE, is_automatic=True, now_mono_ms=now_ms)
+                            if changed:
+                                old_mode = current.value
+                                await timer_log_shift(old_mode, "idle", trigger="inactivity", source="timer_worker")
+                                if _current_session_id > 0:
+                                    duration_ms = now_ms - _session_start_ms
+                                    await timer_end_session(_current_session_id, duration_ms)
+                                _current_session_id = await timer_start_session("idle", today)
+                                _session_start_ms = now_ms
+                                _mode_change_count += 1
 
             # Update daily note every 30s
             if now - last_daily_update >= 30:
@@ -6822,8 +7035,21 @@ async def handle_prompt_submit(payload: dict) -> dict:
         )
         await db.commit()
 
+    # Reset idle timer — real work is happening
+    reset_idle_timer()
+
+    # If timer is IDLE, switch back to WORK_SILENCE
+    exited_idle = False
+    if timer_engine.current_mode == TimerMode.IDLE:
+        now_ms = int(time.monotonic() * 1000)
+        changed, _ = timer_engine.set_mode(TimerMode.WORK_SILENCE, is_automatic=False, now_mono_ms=now_ms)
+        if changed:
+            exited_idle = True
+            await timer_log_shift("idle", "work_silence", trigger="prompt_submit", source="hook")
+            logger.info(f"Hook: PromptSubmit exited IDLE → WORK_SILENCE")
+
     logger.info(f"Hook: PromptSubmit {session_id[:12]}... -> processing (resurrected if stopped)")
-    return {"success": True, "action": "processing", "instance_id": session_id}
+    return {"success": True, "action": "processing", "instance_id": session_id, "exited_idle": exited_idle}
 
 
 async def handle_post_tool_use(payload: dict) -> dict:
@@ -6854,6 +7080,9 @@ async def handle_post_tool_use(payload: dict) -> dict:
             (now, payload.get("pid"), session_id)
         )
         await db.commit()
+
+    # Reset idle timer — active tool use = real work
+    reset_idle_timer()
 
     return {"success": True, "action": "heartbeat", "instance_id": session_id}
 

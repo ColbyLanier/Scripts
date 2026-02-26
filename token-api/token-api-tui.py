@@ -261,11 +261,33 @@ def format_duration_colored(start_time_str: str, end_time_str: str = None) -> st
         return f"[dim]{duration}[/dim]"
 
 
+def _is_stale_instance(instance: dict) -> bool:
+    """Check if a stopped instance should be hidden (pre-today or unnamed 0m run)."""
+    if instance.get("status") not in ("stopped",):
+        return False
+    today = datetime.now().strftime("%Y-%m-%d")
+    # Check if registered before today
+    reg = instance.get("registered_at", "")
+    if reg and not reg.startswith(today):
+        return True
+    # Check for unnamed 0m runs (auto-named "Claude HH:MM" with 0m duration)
+    tab_name = instance.get("tab_name", "")
+    if not is_custom_tab_name(tab_name):
+        stopped_at = instance.get("stopped_at") or instance.get("last_activity", "")
+        dur = format_duration(reg, stopped_at if stopped_at else None)
+        if dur == "0m":
+            return True
+    return False
+
+
 def filter_instances(instances: list) -> list:
     """Filter instances based on current filter_mode and subagent visibility."""
     # First filter by subagent visibility
     if not show_subagents:
         instances = [i for i in instances if not i.get("is_subagent")]
+
+    # Hide stale instances (pre-today stopped, unnamed 0m runs)
+    instances = [i for i in instances if not _is_stale_instance(i)]
 
     if filter_mode == "all":
         return instances
@@ -677,6 +699,7 @@ def get_timer_header_text() -> Text:
         "work_silence": "🔇",
         "work_music": "🎵",
         "work_video": "📺",
+        "work_scrolling": "📱",
         "work_gaming": "🎮",
         "gym": "🏋️",
     }
@@ -720,6 +743,33 @@ def get_timer_header_text() -> Text:
     text.append(break_str, style=f"bold {break_color}")
     if work_indicator:
         text.append(f"  {work_indicator}")
+
+    # Mode distribution bar (compact, inline)
+    shifts_data = _fetch_timer_shifts()
+    mode_dist = shifts_data.get("mode_distribution", {}) if shifts_data else {}
+    if mode_dist:
+        text.append("  ")
+        text.append_text(_mode_bar(mode_dist, width=20))
+        # Inline legend (top 3 modes)
+        total = sum(mode_dist.values())
+        MODE_SHORTS = {
+            "work_silence": ("sil", "bright_white"),
+            "work_music": ("mus", "cyan"),
+            "work_video": ("vid", "yellow"),
+            "work_scrolling": ("scrl", "magenta"),
+            "work_gaming": ("game", "red"),
+            "break": ("brk", "blue"),
+        }
+        legend_parts = []
+        for mode, secs in sorted(mode_dist.items(), key=lambda x: -x[1]):
+            pct = round(secs / total * 100)
+            if pct < 5:
+                continue
+            short, color = MODE_SHORTS.get(mode, (mode[-4:], "white"))
+            legend_parts.append((f" {short}{pct}%", color))
+        text.append(" ")
+        for label, color in legend_parts[:3]:
+            text.append(label, style=color)
 
     return text
 
@@ -1843,6 +1893,21 @@ def create_monitor_panel(max_lines: int = 8) -> Panel:
 
             content.append("\n")
 
+    # Break balance graph (compact, below cron jobs)
+    shifts_data = _fetch_timer_shifts()
+    series = (shifts_data or {}).get("balance_series", [])
+    if series and len(series) >= 2:
+        content.append("\n")
+        graph = _line_graph(series, width=30, height=2)
+        mn, mx = min(series), max(series)
+        graph_lines = graph.split("\n")
+        content.append(f"Brk ", style="bold")
+        content.append(f"{mx:.0f}m ", style="dim")
+        content.append(graph_lines[0])
+        if len(graph_lines) > 1:
+            content.append(f"\n    {mn:.0f}m ", style="dim")
+            content.append(graph_lines[-1])
+
     # Remove trailing newline
     if content.plain.endswith("\n"):
         content.right_crop(1)
@@ -1897,26 +1962,65 @@ def _fetch_timer_shifts() -> dict:
     return _timer_shifts_cache
 
 
-def _sparkline(values: list, width: int = 40) -> str:
-    """Render a Unicode sparkline from a list of numeric values.
+def _line_graph(values: list, width: int = 42, height: int = 3) -> str:
+    """Render a braille line graph.
 
-    Uses block characters ▁▂▃▄▅▆▇█ for 8 levels of granularity.
-    Returns empty string if no values.
+    Each braille char is a 2-wide x 4-tall dot grid, giving
+    width*2 horizontal and height*4 vertical resolution.
+    Returns multi-line string (height lines) or empty string if no values.
     """
     if not values:
         return ""
-    blocks = " ▁▂▃▄▅▆▇█"
-    # Downsample if more points than width
-    if len(values) > width:
-        step = len(values) / width
-        sampled = [values[int(i * step)] for i in range(width)]
+
+    # Braille dot bit positions: (col, row) -> bit
+    # col 0: rows 0-3 = bits 0,1,2,6   col 1: rows 0-3 = bits 3,4,5,7
+    DOT_BITS = {
+        (0, 0): 0x01, (0, 1): 0x02, (0, 2): 0x04, (0, 3): 0x40,
+        (1, 0): 0x08, (1, 1): 0x10, (1, 2): 0x20, (1, 3): 0x80,
+    }
+    BRAILLE_BASE = 0x2800
+
+    h_res = width * 2
+    v_res = height * 4
+
+    # Resample values to h_res points
+    if len(values) >= h_res:
+        step = len(values) / h_res
+        sampled = [values[int(i * step)] for i in range(h_res)]
     else:
-        sampled = values
+        # Stretch to fill width
+        sampled = []
+        for i in range(h_res):
+            idx = i * (len(values) - 1) / max(1, h_res - 1)
+            lo = int(idx)
+            hi = min(lo + 1, len(values) - 1)
+            frac = idx - lo
+            sampled.append(values[lo] * (1 - frac) + values[hi] * frac)
 
     mn = min(sampled)
     mx = max(sampled)
     rng = mx - mn if mx != mn else 1
-    return "".join(blocks[min(8, max(1, int((v - mn) / rng * 8)))] for v in sampled)
+
+    # Scale to 0..v_res-1 (0 = bottom)
+    scaled = [int((v - mn) / rng * (v_res - 1)) for v in sampled]
+
+    # Build braille grid: grid[row][col] where row 0 = top
+    grid = [[0] * width for _ in range(height)]
+
+    for x, y in enumerate(scaled):
+        char_col = x // 2
+        dot_col = x % 2
+        # y=0 is bottom, convert to top-origin
+        dot_y = (v_res - 1) - y
+        char_row = dot_y // 4
+        dot_row = dot_y % 4
+        if 0 <= char_row < height and 0 <= char_col < width:
+            grid[char_row][char_col] |= DOT_BITS[(dot_col, dot_row)]
+
+    lines = []
+    for row in grid:
+        lines.append("".join(chr(BRAILLE_BASE + cell) for cell in row))
+    return "\n".join(lines)
 
 
 def _mode_bar(mode_dist: dict, width: int = 36) -> Text:
@@ -1925,6 +2029,7 @@ def _mode_bar(mode_dist: dict, width: int = 36) -> Text:
         "work_silence": "bright_white",
         "work_music": "cyan",
         "work_video": "yellow",
+        "work_scrolling": "magenta",
         "work_gaming": "red",
         "work_gym": "green",
         "gym": "bright_green",
@@ -1936,6 +2041,7 @@ def _mode_bar(mode_dist: dict, width: int = 36) -> Text:
         "work_silence": "░",
         "work_music": "▒",
         "work_video": "▓",
+        "work_scrolling": "▒",
         "work_gaming": "█",
         "work_gym": "▓",
         "gym": "█",
@@ -1957,8 +2063,8 @@ def _mode_bar(mode_dist: dict, width: int = 36) -> Text:
     return text
 
 
-def create_timer_stats_panel(max_lines: int = 8) -> Panel:
-    """Create timer stats panel with sparkline, mode distribution, and shift stats."""
+def create_timer_stats_panel(max_lines: int = 10) -> Panel:
+    """Create timer stats panel with line graph, mode distribution, and shift stats."""
     data = _fetch_timer_shifts()
 
     if not data or data.get("total_shifts", 0) == 0:
@@ -1966,13 +2072,34 @@ def create_timer_stats_panel(max_lines: int = 8) -> Panel:
 
     lines = []
 
-    # Break balance sparkline
+    # Break balance line graph (braille)
     series = data.get("balance_series", [])
     if series:
-        spark = _sparkline(series, width=42)
+        graph = _line_graph(series, width=42, height=3)
         mn = min(series)
         mx = max(series)
-        lines.append(f"[bold]Break Balance[/bold]  [dim]{mn:.0f}m[/dim] {spark} [dim]{mx:.0f}m[/dim]")
+        graph_lines = graph.split("\n")
+        # Fixed-width prefix: "Break 14m " or "       0m " — all 10 chars
+        mx_label = f"{mx:.0f}m"
+        mn_label = f"{mn:.0f}m"
+        pad = 10  # consistent prefix width
+        # First line: label + max
+        first = Text()
+        first.append(f"{'Brk ' + mx_label:>{pad}} ", style="bold")
+        first.append(graph_lines[0])
+        lines.append(first)
+        # Middle lines
+        for gl in graph_lines[1:-1]:
+            mid = Text()
+            mid.append(" " * (pad + 1))
+            mid.append(gl)
+            lines.append(mid)
+        # Last line: min
+        if len(graph_lines) > 1:
+            last = Text()
+            last.append(f"{mn_label:>{pad}} ", style="dim")
+            last.append(graph_lines[-1])
+            lines.append(last)
     else:
         lines.append("[bold]Break Balance[/bold]  [dim]no data[/dim]")
 
@@ -1993,6 +2120,7 @@ def create_timer_stats_panel(max_lines: int = 8) -> Panel:
             "work_silence": ("░ sil", "bright_white"),
             "work_music": ("▒ mus", "cyan"),
             "work_video": ("▓ vid", "yellow"),
+            "work_scrolling": ("▒ scrl", "magenta"),
             "work_gaming": ("█ game", "red"),
             "break": ("▒ brk", "blue"),
             "pause": ("░ paus", "magenta"),
@@ -2016,7 +2144,7 @@ def create_timer_stats_panel(max_lines: int = 8) -> Panel:
     if enforcements:
         stats += f"  [red bold]Enforcements[/red bold] {enforcements}"
     if twitter:
-        stats += f"  [yellow]Twitter[/yellow] {twitter}"
+        stats += f"  [magenta]Twitter[/magenta] {twitter}"
     lines.append(stats)
 
     # Trigger breakdown (compact)
@@ -2054,7 +2182,7 @@ def create_info_panel(max_lines: int = 8) -> Panel:
         return create_timer_stats_panel(max_lines=max_lines)
 
 
-def create_mobile_info_panel(max_lines: int = 4) -> Panel:
+def create_mobile_info_panel(max_lines: int = 6) -> Panel:
     """Create a compact info panel for mobile - events, server logs, deploy logs, monitor, or timer stats based on panel_page."""
     if panel_page == 0:
         events = get_recent_events(max_lines)
@@ -2173,7 +2301,7 @@ def create_mobile_status_bar(instances: list, selected_idx: int) -> Text:
     state = _read_timer()
     mode_icons = {
         "work_silence": "🔇", "work_music": "🎵", "work_video": "📺",
-        "work_gaming": "🎮", "gym": "🏋️",
+        "work_scrolling": "📱", "work_gaming": "🎮", "gym": "🏋️",
     }
     icon = mode_icons.get(state["mode"], "❓")
     is_backlog = state["backlog_secs"] > 0
@@ -2230,7 +2358,7 @@ def generate_mobile_dashboard(instances: list, selected_idx: int) -> Layout:
             Layout(name="error", size=2),
             Layout(name="instances"),
             Layout(name="details", size=5),
-            Layout(name="info_panel", size=5),
+            Layout(name="info_panel", size=8),
             Layout(name="footer", size=1)
         )
         error_text = Text()
@@ -2240,7 +2368,7 @@ def generate_mobile_dashboard(instances: list, selected_idx: int) -> Layout:
         layout.split_column(
             Layout(name="instances"),
             Layout(name="details", size=5),
-            Layout(name="info_panel", size=5),
+            Layout(name="info_panel", size=8),
             Layout(name="footer", size=1)
         )
 
@@ -2252,7 +2380,7 @@ def generate_mobile_dashboard(instances: list, selected_idx: int) -> Layout:
     else:
         layout["instances"].update(create_mobile_instances_table(instances, selected_idx))
         layout["details"].update(create_mobile_instance_details_panel(selected_instance, selected_todos))
-    layout["info_panel"].update(create_mobile_info_panel(max_lines=3))
+    layout["info_panel"].update(create_mobile_info_panel(max_lines=6))
     layout["footer"].update(create_mobile_status_bar(instances, selected_idx))
 
     return layout

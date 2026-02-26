@@ -1151,8 +1151,8 @@ def build_wait_until_action(config):
 
     timeout_secs = config.get("timeout", 0)
 
-    return {
-        "continueOnTimeout": config.get("continue_on_timeout", False),
+    result = {
+        "continueOnTimeout": config.get("continue_on_timeout", True),
         "timeoutEnabled": timeout_secs > 0,
         "timeoutSeconds": timeout_secs,
         "triggersToWaitFor": triggers_to_wait,
@@ -1166,6 +1166,12 @@ def build_wait_until_action(config):
         "m_isDisabled": config.get("disabled", False),
         "m_isOrCondition": False
     }
+
+    # Optional: write timeout state to a boolean variable
+    if config.get("timeout_var"):
+        result["booleanVariableName"] = config["timeout_var"]
+
+    return result
 
 
 @action_builder("export_macros")

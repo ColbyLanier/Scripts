@@ -127,3 +127,7 @@ Media_Stop:: {  ; Skip current TTS
     Send "{Space}" ; focus the toggle, hit Space
 }
 
+^!+w:: {  ; Ctrl+Alt+Shift+W = Work Action (reset idle)
+    PostToTokenApi("/api/work-action", "")
+}
+
