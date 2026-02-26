@@ -77,7 +77,7 @@ restart_feedback: Optional[tuple[float, str]] = None  # (timestamp, message)
 _timer_cache = {
     "break_secs": 0,
     "backlog_secs": 0,
-    "mode": "work_silence",
+    "mode": "working",
     "work_mode": "clocked_in",
 }
 
@@ -651,7 +651,7 @@ def _read_timer() -> dict:
         _timer_cache = {
             "break_secs": round(data.get("accumulated_break_ms", 0) / 1000),
             "backlog_secs": round(data.get("break_backlog_ms", 0) / 1000),
-            "mode": data.get("current_mode", "work_silence"),
+            "mode": data.get("current_mode", "working"),
             "work_mode": data.get("work_mode", "clocked_in"),
         }
     except Exception:
@@ -696,17 +696,17 @@ def get_timer_header_text() -> Text:
 
     # Mode icons
     mode_icons = {
-        "work_silence": "🔇",
-        "work_music": "🎵",
-        "work_video": "📺",
-        "work_scrolling": "📱",
-        "work_gaming": "🎮",
-        "gym": "🏋️",
+        "working": "💻",
+        "multitasking": "📺",
+        "idle": "💤",
+        "break": "☕",
+        "distracted": "⚠️",
+        "sleeping": "🌙",
     }
 
-    # Parse obsidian mode for display
+    # Parse mode for display
     icon = mode_icons.get(obsidian_mode, "❓")
-    mode_name = obsidian_mode.replace("work_", "").replace("_", " ").title()
+    mode_name = obsidian_mode.replace("_", " ").title()
 
     # Break time color: green >1hr, yellow >30min, red >15min, purple ≤15min, magenta backlog
     is_backlog = backlog_secs > 0
@@ -753,12 +753,12 @@ def get_timer_header_text() -> Text:
         # Inline legend (top 3 modes)
         total = sum(mode_dist.values())
         MODE_SHORTS = {
-            "work_silence": ("sil", "bright_white"),
-            "work_music": ("mus", "cyan"),
-            "work_video": ("vid", "yellow"),
-            "work_scrolling": ("scrl", "magenta"),
-            "work_gaming": ("game", "red"),
+            "working": ("wrk", "bright_white"),
+            "multitasking": ("multi", "yellow"),
+            "idle": ("idle", "dim"),
             "break": ("brk", "blue"),
+            "distracted": ("dist", "red"),
+            "sleeping": ("slp", "dim"),
         }
         legend_parts = []
         for mode, secs in sorted(mode_dist.items(), key=lambda x: -x[1]):
@@ -2026,27 +2026,19 @@ def _line_graph(values: list, width: int = 42, height: int = 3) -> str:
 def _mode_bar(mode_dist: dict, width: int = 36) -> Text:
     """Render a colored horizontal bar showing time distribution per mode."""
     MODE_COLORS = {
-        "work_silence": "bright_white",
-        "work_music": "cyan",
-        "work_video": "yellow",
-        "work_scrolling": "magenta",
-        "work_gaming": "red",
-        "work_gym": "green",
-        "gym": "bright_green",
+        "working": "bright_white",
+        "multitasking": "yellow",
+        "idle": "dim",
         "break": "blue",
-        "pause": "magenta",
+        "distracted": "red",
         "sleeping": "dim",
     }
     MODE_CHARS = {
-        "work_silence": "░",
-        "work_music": "▒",
-        "work_video": "▓",
-        "work_scrolling": "▒",
-        "work_gaming": "█",
-        "work_gym": "▓",
-        "gym": "█",
+        "working": "░",
+        "multitasking": "▒",
+        "idle": "·",
         "break": "▒",
-        "pause": "░",
+        "distracted": "█",
         "sleeping": "·",
     }
 
@@ -2117,13 +2109,12 @@ def create_timer_stats_panel(max_lines: int = 10) -> Panel:
         legend_parts = []
         total = sum(mode_dist.values())
         MODE_SHORTS = {
-            "work_silence": ("░ sil", "bright_white"),
-            "work_music": ("▒ mus", "cyan"),
-            "work_video": ("▓ vid", "yellow"),
-            "work_scrolling": ("▒ scrl", "magenta"),
-            "work_gaming": ("█ game", "red"),
+            "working": ("░ wrk", "bright_white"),
+            "multitasking": ("▒ multi", "yellow"),
+            "idle": ("· idle", "dim"),
             "break": ("▒ brk", "blue"),
-            "pause": ("░ paus", "magenta"),
+            "distracted": ("█ dist", "red"),
+            "sleeping": ("· slp", "dim"),
         }
         for mode, secs in sorted(mode_dist.items(), key=lambda x: -x[1]):
             pct = round(secs / total * 100)
@@ -2300,8 +2291,8 @@ def create_mobile_status_bar(instances: list, selected_idx: int) -> Text:
     # Timer state (condensed)
     state = _read_timer()
     mode_icons = {
-        "work_silence": "🔇", "work_music": "🎵", "work_video": "📺",
-        "work_scrolling": "📱", "work_gaming": "🎮", "gym": "🏋️",
+        "working": "💻", "multitasking": "📺", "idle": "💤",
+        "break": "☕", "distracted": "⚠️", "sleeping": "🌙",
     }
     icon = mode_icons.get(state["mode"], "❓")
     is_backlog = state["backlog_secs"] > 0

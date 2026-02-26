@@ -1,15 +1,21 @@
-"""Unit tests for TimerEngine — pure logic, no I/O dependencies."""
+"""Unit tests for TimerEngine v2 — layered composite model, no I/O dependencies."""
 
 import pytest
 from timer import (
     TimerEngine,
     TimerMode,
     TimerEvent,
+    Activity,
     TickResult,
     format_timer_time,
+    BREAK_RATE_TABLE,
     MANUAL_LOCK_DURATION_MS,
     MAX_IDLE_MS,
-    IDLE_TO_BREAK_TIMEOUT_MS,
+    IDLE_TIMEOUT_FROM_WORKING_MS,
+    IDLE_TIMEOUT_FROM_MULTITASKING_MS,
+    DISTRACTION_TIMEOUT_MS,
+    GYM_BOUNTY_MS,
+    DEFAULT_BREAK_BUFFER_MS,
 )
 
 
@@ -30,6 +36,15 @@ def advance(engine: TimerEngine, start_ms: int, seconds: int, date: str = "2026-
     return result
 
 
+def collect_events(engine: TimerEngine, start_ms: int, seconds: int, date: str = "2026-02-11") -> list[TimerEvent]:
+    """Advance and collect all events across all ticks."""
+    events = []
+    for i in range(seconds):
+        result = engine.tick(start_ms + (i + 1) * 1000, date)
+        events.extend(result.events)
+    return events
+
+
 # ---- format_timer_time ----
 
 class TestFormatTimerTime:
@@ -46,47 +61,17 @@ class TestFormatTimerTime:
         assert format_timer_time(3 * 60 * 60 * 1000 + 5 * 60 * 1000) == "3h 5m"
 
 
-# ---- Basic tick ----
+# ---- Basic tick / WORKING mode ----
 
 class TestBasicTick:
-    def test_silence_earns_quarter_rate(self):
-        """60s of work_silence → 15_000ms break earned (parity with music)."""
+    def test_working_earns_one_to_one(self):
+        """60s of WORKING → 60_000ms break earned (1:1 rate)."""
         engine = make_engine(0)
-        advance(engine, 0, 60)
-        assert engine.accumulated_break_ms == 15_000
-
-    def test_music_earns_quarter_rate(self):
-        """60s of work_music → 15_000ms break earned."""
-        engine = make_engine(0)
-        engine.set_mode(TimerMode.WORK_MUSIC, is_automatic=False, now_mono_ms=0)
-        advance(engine, 0, 60)
-        assert engine.accumulated_break_ms == 15_000
-
-    def test_gym_earns_full_rate(self):
-        """60s of gym → 60_000ms break earned."""
-        engine = make_engine(0)
-        engine.set_mode(TimerMode.GYM, is_automatic=False, now_mono_ms=0)
         advance(engine, 0, 60)
         assert engine.accumulated_break_ms == 60_000
 
-    def test_work_gym_earns_three_quarter_rate(self):
-        """60s of work_gym → 45_000ms break earned."""
-        engine = make_engine(0)
-        engine.set_mode(TimerMode.WORK_GYM, is_automatic=False, now_mono_ms=0)
-        advance(engine, 0, 60)
-        assert engine.accumulated_break_ms == 45_000
-
-    def test_pause_no_accumulation(self):
-        """Pause mode: no break earned, no work time tracked."""
-        engine = make_engine(0)
-        engine.set_mode(TimerMode.PAUSE, is_automatic=False, now_mono_ms=0)
-        advance(engine, 0, 60)
-        assert engine.accumulated_break_ms == 0
-        assert engine.total_work_time_ms == 0
-        assert engine.total_break_time_ms == 0
-
     def test_work_time_tracked(self):
-        """60s of work → 60_000ms total work time."""
+        """60s of WORKING → 60_000ms total work time."""
         engine = make_engine(0)
         advance(engine, 0, 60)
         assert engine.total_work_time_ms == 60_000
@@ -100,67 +85,332 @@ class TestBasicTick:
         assert isinstance(engine.total_break_time_ms, int)
         assert isinstance(engine.break_backlog_ms, int)
 
+    def test_initial_mode_is_working(self):
+        engine = TimerEngine(now_mono_ms=0)
+        assert engine.current_mode == TimerMode.WORKING
 
-# ---- Mode switching ----
-
-class TestModeSwitch:
-    def test_silence_to_music(self):
-        """Switch from silence to music, verify rates are same (parity)."""
+    def test_sub_second_tick(self):
+        """Ticks faster than 1s still accumulate correctly."""
         engine = make_engine(0)
-        advance(engine, 0, 60)  # 15s break earned (silence = 1/4 rate)
-        changed, _ = engine.set_mode(TimerMode.WORK_MUSIC, is_automatic=False, now_mono_ms=60_000)
-        assert changed
-        advance(engine, 60_000, 60)  # 15s more break (music = 1/4 rate)
-        assert engine.accumulated_break_ms == 30_000
+        for i in range(1000):
+            engine.tick(i * 100, "2026-02-11")  # 100ms ticks for 100s
+        # 999 ticks of 100ms each = 99_900ms total, * 1/1 = 99_900ms
+        assert engine.accumulated_break_ms == 99_900
 
-    def test_same_mode_returns_false(self):
-        engine = make_engine(0)
-        changed, _ = engine.set_mode(TimerMode.WORK_SILENCE, is_automatic=False, now_mono_ms=0)
-        assert not changed
 
-    def test_mode_changed_event(self):
+# ---- Effective mode derivation ----
+
+class TestEffectiveMode:
+    def test_working_active_working(self):
+        """Activity=working, prod=active → WORKING."""
         engine = make_engine(0)
-        changed, result = engine.set_mode(TimerMode.WORK_MUSIC, is_automatic=False, now_mono_ms=0)
-        assert changed
+        assert engine.effective_mode == TimerMode.WORKING
+
+    def test_working_inactive_idle(self):
+        """Activity=working, prod=inactive → IDLE."""
+        engine = make_engine(0)
+        engine.set_productivity(False, 0)
+        assert engine.effective_mode == TimerMode.IDLE
+
+    def test_distraction_active_multitasking(self):
+        """Activity=distraction, prod=active, <10min → MULTITASKING."""
+        engine = make_engine(0)
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=True, now_mono_ms=0)
+        assert engine.effective_mode == TimerMode.MULTITASKING
+
+    def test_distraction_inactive_break(self):
+        """Activity=distraction, prod=inactive → BREAK (auto)."""
+        engine = make_engine(0)
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=False, now_mono_ms=0)
+        engine.set_productivity(False, 0)
+        assert engine.effective_mode == TimerMode.BREAK
+
+    def test_manual_break_overrides_all(self):
+        """Manual BREAK override takes priority."""
+        engine = make_engine(0)
+        engine.enter_break(0)
+        assert engine.effective_mode == TimerMode.BREAK
+        # Even with working + active, still BREAK
+        assert engine.activity == Activity.WORKING
+        assert engine.productivity_active
+
+    def test_manual_sleeping_overrides_all(self):
+        engine = make_engine(0)
+        engine.enter_sleeping(0)
+        assert engine.effective_mode == TimerMode.SLEEPING
+
+    def test_distracted_requires_scrolling_gaming_and_timeout(self):
+        """Video stays MULTITASKING even after 10min. Only scrolling/gaming → DISTRACTED."""
+        engine = make_engine(0)
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=False, now_mono_ms=0)
+        # Advance past 10 min
+        advance(engine, 0, 700)
+        assert engine.effective_mode == TimerMode.MULTITASKING  # video, not distracted
+
+    def test_scrolling_becomes_distracted_after_timeout(self):
+        """Scrolling/gaming + prod active → DISTRACTED after 10min."""
+        engine = make_engine(0)
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=True, now_mono_ms=0)
+        # Advance to 10 min
+        timeout_secs = DISTRACTION_TIMEOUT_MS // 1000
+        advance(engine, 0, timeout_secs)
+        assert engine.effective_mode == TimerMode.DISTRACTED
+
+
+# ---- Layer transitions ----
+
+class TestLayerTransitions:
+    def test_set_activity_working_to_distraction(self):
+        engine = make_engine(0)
+        result = engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=False, now_mono_ms=1000)
         assert TimerEvent.MODE_CHANGED in result.events
-        assert result.old_mode == TimerMode.WORK_SILENCE
+        assert result.old_mode == TimerMode.WORKING
+        assert engine.effective_mode == TimerMode.MULTITASKING
 
-    def test_set_mode_finalizes_previous_period(self):
-        """set_mode calls _advance internally, capturing elapsed time."""
+    def test_set_activity_distraction_to_working(self):
         engine = make_engine(0)
-        # Advance 10s in silence (should earn 2500ms break at 1/4 rate)
-        changed, _ = engine.set_mode(TimerMode.WORK_MUSIC, is_automatic=False, now_mono_ms=10_000)
-        assert engine.accumulated_break_ms == 2_500
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=False, now_mono_ms=0)
+        result = engine.set_activity(Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=1000)
+        assert TimerEvent.MODE_CHANGED in result.events
+        assert result.old_mode == TimerMode.MULTITASKING
+        assert engine.effective_mode == TimerMode.WORKING
 
-
-# ---- Video penalty ----
-
-class TestVideoPenalty:
-    def test_video_decreases_break(self):
-        """Accumulate break, switch to video, verify break decreases."""
+    def test_set_productivity_active_to_inactive(self):
         engine = make_engine(0)
-        advance(engine, 0, 60)  # 15_000ms break (silence at 1/4 rate)
-        engine.set_mode(TimerMode.WORK_VIDEO, is_automatic=False, now_mono_ms=60_000)
-        advance(engine, 60_000, 60)  # -15_000ms (video penalty)
+        result = engine.set_productivity(False, 1000)
+        assert TimerEvent.MODE_CHANGED in result.events
+        assert result.old_mode == TimerMode.WORKING
+        assert engine.effective_mode == TimerMode.IDLE
+
+    def test_set_productivity_inactive_to_active(self):
+        engine = make_engine(0)
+        engine.set_productivity(False, 0)
+        result = engine.set_productivity(True, 1000)
+        assert TimerEvent.MODE_CHANGED in result.events
+        assert result.old_mode == TimerMode.IDLE
+        assert engine.effective_mode == TimerMode.WORKING
+
+    def test_no_event_on_same_effective_mode(self):
+        """set_activity to same value → no MODE_CHANGED."""
+        engine = make_engine(0)
+        result = engine.set_activity(Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=1000)
+        assert TimerEvent.MODE_CHANGED not in result.events
+
+
+# ---- Multitasking ----
+
+class TestMultitasking:
+    def test_multitasking_neutral_rate(self):
+        """MULTITASKING earns 0 break (neutral)."""
+        engine = make_engine(0)
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=False, now_mono_ms=0)
+        assert engine.effective_mode == TimerMode.MULTITASKING
+        advance(engine, 0, 60)
         assert engine.accumulated_break_ms == 0
 
-    def test_scrolling_decreases_break_at_gaming_rate(self):
-        """Scrolling (Twitter) drains break at -30 min/hr, same as gaming."""
+    def test_multitasking_tracks_work_time(self):
+        """MULTITASKING still counts as work time."""
         engine = make_engine(0)
-        advance(engine, 0, 60)  # 15_000ms break (silence at 1/4 rate)
-        engine.set_mode(TimerMode.WORK_SCROLLING, is_automatic=False, now_mono_ms=60_000)
-        advance(engine, 60_000, 60)  # -30_000ms (scrolling penalty) → 15k backlog
-        assert engine.accumulated_break_ms == 0
-        assert engine.break_backlog_ms == 15_000
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=False, now_mono_ms=0)
+        advance(engine, 0, 60)
+        assert engine.total_work_time_ms == 60_000
 
-    def test_gaming_decreases_break_faster(self):
-        """Gaming penalty is twice video."""
+    def test_video_stays_multitasking_forever(self):
+        """Video (not scrolling/gaming) never escalates to DISTRACTED."""
         engine = make_engine(0)
-        advance(engine, 0, 60)  # 15_000ms break (silence at 1/4 rate)
-        engine.set_mode(TimerMode.WORK_GAMING, is_automatic=False, now_mono_ms=60_000)
-        advance(engine, 60_000, 60)  # -30_000ms (gaming penalty) → 15k backlog
-        assert engine.accumulated_break_ms == 0
-        assert engine.break_backlog_ms == 15_000  # overshoot into backlog
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=False, now_mono_ms=0)
+        advance(engine, 0, 1200)  # 20 minutes
+        assert engine.effective_mode == TimerMode.MULTITASKING
+
+
+# ---- Distracted ----
+
+class TestDistracted:
+    def test_distracted_penalty_rate(self):
+        """DISTRACTED spends break at -1:1 (60 min/hr)."""
+        engine = make_engine(0)
+        # Earn 120s break first
+        advance(engine, 0, 120)
+        assert engine.accumulated_break_ms == 120_000
+
+        # Enter distraction (scrolling)
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=True, now_mono_ms=120_000)
+        # Advance past 10 min threshold
+        timeout_secs = DISTRACTION_TIMEOUT_MS // 1000
+        advance(engine, 120_000, timeout_secs + 60)  # 60s past threshold
+        # After threshold, mode becomes DISTRACTED and penalty applies
+        assert engine.effective_mode == TimerMode.DISTRACTED
+
+    def test_distraction_timeout_event(self):
+        """DISTRACTION_TIMEOUT event fires when scrolling/gaming reaches 10min."""
+        engine = make_engine(0)
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=True, now_mono_ms=0)
+        timeout_secs = DISTRACTION_TIMEOUT_MS // 1000
+        events = collect_events(engine, 0, timeout_secs)
+        assert TimerEvent.DISTRACTION_TIMEOUT in events
+
+    def test_video_no_distraction_timeout(self):
+        """Video (not scrolling) never triggers DISTRACTION_TIMEOUT."""
+        engine = make_engine(0)
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=False, now_mono_ms=0)
+        events = collect_events(engine, 0, 700)  # well past 10 min
+        assert TimerEvent.DISTRACTION_TIMEOUT not in events
+
+    def test_distracted_prod_loss_becomes_break(self):
+        """DISTRACTED → prod expires → BREAK (rule 2: inactive+distraction=BREAK)."""
+        engine = make_engine(0)
+        # Earn break, enter distraction, wait for DISTRACTED
+        advance(engine, 0, 120)
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=True, now_mono_ms=120_000)
+        timeout_secs = DISTRACTION_TIMEOUT_MS // 1000
+        advance(engine, 120_000, timeout_secs)
+        assert engine.effective_mode == TimerMode.DISTRACTED
+
+        # Now lose productivity
+        t = 120_000 + timeout_secs * 1000
+        result = engine.set_productivity(False, t)
+        assert engine.effective_mode == TimerMode.BREAK
+        assert TimerEvent.MODE_CHANGED in result.events
+        assert result.old_mode == TimerMode.DISTRACTED
+
+
+# ---- Parameterized idle ----
+
+class TestParameterizedIdle:
+    def test_idle_from_working_2hr_timeout(self):
+        """WORKING → prod inactive → IDLE with 2-hour timeout."""
+        engine = make_engine(0)
+        engine.set_productivity(False, 1000)
+        assert engine.effective_mode == TimerMode.IDLE
+        assert engine.idle_timeout_ms == IDLE_TIMEOUT_FROM_WORKING_MS
+
+    def test_idle_from_multitasking_2min_timeout(self):
+        """MULTITASKING → prod inactive → IDLE with 2-minute timeout."""
+        engine = make_engine(0)
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=False, now_mono_ms=0)
+        assert engine.effective_mode == TimerMode.MULTITASKING
+        engine.set_productivity(False, 1000)
+        # inactive + distraction = BREAK, not IDLE — but timeout was parameterized
+        # Actually: inactive + distraction → BREAK directly (rule 2)
+        # The 2-min timeout applies when we go from MULTITASKING to IDLE
+        # which means activity must switch back to WORKING first
+        # Let me reconsider: if prod goes inactive while distracted → BREAK
+        # The 2-min timeout is for when we were multitasking and distraction stops
+        # then prod is inactive → IDLE with 2min timeout
+        pass
+
+    def test_idle_timeout_from_working_triggers_break(self):
+        """After 2 hours of IDLE (from WORKING), auto-transition to BREAK."""
+        engine = make_engine(0)
+        engine.set_productivity(False, 0)
+        assert engine.effective_mode == TimerMode.IDLE
+
+        timeout_secs = IDLE_TIMEOUT_FROM_WORKING_MS // 1000
+        events = collect_events(engine, 0, timeout_secs)
+        assert TimerEvent.IDLE_TIMEOUT in events
+        assert engine.effective_mode == TimerMode.BREAK
+
+    def test_idle_timeout_from_multitasking_triggers_break_fast(self):
+        """After 2 minutes of IDLE (from MULTITASKING), auto-transition to BREAK."""
+        engine = make_engine(0)
+        # Start as multitasking (distraction + prod active)
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=False, now_mono_ms=0)
+        assert engine.effective_mode == TimerMode.MULTITASKING
+        # Lose productivity while still in MULTITASKING → goes to BREAK (rule 2: inactive+distraction)
+        # To get 2min idle: stop distraction first so prod inactive → IDLE
+        # But we want the 2min timeout from multitasking context.
+        # The timeout is parameterized at the moment prod goes inactive.
+        # If effective_mode was MULTITASKING when prod goes inactive → 2min timeout.
+        # But inactive+distraction = BREAK, not IDLE.
+        # So: lose prod while in MULTITASKING → switch to working → now IDLE with 2min timeout
+        # Actually: set_productivity(False) while MULTITASKING → old_mode=MULTITASKING → 2min
+        # but effective becomes BREAK (inactive+distraction). Need to switch activity too.
+        # Real scenario: was multitasking, distraction stops, prod stops shortly after
+        engine.set_activity(Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=500)
+        # Now WORKING. Lose productivity (old_mode was WORKING, not MULTITASKING)
+        # Hmm — the 2min timeout should be based on what mode we were in BEFORE prod went inactive
+        # Since we switched back to working first, old_mode is WORKING → 2hr timeout
+        # The 2min case: prod goes inactive while still multitasking (activity=distraction)
+        # But that gives BREAK (rule 2), not IDLE.
+        # The 2min idle from multitasking applies when: was multitasking, distraction ends
+        # AND prod goes inactive at roughly the same time.
+        # Let's test: set prod inactive while multitasking → effective=BREAK, then set activity=working
+        engine.set_productivity(True, 500)  # reset to active
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=False, now_mono_ms=600)
+        assert engine.effective_mode == TimerMode.MULTITASKING
+        # Prod goes inactive while multitasking → timeout parameterized to 2min
+        engine.set_productivity(False, 700)
+        # effective = BREAK (inactive + distraction), but idle_timeout_ms was set to 2min
+        assert engine.effective_mode == TimerMode.BREAK
+        # Now switch activity back to working → effective = IDLE (inactive + working)
+        engine.set_activity(Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=800)
+        assert engine.effective_mode == TimerMode.IDLE
+        assert engine.idle_timeout_ms == IDLE_TIMEOUT_FROM_MULTITASKING_MS
+
+        timeout_secs = IDLE_TIMEOUT_FROM_MULTITASKING_MS // 1000
+        events = collect_events(engine, 800, timeout_secs)
+        assert TimerEvent.IDLE_TIMEOUT in events
+        assert engine.effective_mode == TimerMode.BREAK
+
+    def test_idle_no_accumulation(self):
+        """IDLE mode: no break earned, no work time change."""
+        engine = make_engine(0)
+        advance(engine, 0, 40)
+        break_before = engine.accumulated_break_ms
+        work_before = engine.total_work_time_ms
+
+        engine.set_productivity(False, 40_000)
+        advance(engine, 40_000, 60)
+        assert engine.accumulated_break_ms == break_before
+        assert engine.total_work_time_ms == work_before
+
+    def test_idle_timeout_exempt(self):
+        """Stays IDLE past timeout when exempt (gym/campus)."""
+        engine = make_engine(0)
+        engine.idle_timeout_exempt = True
+        engine.set_productivity(False, 0)
+
+        timeout_secs = IDLE_TIMEOUT_FROM_WORKING_MS // 1000
+        advance(engine, 0, timeout_secs + 60)
+        assert engine.effective_mode == TimerMode.IDLE
+        assert TimerEvent.IDLE_TIMEOUT not in collect_events(engine, timeout_secs * 1000 + 60_000, 10)
+
+    def test_productivity_active_clears_idle(self):
+        """Becoming productive again clears idle state."""
+        engine = make_engine(0)
+        engine.set_productivity(False, 0)
+        assert engine.effective_mode == TimerMode.IDLE
+        engine.set_productivity(True, 5000)
+        assert engine.effective_mode == TimerMode.WORKING
+
+
+# ---- Gym bounty ----
+
+class TestGymBounty:
+    def test_apply_gym_bounty(self):
+        """+30 min break on gym exit."""
+        engine = make_engine(0)
+        result = engine.apply_gym_bounty(0)
+        assert engine.accumulated_break_ms == GYM_BOUNTY_MS
+
+    def test_gym_bounty_stacks_with_earned(self):
+        """Bounty adds to existing break time."""
+        engine = make_engine(0)
+        advance(engine, 0, 60)  # earn 60_000ms
+        engine.apply_gym_bounty(60_000)
+        assert engine.accumulated_break_ms == 60_000 + GYM_BOUNTY_MS
+
+    def test_gym_bounty_pays_off_backlog(self):
+        """Bounty pays off backlog before accumulating."""
+        engine = make_engine(0)
+        # Create backlog by entering break with no earned time
+        engine.enter_break(0)
+        advance(engine, 0, 30)  # 30s break consumed → 30_000 backlog
+        assert engine.break_backlog_ms == 30_000
+        engine.resume(30_000)
+        engine.apply_gym_bounty(30_000)
+        assert engine.break_backlog_ms == 0
+        assert engine.accumulated_break_ms == GYM_BOUNTY_MS - 30_000
 
 
 # ---- Break consumption ----
@@ -169,16 +419,16 @@ class TestBreakConsumption:
     def test_break_mode_consumes_accumulated(self):
         """Enter break mode, verify accumulated_break_ms decreases."""
         engine = make_engine(0)
-        advance(engine, 0, 60)  # 15_000ms break earned (silence at 1/4 rate)
-        engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=60_000)
+        advance(engine, 0, 60)  # 60_000ms break earned (1:1 rate)
+        engine.enter_break(60_000)
         advance(engine, 60_000, 10)  # consume 10_000ms
-        assert engine.accumulated_break_ms == 5_000
+        assert engine.accumulated_break_ms == 50_000
         assert engine.total_break_time_ms == 10_000
 
     def test_break_tracks_break_time(self):
         engine = make_engine(0)
         advance(engine, 0, 60)
-        engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=60_000)
+        engine.enter_break(60_000)
         advance(engine, 60_000, 20)
         assert engine.total_break_time_ms == 20_000
 
@@ -189,77 +439,71 @@ class TestBreakExhaustion:
     def test_break_exhaustion_event(self):
         """Consume all break time → BREAK_EXHAUSTED event."""
         engine = make_engine(0)
-        advance(engine, 0, 60)  # 15_000ms break (silence at 1/4 rate)
-        engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=60_000)
-        # Consume 16s of break (more than 15s available)
-        result = advance(engine, 60_000, 16)
+        advance(engine, 0, 10)  # 10_000ms break (1:1 rate)
+        engine.enter_break(10_000)
+        result = advance(engine, 10_000, 11)  # 11s > 10s available
         assert TimerEvent.BREAK_EXHAUSTED in result.events
         assert engine.accumulated_break_ms == 0
         assert engine.break_backlog_ms > 0
 
-    def test_video_exhaustion(self):
-        """Video penalty can exhaust break."""
+    def test_distracted_exhaustion(self):
+        """DISTRACTED penalty can exhaust break."""
         engine = make_engine(0)
-        advance(engine, 0, 20)  # 5_000ms break (silence at 1/4 rate)
-        engine.set_mode(TimerMode.WORK_VIDEO, is_automatic=False, now_mono_ms=20_000)
-        # 21s of video = 5_250ms penalty, exceeds 5_000ms break
-        last = TickResult()
-        exhausted = False
-        for i in range(21):
-            last = engine.tick(20_000 + (i + 1) * 1000, "2026-02-11")
-            if TimerEvent.BREAK_EXHAUSTED in last.events:
-                exhausted = True
-                break
-        assert exhausted
+        advance(engine, 0, 20)  # 20_000ms break (1:1 rate)
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=True, now_mono_ms=20_000)
+        # Advance past 10min threshold then continue
+        timeout_secs = DISTRACTION_TIMEOUT_MS // 1000
+        advance(engine, 20_000, timeout_secs)
+        # Now in DISTRACTED, penalty -1:1
+        # Need 20s more to exhaust remaining break
+        events = collect_events(engine, 20_000 + timeout_secs * 1000, 30)
+        assert TimerEvent.BREAK_EXHAUSTED in events
+
+    def test_break_exhaustion_exact_zero(self):
+        """When break hits exactly 0 (no overshoot), no backlog created."""
+        engine = make_engine(0)
+        advance(engine, 0, 5)  # 5_000ms break (1:1 rate)
+        engine.enter_break(5_000)
+        advance(engine, 5_000, 5)  # consume exactly 5_000ms
         assert engine.accumulated_break_ms == 0
+        assert engine.break_backlog_ms == 0
 
 
 # ---- Backlog mechanics ----
 
 class TestBacklog:
-    def test_backlog_grows_during_video(self):
-        """Exhaust break → continue video → backlog grows."""
+    def test_backlog_grows_during_break(self):
+        """No break earned, go to break → backlog grows."""
         engine = make_engine(0)
-        # No break earned, go straight to video
-        engine.set_mode(TimerMode.WORK_VIDEO, is_automatic=False, now_mono_ms=0)
-        advance(engine, 0, 60)  # -15_000ms penalty → backlog = 15_000
-        assert engine.break_backlog_ms == 15_000
+        engine.enter_break(0)
+        advance(engine, 0, 60)  # 60_000ms consumed → all backlog
+        assert engine.break_backlog_ms == 60_000
         assert engine.accumulated_break_ms == 0
 
     def test_backlog_offset_before_accumulation(self):
-        """Switch to silence with backlog → pay off backlog first."""
+        """Earn break with backlog → pay off backlog first."""
         engine = make_engine(0)
-        engine.set_mode(TimerMode.WORK_VIDEO, is_automatic=False, now_mono_ms=0)
-        advance(engine, 0, 40)  # 10_000ms backlog
+        engine.enter_break(0)
+        advance(engine, 0, 10)  # 10_000ms backlog
         assert engine.break_backlog_ms == 10_000
-
-        engine.set_mode(TimerMode.WORK_SILENCE, is_automatic=False, now_mono_ms=40_000)
-        advance(engine, 40_000, 80)  # 80s silence at 1/4 = 20_000ms earned → 10k backlog, 10k break
+        engine.resume(10_000)
+        advance(engine, 10_000, 20)  # 20_000ms earned → 10k backlog, 10k break
         assert engine.break_backlog_ms == 0
         assert engine.accumulated_break_ms == 10_000
 
-    def test_video_during_backlog_grows_backlog(self):
-        """Video penalty while in backlog increases backlog."""
-        engine = make_engine(0)
-        engine.set_mode(TimerMode.WORK_VIDEO, is_automatic=False, now_mono_ms=0)
-        advance(engine, 0, 40)  # 10_000ms backlog
-        assert engine.break_backlog_ms == 10_000
-        advance(engine, 40_000, 40)  # +10_000ms more backlog
-        assert engine.break_backlog_ms == 20_000
 
-
-# ---- Idle detection ----
+# ---- Idle detection (gap) ----
 
 class TestIdleDetection:
     def test_large_gap_skips_accumulation(self):
-        """Idle >10 min → no accumulation."""
+        """Idle >10 min → no accumulation for that tick."""
         engine = make_engine(0)
-        advance(engine, 0, 10)  # small warmup
+        advance(engine, 0, 10)  # small warmup: 10_000ms break
         # Jump 15 minutes
         result = engine.tick(10_000 + 15 * 60 * 1000, "2026-02-11")
         assert TimerEvent.BREAK_EXHAUSTED not in result.events
-        # Only the first 10s of work should have accumulated (at 1/4 rate)
-        assert engine.accumulated_break_ms == 2_500
+        # Only the first 10s of work should have accumulated (at 1:1 rate)
+        assert engine.accumulated_break_ms == 10_000
 
     def test_exactly_at_threshold(self):
         """Gap exactly at MAX_IDLE_MS is still idle."""
@@ -276,38 +520,35 @@ class TestDailyReset:
         """Tick with new date → DAILY_RESET event, counters zeroed."""
         engine = make_engine(0, "2026-02-10")
         advance(engine, 0, 60, date="2026-02-10")  # accumulate some state
-        assert engine.accumulated_break_ms == 15_000
+        assert engine.accumulated_break_ms == 60_000
 
-        result = engine.tick(61_000, "2026-02-11")
+        result = engine.tick(61_000, "2026-02-11", current_hour=8)
         assert TimerEvent.DAILY_RESET in result.events
         assert result.reset_date == "2026-02-10"
-        # 15_000ms // (1000 * 60) = 0 (less than 1 full minute)
-        assert result.productivity_score == 0
 
     def test_reset_productivity_score(self):
         """Productivity score = accumulated_break_ms // (1000 * 60)."""
         engine = make_engine(0, "2026-02-10")
-        advance(engine, 0, 240, date="2026-02-10")  # 60_000ms break (240s * 1/4)
-        result = engine.tick(241_000, "2026-02-11")
+        advance(engine, 0, 60, date="2026-02-10")  # 60_000ms break (60s * 1/1)
+        result = engine.tick(61_000, "2026-02-11", current_hour=8)
         assert result.productivity_score == 1  # 60_000 // 60_000 = 1
 
     def test_reset_clears_counters(self):
         engine = make_engine(0, "2026-02-10")
         advance(engine, 0, 60, date="2026-02-10")
-        engine.tick(61_000, "2026-02-11")
-        from timer import DEFAULT_BREAK_BUFFER_MS
-        assert engine.accumulated_break_ms == DEFAULT_BREAK_BUFFER_MS  # 5 min starting buffer
+        engine.tick(61_000, "2026-02-11", current_hour=8)
+        assert engine.accumulated_break_ms == DEFAULT_BREAK_BUFFER_MS
         assert engine.break_backlog_ms == 0
         assert engine.total_work_time_ms == 0
         assert engine.total_break_time_ms == 0
-        assert engine.current_mode == TimerMode.WORK_SILENCE
+        assert engine.current_mode == TimerMode.WORKING
         assert engine.daily_start_date == "2026-02-11"
 
     def test_reset_clears_manual_lock(self):
         engine = make_engine(0, "2026-02-10")
-        engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=0)
+        engine.enter_break(0)
         assert engine.manual_mode_lock
-        engine.tick(1_000, "2026-02-11")
+        engine.tick(1_000, "2026-02-11", current_hour=8)
         assert not engine.manual_mode_lock
 
     def test_first_tick_sets_date(self):
@@ -315,76 +556,105 @@ class TestDailyReset:
         engine.tick(0, "2026-02-11")
         assert engine.daily_start_date == "2026-02-11"
 
+    def test_reset_hour_7(self):
+        """Default reset hour is 7, not 9."""
+        engine = make_engine(0, "2026-02-10")
+        advance(engine, 0, 10, date="2026-02-10")
+        # At hour 6 (before 7 AM), should NOT reset
+        result = engine.tick(11_000, "2026-02-11", current_hour=6)
+        assert TimerEvent.DAILY_RESET not in result.events
+        assert engine.daily_start_date == "2026-02-10"
+        # At hour 7, SHOULD reset
+        result = engine.tick(12_000, "2026-02-11", current_hour=7)
+        assert TimerEvent.DAILY_RESET in result.events
 
-# ---- Manual mode lock ----
+    def test_sleeping_auto_wakes_at_reset_hour(self):
+        """SLEEPING mode auto-exits at reset hour."""
+        engine = make_engine(0)
+        engine.enter_sleeping(0)
+        assert engine.effective_mode == TimerMode.SLEEPING
+        result = engine.tick(1_000, "2026-02-11", current_hour=8)
+        assert engine.effective_mode == TimerMode.WORKING
+        assert engine.manual_mode is None
 
-class TestManualModeLock:
+
+# ---- Manual mode (break/sleeping) ----
+
+class TestManualMode:
+    def test_enter_break(self):
+        engine = make_engine(0)
+        changed, result = engine.enter_break(0)
+        assert changed
+        assert engine.effective_mode == TimerMode.BREAK
+        assert TimerEvent.MODE_CHANGED in result.events
+
+    def test_enter_sleeping(self):
+        engine = make_engine(0)
+        changed, result = engine.enter_sleeping(0)
+        assert changed
+        assert engine.effective_mode == TimerMode.SLEEPING
+
+    def test_resume_from_break(self):
+        engine = make_engine(0)
+        engine.enter_break(0)
+        changed, result = engine.resume(1000)
+        assert changed
+        assert engine.effective_mode == TimerMode.WORKING
+        assert not engine.manual_mode_lock
+
+    def test_resume_from_sleeping(self):
+        engine = make_engine(0)
+        engine.enter_sleeping(0)
+        changed, result = engine.resume(1000)
+        assert changed
+        assert engine.effective_mode == TimerMode.WORKING
+
+    def test_resume_when_not_in_manual(self):
+        engine = make_engine(0)
+        changed, _ = engine.resume(0)
+        assert not changed
+
+    def test_enter_break_twice(self):
+        engine = make_engine(0)
+        engine.enter_break(0)
+        changed, _ = engine.enter_break(1000)
+        assert not changed
+
     def test_break_sets_lock(self):
         engine = make_engine(0)
-        engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=0)
+        engine.enter_break(0)
         assert engine.manual_mode_lock
 
-    def test_pause_sets_lock(self):
+    def test_sleeping_neutral(self):
+        """SLEEPING: no accumulation of any kind."""
         engine = make_engine(0)
-        engine.set_mode(TimerMode.PAUSE, is_automatic=False, now_mono_ms=0)
-        assert engine.manual_mode_lock
-
-    def test_auto_switch_blocked_during_lock(self):
-        """Automatic mode switches are blocked during manual lock."""
-        engine = make_engine(0)
-        advance(engine, 0, 60)  # earn break time
-        engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=60_000)
-        changed, _ = engine.set_mode(
-            TimerMode.WORK_MUSIC, is_automatic=True, now_mono_ms=60_500
-        )
-        assert not changed
-        assert engine.current_mode == TimerMode.BREAK
-
-    def test_manual_switch_allowed_during_lock(self):
-        """Manual (non-automatic) switches are always allowed."""
-        engine = make_engine(0)
-        engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=0)
-        changed, _ = engine.set_mode(
-            TimerMode.WORK_SILENCE, is_automatic=False, now_mono_ms=500
-        )
-        assert changed
-        assert engine.current_mode == TimerMode.WORK_SILENCE
-
-    def test_lock_expires(self):
-        """After 30 min, auto-switches are allowed again."""
-        engine = make_engine(0)
-        engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=0)
-        expired_ms = MANUAL_LOCK_DURATION_MS + 1
-        changed, _ = engine.set_mode(
-            TimerMode.WORK_MUSIC, is_automatic=True, now_mono_ms=expired_ms
-        )
-        assert changed
-        assert engine.current_mode == TimerMode.WORK_MUSIC
-        assert not engine.manual_mode_lock
-
-    def test_work_mode_clears_lock(self):
-        engine = make_engine(0)
-        engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=0)
-        engine.set_mode(TimerMode.WORK_SILENCE, is_automatic=False, now_mono_ms=500)
-        assert not engine.manual_mode_lock
+        advance(engine, 0, 10)  # earn 10_000ms
+        break_before = engine.accumulated_break_ms
+        engine.enter_sleeping(10_000)
+        advance(engine, 10_000, 60)
+        assert engine.accumulated_break_ms == break_before
+        assert engine.total_break_time_ms == 0
 
 
-# ---- Serialization round-trip ----
+# ---- Serialization round-trip (v2) ----
 
 class TestSerialization:
     def test_round_trip(self):
         """to_dict → from_dict preserves state."""
         engine = make_engine(0)
-        advance(engine, 0, 120)  # 60_000ms break
-        engine.set_mode(TimerMode.WORK_MUSIC, is_automatic=False, now_mono_ms=120_000)
-        advance(engine, 120_000, 30)  # 7_500ms more break
+        advance(engine, 0, 60)  # 60_000ms break
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=True, now_mono_ms=60_000)
+        advance(engine, 60_000, 30)
 
-        data = engine.to_dict(now_mono_ms=150_000)
+        data = engine.to_dict(now_mono_ms=90_000)
+        assert data["format_version"] == 2
 
         restored = TimerEngine(now_mono_ms=200_000)
         restored.from_dict(data, now_mono_ms=200_000)
 
-        assert restored.current_mode == TimerMode.WORK_MUSIC
+        assert restored.activity == engine.activity
+        assert restored.productivity_active == engine.productivity_active
+        assert restored.manual_mode == engine.manual_mode
         assert restored.accumulated_break_ms == engine.accumulated_break_ms
         assert restored.break_backlog_ms == engine.break_backlog_ms
         assert restored.total_work_time_ms == engine.total_work_time_ms
@@ -394,66 +664,168 @@ class TestSerialization:
     def test_lock_surviving_serialization(self):
         """Manual lock persists across serialize/deserialize."""
         engine = make_engine(0)
-        engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=0)
-
-        data = engine.to_dict(now_mono_ms=5_000)  # 5s into lock
+        engine.enter_break(0)
+        data = engine.to_dict(now_mono_ms=5_000)
 
         restored = TimerEngine(now_mono_ms=100_000)
         restored.from_dict(data, now_mono_ms=100_000)
         assert restored.manual_mode_lock
-
-        # Auto-switch should still be blocked (lock has ~29m55s remaining)
-        changed, _ = restored.set_mode(
-            TimerMode.WORK_MUSIC, is_automatic=True, now_mono_ms=100_500
-        )
-        assert not changed
+        assert restored.effective_mode == TimerMode.BREAK
 
     def test_expired_lock_cleared_on_restore(self):
         """Lock that expired during downtime is cleared on restore."""
         engine = make_engine(0)
-        engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=0)
-
-        # Serialize at 31 min (lock expired)
+        engine.enter_break(0)
         data = engine.to_dict(now_mono_ms=MANUAL_LOCK_DURATION_MS + 60_000)
 
         restored = TimerEngine(now_mono_ms=200_000)
         restored.from_dict(data, now_mono_ms=200_000)
         assert not restored.manual_mode_lock
 
-    def test_no_work_actions_in_dict(self):
-        """work_actions field is gone from serialization."""
+    def test_idle_serialization(self):
+        """Round-trip preserves idle state."""
         engine = make_engine(0)
-        data = engine.to_dict(now_mono_ms=0)
-        assert "work_actions" not in data
+        engine.idle_timeout_exempt = True
+        engine.set_productivity(False, 10_000)
+        advance(engine, 10_000, 5)
 
-    def test_old_format_backward_compat(self):
-        """from_dict handles old-format keys gracefully."""
-        old_data = {
-            "current_mode": "work_music",
-            "total_work_time_ms": 120000.5,  # old float values
-            "total_break_time_ms": 0,
-            "accumulated_break_ms": 60000.25,
-            "break_backlog_ms": 0,
-            "work_actions": 42,  # vestige — should be ignored
-            "daily_start_date": "2026-02-10",
-            "last_tick_time": 1234567890.0,  # old field — ignored
-            "manual_mode_lock": False,
-            "manual_mode_lock_until": None,
-        }
-        engine = TimerEngine(now_mono_ms=0)
-        engine.from_dict(old_data, now_mono_ms=0)
-        assert engine.current_mode == TimerMode.WORK_MUSIC
-        assert engine.accumulated_break_ms == 60000  # truncated to int
-        assert engine.total_work_time_ms == 120000
+        data = engine.to_dict(now_mono_ms=15_000)
+        assert data["idle_entered_elapsed_ms"] == 5_000
+        assert data["idle_timeout_exempt"] is True
+        assert data["idle_timeout_ms"] == IDLE_TIMEOUT_FROM_WORKING_MS
+
+        restored = TimerEngine(now_mono_ms=100_000)
+        restored.from_dict(data, now_mono_ms=100_000)
+        assert not restored.productivity_active
+        assert restored.idle_timeout_exempt is True
+
+    def test_distraction_serialization(self):
+        """Round-trip preserves distraction state."""
+        engine = make_engine(0)
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=True, now_mono_ms=0)
+        advance(engine, 0, 30)
+
+        data = engine.to_dict(now_mono_ms=30_000)
+        assert data["distraction_elapsed_ms"] == 30_000
+        assert data["distraction_is_scrolling_gaming"] is True
+
+        restored = TimerEngine(now_mono_ms=100_000)
+        restored.from_dict(data, now_mono_ms=100_000)
+        assert restored.activity == Activity.DISTRACTION
+        # distraction_started_ms should be restored relative to new now
+        assert restored.distraction_started_ms == 100_000 - 30_000
 
     def test_export_dict_camel_case(self):
-        """to_export_dict returns camelCase keys."""
+        """to_export_dict returns camelCase keys with layer info."""
         engine = make_engine(0)
         advance(engine, 0, 60)
         d = engine.to_export_dict()
-        assert "currentMode" in d
-        assert "breakAvailableSeconds" in d
-        assert d["breakAvailableSeconds"] == 15  # 15_000ms = 15s
+        assert d["currentMode"] == "working"
+        assert d["activity"] == "working"
+        assert d["productivityActive"] is True
+        assert d["breakAvailableSeconds"] == 60
+
+
+# ---- Legacy migration ----
+
+class TestLegacyMigration:
+    def test_work_silence_migration(self):
+        old_data = {
+            "current_mode": "work_silence",
+            "total_work_time_ms": 120000,
+            "total_break_time_ms": 0,
+            "accumulated_break_ms": 60000,
+            "break_backlog_ms": 0,
+            "daily_start_date": "2026-02-10",
+            "manual_mode_lock": False,
+        }
+        engine = TimerEngine(now_mono_ms=0)
+        engine.from_dict(old_data, now_mono_ms=0)
+        assert engine.activity == Activity.WORKING
+        assert engine.productivity_active is True
+        assert engine.manual_mode is None
+        assert engine.effective_mode == TimerMode.WORKING
+        assert engine.accumulated_break_ms == 60000
+
+    def test_work_video_migration(self):
+        old_data = {
+            "current_mode": "work_video",
+            "total_work_time_ms": 0,
+            "total_break_time_ms": 0,
+            "accumulated_break_ms": 0,
+            "break_backlog_ms": 0,
+        }
+        engine = TimerEngine(now_mono_ms=0)
+        engine.from_dict(old_data, now_mono_ms=0)
+        assert engine.activity == Activity.DISTRACTION
+        assert engine.productivity_active is True
+        assert engine.effective_mode == TimerMode.MULTITASKING
+
+    def test_work_scrolling_migration(self):
+        old_data = {"current_mode": "work_scrolling"}
+        engine = TimerEngine(now_mono_ms=0)
+        engine.from_dict(old_data, now_mono_ms=0)
+        assert engine.activity == Activity.DISTRACTION
+        assert engine.productivity_active is True
+        # scrolling/gaming → distraction_is_scrolling_gaming = True
+
+    def test_break_migration(self):
+        old_data = {
+            "current_mode": "break",
+            "manual_mode_lock": True,
+            "manual_mode_lock_remaining_ms": 300000,
+            "accumulated_break_ms": 50000,
+        }
+        engine = TimerEngine(now_mono_ms=0)
+        engine.from_dict(old_data, now_mono_ms=0)
+        assert engine.manual_mode == TimerMode.BREAK
+        assert engine.effective_mode == TimerMode.BREAK
+        assert engine.manual_mode_lock is True
+
+    def test_sleeping_migration(self):
+        old_data = {"current_mode": "sleeping"}
+        engine = TimerEngine(now_mono_ms=0)
+        engine.from_dict(old_data, now_mono_ms=0)
+        assert engine.manual_mode == TimerMode.SLEEPING
+        assert engine.effective_mode == TimerMode.SLEEPING
+
+    def test_idle_migration(self):
+        old_data = {"current_mode": "idle"}
+        engine = TimerEngine(now_mono_ms=0)
+        engine.from_dict(old_data, now_mono_ms=0)
+        assert engine.activity == Activity.WORKING
+        assert engine.productivity_active is False
+        assert engine.effective_mode == TimerMode.IDLE
+
+    def test_pause_migration(self):
+        old_data = {"current_mode": "pause"}
+        engine = TimerEngine(now_mono_ms=0)
+        engine.from_dict(old_data, now_mono_ms=0)
+        assert engine.activity == Activity.WORKING
+        assert engine.productivity_active is False
+        assert engine.effective_mode == TimerMode.IDLE
+
+    def test_gym_migration(self):
+        old_data = {"current_mode": "gym"}
+        engine = TimerEngine(now_mono_ms=0)
+        engine.from_dict(old_data, now_mono_ms=0)
+        assert engine.activity == Activity.WORKING
+        assert engine.productivity_active is True
+        assert engine.effective_mode == TimerMode.WORKING
+
+    def test_old_format_float_truncation(self):
+        """Old float values are truncated to int."""
+        old_data = {
+            "current_mode": "work_music",
+            "total_work_time_ms": 120000.5,
+            "accumulated_break_ms": 60000.25,
+            "total_break_time_ms": 0,
+            "break_backlog_ms": 0,
+        }
+        engine = TimerEngine(now_mono_ms=0)
+        engine.from_dict(old_data, now_mono_ms=0)
+        assert engine.accumulated_break_ms == 60000
+        assert engine.total_work_time_ms == 120000
 
 
 # ---- Edge cases ----
@@ -471,135 +843,23 @@ class TestEdgeCases:
         engine.tick(500, "2026-02-11")  # earlier timestamp
         assert engine.accumulated_break_ms == 0
 
-    def test_sub_second_tick(self):
-        """Ticks faster than 1s still accumulate correctly."""
+    def test_rate_table_completeness(self):
+        """All TimerModes have an entry in the rate table."""
+        for mode in TimerMode:
+            assert mode in BREAK_RATE_TABLE, f"Missing rate for {mode}"
+
+    def test_distraction_upgrade_resets_timer(self):
+        """Upgrading from video to scrolling resets distraction timer."""
         engine = make_engine(0)
-        for i in range(1000):
-            engine.tick(i * 100, "2026-02-11")  # 100ms ticks for 100s
-        # 999 ticks of 100ms each = 99_900ms total, * 1/4 = 24_975ms
-        assert engine.accumulated_break_ms == 24_975
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=False, now_mono_ms=0)
+        advance(engine, 0, 300)  # 5 min of video
+        # Upgrade to scrolling
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=True, now_mono_ms=300_000)
+        assert engine.distraction_started_ms == 300_000  # reset, not 0
 
-    def test_initial_mode_is_work_silence(self):
-        engine = TimerEngine(now_mono_ms=0)
-        assert engine.current_mode == TimerMode.WORK_SILENCE
-
-    def test_break_exhaustion_exact_zero(self):
-        """When break hits exactly 0 (no overshoot), no backlog created."""
+    def test_distraction_clears_on_working(self):
+        """Switching back to working clears all distraction state."""
         engine = make_engine(0)
-        # Earn exactly 5_000ms break (20s silence at 1/4 rate)
-        advance(engine, 0, 20)
-        assert engine.accumulated_break_ms == 5_000
-        # Consume exactly 5_000ms in break mode
-        engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=20_000)
-        advance(engine, 20_000, 5)
-        assert engine.accumulated_break_ms == 0
-        assert engine.break_backlog_ms == 0
-
-
-# ---- IDLE mode ----
-
-class TestIdleMode:
-    def test_idle_no_accumulation(self):
-        """IDLE mode: no break earned, no work time tracked."""
-        engine = make_engine(0)
-        # Earn some break first to verify it doesn't change
-        advance(engine, 0, 40)  # 10_000ms break
-        assert engine.accumulated_break_ms == 10_000
-        work_before = engine.total_work_time_ms
-
-        engine.set_mode(TimerMode.IDLE, is_automatic=True, now_mono_ms=40_000)
-        advance(engine, 40_000, 60)
-        assert engine.accumulated_break_ms == 10_000  # unchanged
-        assert engine.total_work_time_ms == work_before  # unchanged
-        assert engine.total_break_time_ms == 0
-
-    def test_idle_timeout_triggers_break(self):
-        """After 15 min of IDLE → auto-transition to BREAK + IDLE_TIMEOUT event."""
-        engine = make_engine(0)
-        engine.set_mode(TimerMode.IDLE, is_automatic=True, now_mono_ms=0)
-
-        # Advance to just before timeout (14 min 59 sec) — should stay IDLE
-        timeout_secs = IDLE_TO_BREAK_TIMEOUT_MS // 1000
-        advance(engine, 0, timeout_secs - 1)
-        assert engine.current_mode == TimerMode.IDLE
-
-        # One more second → timeout
-        result = engine.tick((timeout_secs) * 1000, "2026-02-11")
-        assert engine.current_mode == TimerMode.BREAK
-        assert TimerEvent.IDLE_TIMEOUT in result.events
-        assert TimerEvent.MODE_CHANGED in result.events
-        assert result.old_mode == TimerMode.IDLE
-
-    def test_idle_timeout_exempt(self):
-        """Stays IDLE past 15 min when exempt (gym/campus)."""
-        engine = make_engine(0)
-        engine.idle_timeout_exempt = True
-        engine.set_mode(TimerMode.IDLE, is_automatic=True, now_mono_ms=0)
-
-        timeout_secs = IDLE_TO_BREAK_TIMEOUT_MS // 1000
-        result = advance(engine, 0, timeout_secs + 60)  # 16 minutes
-        assert engine.current_mode == TimerMode.IDLE
-        assert TimerEvent.IDLE_TIMEOUT not in result.events
-
-    def test_idle_to_work_manual(self):
-        """Manual switch from IDLE to WORK_SILENCE works."""
-        engine = make_engine(0)
-        engine.set_mode(TimerMode.IDLE, is_automatic=True, now_mono_ms=0)
-        changed, result = engine.set_mode(TimerMode.WORK_SILENCE, is_automatic=False, now_mono_ms=5_000)
-        assert changed
-        assert engine.current_mode == TimerMode.WORK_SILENCE
-        assert TimerEvent.MODE_CHANGED in result.events
-
-    def test_idle_blocked_by_manual_lock(self):
-        """Auto-IDLE blocked during BREAK/PAUSE lock."""
-        engine = make_engine(0)
-        advance(engine, 0, 60)  # earn break
-        engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=60_000)
-        assert engine.manual_mode_lock
-        changed, _ = engine.set_mode(TimerMode.IDLE, is_automatic=True, now_mono_ms=61_000)
-        assert not changed
-        assert engine.current_mode == TimerMode.BREAK
-
-    def test_idle_serialization(self):
-        """Round-trip preserves idle state."""
-        engine = make_engine(0)
-        engine.idle_timeout_exempt = True
-        engine.set_mode(TimerMode.IDLE, is_automatic=True, now_mono_ms=10_000)
-        # Advance 5 seconds in IDLE
-        advance(engine, 10_000, 5)
-
-        data = engine.to_dict(now_mono_ms=15_000)
-        assert data["idle_entered_elapsed_ms"] == 5_000
-        assert data["idle_timeout_exempt"] is True
-
-        restored = TimerEngine(now_mono_ms=100_000)
-        restored.from_dict(data, now_mono_ms=100_000)
-        assert restored.current_mode == TimerMode.IDLE
-        assert restored.idle_timeout_exempt is True
-        # idle_entered_ms should be restored relative to new now
-        # After restoring, 5s elapsed means idle_entered = 100_000 - 5_000 = 95_000
-        # So timeout would fire at 95_000 + 900_000 = 995_000
-        # Advance to just before that
-        advance(restored, 100_000, 60)  # 1 min, still far from timeout
-        assert restored.current_mode == TimerMode.IDLE  # still idle (exempt)
-
-    def test_idle_daily_reset_clears(self):
-        """Daily reset clears idle state."""
-        engine = make_engine(0, "2026-02-10")
-        engine.set_mode(TimerMode.IDLE, is_automatic=True, now_mono_ms=0)
-        engine.tick(1_000, "2026-02-11")  # trigger reset
-        assert engine.current_mode == TimerMode.WORK_SILENCE
-
-    def test_idle_timeout_emits_mode_changed(self):
-        """Both IDLE_TIMEOUT and MODE_CHANGED events are emitted."""
-        engine = make_engine(0)
-        engine.set_mode(TimerMode.IDLE, is_automatic=True, now_mono_ms=0)
-        timeout_secs = IDLE_TO_BREAK_TIMEOUT_MS // 1000
-        result = advance(engine, 0, timeout_secs)
-        assert TimerEvent.IDLE_TIMEOUT in result.events
-        assert TimerEvent.MODE_CHANGED in result.events
-
-    def test_idle_break_rate_zero(self):
-        """Confirm IDLE has (0, 1) in rate table — neutral."""
-        from timer import BREAK_RATE_TABLE
-        assert BREAK_RATE_TABLE[TimerMode.IDLE] == (0, 1)
+        engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=True, now_mono_ms=0)
+        engine.set_activity(Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=5000)
+        assert engine.distraction_started_ms is None

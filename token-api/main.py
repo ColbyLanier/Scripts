@@ -36,7 +36,10 @@ from pydantic import BaseModel, Field
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
-from timer import TimerEngine, TimerMode, TimerEvent, format_timer_time, IDLE_TO_BREAK_TIMEOUT_MS
+from timer import (
+    TimerEngine, TimerMode, TimerEvent, Activity,
+    format_timer_time, IDLE_TO_BREAK_TIMEOUT_MS, DEFAULT_BREAK_BUFFER_MS,
+)
 
 # Configure logging for TUI capture
 logger = logging.getLogger("token_api")
@@ -1138,18 +1141,21 @@ async def lifespan(app: FastAPI):
     await load_tasks_from_db()
     timer_load_from_db()
     await restore_desktop_state()
-    # Sync timer mode with restored desktop mode
+    # Sync timer activity layer with restored desktop mode
     desktop_mode = DESKTOP_STATE.get("current_mode", "silence")
-    expected_timer_mode = TimerMode("work_" + desktop_mode)
     now_ms = int(time.monotonic() * 1000)
-    if timer_engine.current_mode != expected_timer_mode and timer_engine.current_mode.value.startswith("work_"):
-        print(f"TIMER: Syncing timer mode {timer_engine.current_mode.value} -> {expected_timer_mode.value} (from desktop state)")
-        timer_engine.set_mode(expected_timer_mode, is_automatic=False, now_mono_ms=now_ms)
+    if desktop_mode in ("video", "scrolling", "gaming"):
+        is_sg = desktop_mode in ("scrolling", "gaming")
+        timer_engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=is_sg, now_mono_ms=now_ms)
+        print(f"TIMER: Synced activity=DISTRACTION (desktop={desktop_mode}, scrolling_gaming={is_sg})")
+    else:
+        timer_engine.set_activity(Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=now_ms)
+        print(f"TIMER: Synced activity=WORKING (desktop={desktop_mode})")
     # Stash cleanup on startup + hourly
     stash_cleanup()
     scheduler.add_job(stash_cleanup, IntervalTrigger(hours=1), id="stash_cleanup", replace_existing=True)
-    # 9 AM daily timer reset (clear accumulated break + wipe prior-day timer events)
-    scheduler.add_job(timer_9am_reset, CronTrigger(hour=9, minute=0), id="timer_9am_reset", replace_existing=True)
+    # 7 AM daily timer reset (clear accumulated break + wipe prior-day timer events)
+    scheduler.add_job(timer_9am_reset, CronTrigger(hour=7, minute=0), id="timer_7am_reset", replace_existing=True)
     scheduler.start()
     print("Scheduler started")
     # Start TTS queue worker
@@ -2509,14 +2515,11 @@ VALID_DETECTION_MODES = ["silence", "music", "video", "scrolling", "gaming", "gy
 # ============ Timer Engine ============
 timer_engine = TimerEngine(now_mono_ms=int(time.monotonic() * 1000))
 
-# Inactivity tracking for idle detection (monotonic ms)
-_last_work_event_ms: int = int(time.monotonic() * 1000)
-
 
 def reset_idle_timer():
-    """Reset the inactivity timer. Called on work actions (prompt_submit, tool_use, work-action, silence/music detection)."""
-    global _last_work_event_ms
-    _last_work_event_ms = int(time.monotonic() * 1000)
+    """Signal productivity to the timer engine. Replaces old _last_work_event_ms tracking."""
+    now_ms = int(time.monotonic() * 1000)
+    timer_engine.set_productivity(True, now_ms)
 
 # Paths for Obsidian vault (write-only consumer for daily notes)
 OBSIDIAN_VAULT_PATH = Path.home() / "Token-ENV"
@@ -3836,23 +3839,20 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
         DESKTOP_STATE["current_mode"] = detected_mode
         DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
 
-        # Update internal timer (automatic = respects manual lock)
+        # Update timer activity layer
         now_ms = int(time.monotonic() * 1000)
-
-        # Distractions (video/scrolling/gaming) → IDLE instead of penalty modes
-        if detected_mode in ("video", "scrolling", "gaming"):
-            timer_target = TimerMode.IDLE
-        else:
-            timer_target = TimerMode("work_" + detected_mode)
-            # Silence/music = real work indicator → reset idle timer
-            reset_idle_timer()
-
         old_timer_mode = timer_engine.current_mode.value
-        timer_updated, _ = timer_engine.set_mode(timer_target, is_automatic=True, now_mono_ms=now_ms)
 
+        if detected_mode in ("video", "scrolling", "gaming"):
+            is_sg = detected_mode in ("scrolling", "gaming")
+            result = timer_engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=is_sg, now_mono_ms=now_ms)
+        else:
+            result = timer_engine.set_activity(Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=now_ms)
+
+        timer_updated = TimerEvent.MODE_CHANGED in result.events
         if timer_updated:
             await timer_log_shift(old_timer_mode,
-                                  timer_target.value, trigger="desktop_detection", source="ahk")
+                                  timer_engine.current_mode.value, trigger="desktop_detection", source="ahk")
 
         await log_event(
             "desktop_mode_change",
@@ -4003,17 +4003,19 @@ async def handle_phone_activity(request: PhoneActivityRequest):
             timer_engine._manual_mode_lock_until_ms = None
             print(f"    Twitter closed, lock cleared")
 
-        # Switch timer to silence when distraction app closes
+        # Switch timer activity to working when distraction app closes
         timer_updated = False
         if old_app:
             DESKTOP_STATE["current_mode"] = "silence"
             DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
             now_ms = int(time.monotonic() * 1000)
-            timer_updated, _ = timer_engine.set_mode(TimerMode.WORK_SILENCE, is_automatic=False, now_mono_ms=now_ms)
+            old_timer_mode = timer_engine.current_mode.value
+            result = timer_engine.set_activity(Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=now_ms)
+            timer_updated = TimerEvent.MODE_CHANGED in result.events
             if timer_updated:
-                await timer_log_shift(None, "work_silence", trigger="phone_app", source="macrodroid",
-                                      phone_app=app_name)
-            print(f"    Phone close -> silence | timer={timer_updated}")
+                await timer_log_shift(old_timer_mode, timer_engine.current_mode.value, trigger="phone_app",
+                                      source="macrodroid", phone_app=app_name)
+            print(f"    Phone close -> working | timer={timer_updated}")
 
         await log_event(
             "phone_app_closed",
@@ -4045,7 +4047,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
             message="App not in distraction list"
         )
 
-    # Helper to sync timer mode for phone distraction
+    # Helper to sync timer activity layer for phone distraction
     def _sync_phone_timer():
         # If twitter was already zapped, don't let phantom opens change timer mode
         # (this prevents phantom opens from burning break time → break_exhausted zaps)
@@ -4056,9 +4058,11 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         DESKTOP_STATE["current_mode"] = distraction_mode
         DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
         now_ms = int(time.monotonic() * 1000)
-        # Phone distractions → IDLE instead of penalty modes
-        updated, _ = timer_engine.set_mode(TimerMode.IDLE, is_automatic=True, now_mono_ms=now_ms)
-        print(f"    Phone open -> {distraction_mode} (timer→IDLE) | timer={updated}")
+        # Phone distractions → set activity to DISTRACTION
+        is_sg = distraction_mode in ("scrolling", "gaming")
+        result = timer_engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=is_sg, now_mono_ms=now_ms)
+        updated = TimerEvent.MODE_CHANGED in result.events
+        print(f"    Phone open -> {distraction_mode} (activity=DISTRACTION, sg={is_sg}) | timer={updated}")
         # Track Twitter open time for 7-minute enforcement
         if app_name in ("twitter", "x", "com.twitter.android"):
             if PHONE_STATE["twitter_open_since"] is None and not PHONE_STATE.get("twitter_zapped"):
@@ -4287,6 +4291,9 @@ async def get_timer_state():
     """Get full timer state (for debugging, dashboards, Stream Deck)."""
     return {
         "current_mode": timer_engine.current_mode.value,
+        "activity": timer_engine.activity.value,
+        "productivity_active": timer_engine.productivity_active,
+        "manual_mode": timer_engine.manual_mode.value if timer_engine.manual_mode else None,
         "total_work_time": format_timer_time(timer_engine.total_work_time_ms),
         "total_work_time_ms": timer_engine.total_work_time_ms,
         "total_break_time": format_timer_time(timer_engine.total_break_time_ms),
@@ -4373,12 +4380,11 @@ async def enter_break_mode():
 
     now_ms = int(time.monotonic() * 1000)
     old_mode = timer_engine.current_mode.value
-    changed, tick_result = timer_engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=now_ms)
+    changed, tick_result = timer_engine.enter_break(now_ms)
     if changed:
         today = datetime.now().strftime("%Y-%m-%d")
         await timer_log_mode_change(old_mode, "break", is_automatic=False)
         await timer_log_shift(old_mode, "break", trigger="manual", source="api")
-        # End previous session and start new one
         await timer_end_session(_current_session_id, now_ms - _session_start_ms, break_used_ms=timer_engine.total_break_time_ms)
         _current_session_id = await timer_start_session("break", today)
         _session_start_ms = now_ms
@@ -4388,20 +4394,22 @@ async def enter_break_mode():
 
 @app.post("/api/timer/pause")
 async def enter_pause_mode():
-    """Enter pause mode (for Stream Deck / TUI / manual control)."""
+    """Enter pause mode (sets productivity inactive → IDLE)."""
     global _current_session_id, _session_start_ms
     now_ms = int(time.monotonic() * 1000)
     old_mode = timer_engine.current_mode.value
-    changed, tick_result = timer_engine.set_mode(TimerMode.PAUSE, is_automatic=False, now_mono_ms=now_ms)
+    result = timer_engine.set_productivity(False, now_ms)
+    changed = TimerEvent.MODE_CHANGED in result.events
     if changed:
         today = datetime.now().strftime("%Y-%m-%d")
-        await timer_log_mode_change(old_mode, "pause", is_automatic=False)
-        await timer_log_shift(old_mode, "pause", trigger="manual", source="api")
+        new_mode = timer_engine.current_mode.value
+        await timer_log_mode_change(old_mode, new_mode, is_automatic=False)
+        await timer_log_shift(old_mode, new_mode, trigger="manual", source="api")
         await timer_end_session(_current_session_id, now_ms - _session_start_ms)
-        _current_session_id = await timer_start_session("pause", today)
+        _current_session_id = await timer_start_session(new_mode, today)
         _session_start_ms = now_ms
-        await log_event("timer_mode_change", details={"new_mode": "pause", "source": "api"})
-    return {"status": "pause", "changed": changed}
+        await log_event("timer_mode_change", details={"new_mode": new_mode, "source": "api"})
+    return {"status": timer_engine.current_mode.value, "changed": changed}
 
 
 @app.post("/api/timer/sleep")
@@ -4410,7 +4418,7 @@ async def enter_sleep_mode():
     global _current_session_id, _session_start_ms
     now_ms = int(time.monotonic() * 1000)
     old_mode = timer_engine.current_mode.value
-    changed, tick_result = timer_engine.set_mode(TimerMode.SLEEPING, is_automatic=False, now_mono_ms=now_ms)
+    changed, tick_result = timer_engine.enter_sleeping(now_ms)
     if changed:
         today = datetime.now().strftime("%Y-%m-%d")
         await timer_log_mode_change(old_mode, "sleeping", is_automatic=False)
@@ -4424,22 +4432,24 @@ async def enter_sleep_mode():
 
 @app.post("/api/timer/resume")
 async def resume_work_mode():
-    """Exit break/pause and return to work_silence."""
+    """Exit break/sleeping and resume. Also sets productivity active."""
     global _current_session_id, _session_start_ms
     now_ms = int(time.monotonic() * 1000)
     old_mode = timer_engine.current_mode.value
-    changed, tick_result = timer_engine.set_mode(TimerMode.WORK_SILENCE, is_automatic=False, now_mono_ms=now_ms)
+    changed, tick_result = timer_engine.resume(now_ms)
+    # Also ensure productivity is active
+    timer_engine.set_productivity(True, now_ms)
     if changed:
-        DESKTOP_STATE["current_mode"] = "silence"
         DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
         today = datetime.now().strftime("%Y-%m-%d")
-        await timer_log_mode_change(old_mode, "work_silence", is_automatic=False)
-        await timer_log_shift(old_mode, "work_silence", trigger="manual", source="api")
+        new_mode = timer_engine.current_mode.value
+        await timer_log_mode_change(old_mode, new_mode, is_automatic=False)
+        await timer_log_shift(old_mode, new_mode, trigger="manual", source="api")
         await timer_end_session(_current_session_id, now_ms - _session_start_ms)
-        _current_session_id = await timer_start_session("work_silence", today)
+        _current_session_id = await timer_start_session(new_mode, today)
         _session_start_ms = now_ms
-        await log_event("timer_mode_change", details={"new_mode": "work_silence", "source": "api"})
-    return {"status": "work_silence", "changed": changed}
+        await log_event("timer_mode_change", details={"new_mode": new_mode, "source": "api"})
+    return {"status": timer_engine.current_mode.value, "changed": changed}
 
 
 @app.post("/api/timer/daily-reset")
@@ -4464,42 +4474,37 @@ async def reset_timer():
     if _current_session_id > 0:
         await timer_end_session(_current_session_id, now_ms - _session_start_ms)
 
-    # Reset timer state
-    timer_engine._total_work_time_ms = 0
-    timer_engine._total_break_time_ms = 0
+    # Reset timer state using force_daily_reset
+    timer_engine.force_daily_reset(now_ms, today)
     timer_engine._accumulated_break_ms = DEFAULT_BREAK_BUFFER_MS
-    timer_engine._break_backlog_ms = 0
-    timer_engine._daily_start_date = today
-    timer_engine._current_mode = TimerMode.WORK_SILENCE
 
     # Start fresh session
-    _current_session_id = await timer_start_session("work_silence", today)
+    _current_session_id = await timer_start_session(timer_engine.current_mode.value, today)
     _session_start_ms = now_ms
 
     await log_event("timer_reset", details={"date": today})
-    return {"status": "reset", "total_work_time": "0h 0m", "accumulated_break": "5m", "current_mode": "work_silence"}
+    return {"status": "reset", "total_work_time": "0h 0m", "accumulated_break": "5m", "current_mode": timer_engine.current_mode.value}
 
 
 @app.post("/api/work-action")
 async def work_action():
-    """Manual work action signal — resets idle timer, exits IDLE if active."""
+    """Manual work action signal — sets productivity active."""
     global _current_session_id, _session_start_ms
-    reset_idle_timer()
+    now_ms = int(time.monotonic() * 1000)
+    old_mode = timer_engine.current_mode.value
+    result = timer_engine.set_productivity(True, now_ms)
+    exited_idle = TimerEvent.MODE_CHANGED in result.events
 
-    exited_idle = False
-    if timer_engine.current_mode == TimerMode.IDLE:
-        now_ms = int(time.monotonic() * 1000)
-        changed, _ = timer_engine.set_mode(TimerMode.WORK_SILENCE, is_automatic=False, now_mono_ms=now_ms)
-        if changed:
-            exited_idle = True
-            today = datetime.now().strftime("%Y-%m-%d")
-            await timer_log_shift("idle", "work_silence", trigger="work_action", source="api")
-            if _current_session_id > 0:
-                duration_ms = now_ms - _session_start_ms
-                await timer_end_session(_current_session_id, duration_ms)
-            _current_session_id = await timer_start_session("work_silence", today)
-            _session_start_ms = now_ms
-            print("TIMER: Work-action exited IDLE → WORK_SILENCE")
+    if exited_idle:
+        new_mode = timer_engine.current_mode.value
+        today = datetime.now().strftime("%Y-%m-%d")
+        await timer_log_shift(old_mode, new_mode, trigger="work_action", source="api")
+        if _current_session_id > 0:
+            duration_ms = now_ms - _session_start_ms
+            await timer_end_session(_current_session_id, duration_ms)
+        _current_session_id = await timer_start_session(new_mode, today)
+        _session_start_ms = now_ms
+        print(f"TIMER: Work-action exited {old_mode} → {new_mode}")
 
     return {"idle_timer_reset": True, "exited_idle": exited_idle, "current_mode": timer_engine.current_mode.value}
 
@@ -4597,11 +4602,11 @@ async def set_work_mode(request: WorkModeRequest):
 
     print(f">>> Work mode changed: {old_mode} -> {request.mode} (source: {request.source})")
 
-    # If switching to gym mode, update internal timer
+    # If switching to gym mode, set idle timeout exempt
     timer_updated = False
     if request.mode == "gym":
-        now_ms = int(time.monotonic() * 1000)
-        timer_updated, _ = timer_engine.set_mode(TimerMode.GYM, is_automatic=False, now_mono_ms=now_ms)
+        timer_engine.idle_timeout_exempt = True
+        timer_updated = True
 
     await log_event(
         "work_mode_change",
@@ -4697,6 +4702,14 @@ async def handle_location_event(request: LocationEventRequest):
         result = await set_work_mode(work_mode_req)
     else:
         print(f">>> Location tracking only for {key}, no mode change")
+
+    # Gym bounty: +30 min break on gym exit
+    if location == "gym" and action == "exit":
+        now_ms = int(time.monotonic() * 1000)
+        timer_engine.apply_gym_bounty(now_ms)
+        bounty_min = round(timer_engine.accumulated_break_ms / 60000, 1)
+        print(f">>> Gym bounty applied: +30min break (total: {bounty_min}min)")
+        await log_event("gym_bounty", details={"break_minutes": bounty_min})
 
     await log_event("location_event", details={
         "location": location,
@@ -6070,12 +6083,12 @@ async def timer_worker():
             current_hour = now.hour
             result = timer_engine.tick(now_ms, today, current_hour)
 
-            # Handle events (IDLE_TIMEOUT handled specially since it also emits MODE_CHANGED)
+            # Handle events (some events come paired with MODE_CHANGED — handle specially)
             has_idle_timeout = TimerEvent.IDLE_TIMEOUT in result.events
+            has_distraction_timeout = TimerEvent.DISTRACTION_TIMEOUT in result.events
             for event in result.events:
                 if event == TimerEvent.IDLE_TIMEOUT:
                     print("TIMER: Idle timeout — auto-transitioning to BREAK")
-                    # End idle session, start break session
                     if _current_session_id > 0:
                         duration_ms = now_ms - _session_start_ms
                         await timer_end_session(_current_session_id, duration_ms)
@@ -6086,52 +6099,57 @@ async def timer_worker():
                     loop = asyncio.get_event_loop()
                     loop.run_in_executor(None, speak_tts, "Idle timeout. Entering break mode.")
                     continue
-                elif event == TimerEvent.MODE_CHANGED and has_idle_timeout:
-                    # Already handled above with IDLE_TIMEOUT
+                elif event == TimerEvent.DISTRACTION_TIMEOUT:
+                    print("TIMER: Distraction timeout — scrolling/gaming ≥10min → DISTRACTED")
+                    if _current_session_id > 0:
+                        duration_ms = now_ms - _session_start_ms
+                        await timer_end_session(_current_session_id, duration_ms)
+                    await timer_log_shift("multitasking", "distracted", trigger="distraction_timeout", source="timer_worker")
+                    _current_session_id = await timer_start_session("distracted", today)
+                    _session_start_ms = now_ms
+                    _mode_change_count += 1
+                    # Enforce: close distraction windows + Pavlok
+                    close_distraction_windows()
+                    send_pavlok_stimulus(reason="distraction_timeout")
+                    loop = asyncio.get_event_loop()
+                    loop.run_in_executor(None, speak_tts, "Distraction timeout. Close distractions now.")
                     continue
+                elif event == TimerEvent.MODE_CHANGED and (has_idle_timeout or has_distraction_timeout):
+                    continue  # Already handled above
                 elif event == TimerEvent.BREAK_EXHAUSTED:
                     await timer_log_shift(timer_engine.current_mode.value, "break_exhausted",
                                          trigger="enforcement", source="timer_worker")
                     asyncio.create_task(_async_enforce_break_exhausted())
                 elif event == TimerEvent.DAILY_RESET:
                     print(f"TIMER: Daily reset (was {result.reset_date}, now {today}). Productivity score: {result.productivity_score}")
-                    # End current session
                     if _current_session_id > 0:
                         duration_ms = now_ms - _session_start_ms
                         await timer_end_session(_current_session_id, duration_ms, break_earned_ms=timer_engine.total_break_time_ms)
-                    # Save daily score
                     await timer_save_daily_score(
-                        result.reset_date, 
+                        result.reset_date,
                         result.productivity_score or 0,
                         timer_engine.total_work_time_ms,
                         timer_engine.total_break_time_ms,
                         _mode_change_count,
                         _mode_change_count
                     )
-                    # Generate daily analytics before wiping shifts
                     await generate_daily_timer_analytics(result.reset_date)
                     await timer_log_shift(result.old_mode.value if result.old_mode else None,
-                                         "work_silence", trigger="daily_reset", source="timer_worker")
-                    # Reset for new day
+                                         timer_engine.current_mode.value, trigger="daily_reset", source="timer_worker")
                     _mode_change_count = 0
                     _current_session_id = await timer_start_session(timer_engine.current_mode.value, today)
                     _session_start_ms = now_ms
                 elif event == TimerEvent.MODE_CHANGED and result.old_mode:
-                    # End previous session
                     if _current_session_id > 0:
                         duration_ms = now_ms - _session_start_ms
-                        # Calculate break earned/used for the session
-                        if result.old_mode.value.startswith("work_") or result.old_mode == TimerMode.GYM:
+                        if result.old_mode in (TimerMode.WORKING, TimerMode.MULTITASKING, TimerMode.DISTRACTED):
                             await timer_end_session(_current_session_id, duration_ms, break_earned_ms=timer_engine.total_break_time_ms)
                         else:
                             await timer_end_session(_current_session_id, duration_ms, break_used_ms=timer_engine.total_break_time_ms)
-                    # Log mode change
                     await timer_log_mode_change(result.old_mode.value if result.old_mode else None, timer_engine.current_mode.value, is_automatic=False)
                     _mode_change_count += 1
-                    # Start new session
                     _current_session_id = await timer_start_session(timer_engine.current_mode.value, today)
                     _session_start_ms = now_ms
-                    # Push mode change to phone widget
                     async with aiosqlite.connect(DB_PATH) as _wdb:
                         _cur = await _wdb.execute(
                             "SELECT COUNT(*) FROM claude_instances WHERE status IN ('processing', 'idle') AND COALESCE(is_subagent, 0) = 0"
@@ -6173,37 +6191,31 @@ async def timer_worker():
             location_zone = DESKTOP_STATE.get("location_zone")
             timer_engine.idle_timeout_exempt = (work_mode == "gym" or location_zone == "campus")
 
-            # Inactivity → IDLE detection (check every 10s, only in work_* modes)
+            # Productivity layer update (every 10s) — poll DB for active instances
             if now - last_db_save >= 10:  # piggyback on DB save interval
-                current = timer_engine.current_mode
-                if current.value.startswith("work_"):
-                    idle_elapsed_ms = now_ms - _last_work_event_ms
-                    if idle_elapsed_ms >= IDLE_TO_BREAK_TIMEOUT_MS:
-                        # Check if any instance is actively processing (recent activity)
-                        any_processing = False
-                        async with aiosqlite.connect(DB_PATH) as db:
-                            cursor = await db.execute(
-                                """SELECT COUNT(*) FROM claude_instances
-                                   WHERE status = 'processing'
-                                   AND last_activity > datetime('now', '-2 minutes', 'localtime')"""
-                            )
-                            row = await cursor.fetchone()
-                            any_processing = (row[0] if row else 0) > 0
+                any_processing = False
+                async with aiosqlite.connect(DB_PATH) as db:
+                    cursor = await db.execute(
+                        """SELECT COUNT(*) FROM claude_instances
+                           WHERE status = 'processing'
+                           AND last_activity > datetime('now', '-2 minutes', 'localtime')"""
+                    )
+                    row = await cursor.fetchone()
+                    any_processing = (row[0] if row else 0) > 0
 
-                        if any_processing:
-                            reset_idle_timer()
-                        else:
-                            print(f"TIMER: Inactivity detected ({idle_elapsed_ms // 1000}s). Switching to IDLE.")
-                            changed, _ = timer_engine.set_mode(TimerMode.IDLE, is_automatic=True, now_mono_ms=now_ms)
-                            if changed:
-                                old_mode = current.value
-                                await timer_log_shift(old_mode, "idle", trigger="inactivity", source="timer_worker")
-                                if _current_session_id > 0:
-                                    duration_ms = now_ms - _session_start_ms
-                                    await timer_end_session(_current_session_id, duration_ms)
-                                _current_session_id = await timer_start_session("idle", today)
-                                _session_start_ms = now_ms
-                                _mode_change_count += 1
+                old_mode = timer_engine.current_mode.value
+                prod_result = timer_engine.set_productivity(any_processing, now_ms)
+                if TimerEvent.MODE_CHANGED in prod_result.events:
+                    new_mode = timer_engine.current_mode.value
+                    trigger = "productivity_active" if any_processing else "productivity_inactive"
+                    print(f"TIMER: Productivity {trigger} — {old_mode} → {new_mode}")
+                    await timer_log_shift(old_mode, new_mode, trigger=trigger, source="timer_worker")
+                    if _current_session_id > 0:
+                        duration_ms = now_ms - _session_start_ms
+                        await timer_end_session(_current_session_id, duration_ms)
+                    _current_session_id = await timer_start_session(new_mode, today)
+                    _session_start_ms = now_ms
+                    _mode_change_count += 1
 
             # Update daily note every 30s
             if now - last_daily_update >= 30:
@@ -6250,7 +6262,7 @@ async def _async_enforce_twitter_timeout():
     old_mode = timer_engine.current_mode.value
     timer_engine._manual_mode_lock = False
     timer_engine._manual_mode_lock_until_ms = None
-    changed, _ = timer_engine.set_mode(TimerMode.BREAK, is_automatic=False, now_mono_ms=now_ms)
+    changed, _ = timer_engine.enter_break(now_ms)
     if changed:
         today = datetime.now().strftime("%Y-%m-%d")
         await timer_log_mode_change(old_mode, "break", is_automatic=False)
@@ -6298,11 +6310,11 @@ async def enforce_break_exhausted_impl() -> dict:
         PHONE_STATE["current_app"] = None
         PHONE_STATE["is_distracted"] = False
 
-        # Switch timer/desktop back to silence since phone distraction is being closed
+        # Switch timer/desktop back to working since phone distraction is being closed
         DESKTOP_STATE["current_mode"] = "silence"
         DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
         now_ms = int(time.monotonic() * 1000)
-        timer_engine.set_mode(TimerMode.WORK_SILENCE, is_automatic=True, now_mono_ms=now_ms)
+        timer_engine.set_activity(Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=now_ms)
 
     if enforced_any:
         send_pavlok_stimulus(reason="break_exhausted")
@@ -7035,18 +7047,15 @@ async def handle_prompt_submit(payload: dict) -> dict:
         )
         await db.commit()
 
-    # Reset idle timer — real work is happening
-    reset_idle_timer()
-
-    # If timer is IDLE, switch back to WORK_SILENCE
-    exited_idle = False
-    if timer_engine.current_mode == TimerMode.IDLE:
-        now_ms = int(time.monotonic() * 1000)
-        changed, _ = timer_engine.set_mode(TimerMode.WORK_SILENCE, is_automatic=False, now_mono_ms=now_ms)
-        if changed:
-            exited_idle = True
-            await timer_log_shift("idle", "work_silence", trigger="prompt_submit", source="hook")
-            logger.info(f"Hook: PromptSubmit exited IDLE → WORK_SILENCE")
+    # Signal productivity — sets prod active, exits IDLE if needed
+    now_ms = int(time.monotonic() * 1000)
+    old_mode = timer_engine.current_mode.value
+    result = timer_engine.set_productivity(True, now_ms)
+    exited_idle = TimerEvent.MODE_CHANGED in result.events
+    if exited_idle:
+        new_mode = timer_engine.current_mode.value
+        await timer_log_shift(old_mode, new_mode, trigger="prompt_submit", source="hook")
+        logger.info(f"Hook: PromptSubmit exited {old_mode} → {new_mode}")
 
     logger.info(f"Hook: PromptSubmit {session_id[:12]}... -> processing (resurrected if stopped)")
     return {"success": True, "action": "processing", "instance_id": session_id, "exited_idle": exited_idle}
@@ -7081,8 +7090,9 @@ async def handle_post_tool_use(payload: dict) -> dict:
         )
         await db.commit()
 
-    # Reset idle timer — active tool use = real work
-    reset_idle_timer()
+    # Signal productivity — active tool use = real work
+    now_ms = int(time.monotonic() * 1000)
+    timer_engine.set_productivity(True, now_ms)
 
     return {"success": True, "action": "heartbeat", "instance_id": session_id}
 
