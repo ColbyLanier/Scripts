@@ -18,7 +18,19 @@ triggers:
     packages: ["com.google.android.youtube", "app.revanced.android.youtube"]
     launched: true
 
+global_variables:
+  - name: yt_bg
+    type: boolean
+    value: false
+
 actions:
+  # Clear yt_bg flag — fresh foreground open
+  - type: set_variable
+    name: yt_bg
+    var_type: boolean
+    value: false
+    local: false
+
   # Log: macro triggered
   - type: shell
     command: 'mkdir -p /storage/emulated/0/MacroDroid/logs && echo "{system_time} INFO youtube-open TRIGGERED" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
@@ -55,7 +67,7 @@ actions:
 
   # Force run local management for this app
   - type: run_macro
-    macro_name: "Youtube management"
+    macro_name: "Youtube Disable"
 
   # Enable all local fallbacks for future events
   - type: run_macro

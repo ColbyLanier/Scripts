@@ -1144,6 +1144,9 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
+    # Restore twitter zap cooldown across restarts
+    _restore_twitter_zap_cooldown()
+
     # Startup
     await init_db()
     await load_tasks_from_db()
@@ -2866,7 +2869,38 @@ PHONE_STATE = {
     "twitter_open_since": None,  # monotonic time when Twitter/X was opened, None when closed
     "twitter_zapped": False,  # True after 7-min zap fires; blocks re-zap until confirmed close
     "twitter_last_zap_at": 0,  # monotonic time of last twitter zap (30-min cooldown)
+    "twitter_last_zap_wall": 0,  # wall-clock time.time() of last zap (survives restarts via file)
 }
+
+TWITTER_ZAP_COOLDOWN_FILE = DB_PATH.parent / "twitter_zap_cooldown.txt"
+TWITTER_ZAP_COOLDOWN_SECS = 1800  # 30 minutes
+
+
+def _persist_twitter_zap_cooldown():
+    """Write twitter zap wall-clock time to file so it survives restarts."""
+    try:
+        TWITTER_ZAP_COOLDOWN_FILE.write_text(str(time.time()))
+    except Exception as e:
+        print(f"WARN: Failed to persist twitter zap cooldown: {e}")
+
+
+def _restore_twitter_zap_cooldown():
+    """On startup, restore twitter zap cooldown from file.
+    If a zap happened less than 30 min ago, set twitter_zapped=True to block phantom opens."""
+    try:
+        if TWITTER_ZAP_COOLDOWN_FILE.exists():
+            last_zap_wall = float(TWITTER_ZAP_COOLDOWN_FILE.read_text().strip())
+            elapsed = time.time() - last_zap_wall
+            if elapsed < TWITTER_ZAP_COOLDOWN_SECS:
+                PHONE_STATE["twitter_zapped"] = True
+                PHONE_STATE["twitter_last_zap_wall"] = last_zap_wall
+                print(f"STARTUP: Twitter zap cooldown restored ({elapsed:.0f}s ago, {TWITTER_ZAP_COOLDOWN_SECS - elapsed:.0f}s remaining). Phantom opens blocked.")
+            else:
+                print(f"STARTUP: Twitter zap cooldown expired ({elapsed:.0f}s ago). Clearing file.")
+                TWITTER_ZAP_COOLDOWN_FILE.unlink(missing_ok=True)
+    except Exception as e:
+        print(f"WARN: Failed to restore twitter zap cooldown: {e}")
+
 
 # Shizuku restart state
 SHIZUKU_STATE = {
@@ -4179,17 +4213,31 @@ async def handle_phone_activity(request: PhoneActivityRequest):
             message="App not in distraction list"
         )
 
+    is_twitter = app_name in ("twitter", "x", "com.twitter.android")
+
     # Phantom open guard: if Twitter was already zapped and we haven't received
     # a confirmed close event, ignore all subsequent "open" events entirely.
     # MacroDroid's app_launched trigger re-fires on notification banners, app
     # switcher, etc. — these phantom opens were resetting current_app and
     # restarting the 7-minute timer, causing repeat zaps.
-    if app_name in ("twitter", "x", "com.twitter.android") and PHONE_STATE.get("twitter_zapped"):
+    if is_twitter and PHONE_STATE.get("twitter_zapped"):
         print(f"    Phantom Twitter open ignored (already zapped, awaiting confirmed close)")
         return PhoneActivityResponse(
             allowed=False,
             reason="phantom_blocked",
             message="Twitter already enforced, waiting for confirmed close"
+        )
+
+    # Duplicate open debounce: if we're already tracking this app, don't
+    # re-process. MacroDroid sends repeated app_launched events for the same
+    # app (notification banners, app switcher swipe-throughs, etc.).
+    current = (PHONE_STATE.get("current_app") or "").lower()
+    if current == app_name or (is_twitter and current in ("twitter", "x", "com.twitter.android")):
+        print(f"    Duplicate {app_name} open ignored (already current_app)")
+        return PhoneActivityResponse(
+            allowed=True,
+            reason="already_tracked",
+            message="Already tracking this app"
         )
 
     # Helper to sync timer activity layer for phone distraction
@@ -6407,6 +6455,27 @@ async def timer_worker():
                         _active = _row[0] if _row else 0
                     asyncio.create_task(push_phone_widget_async(timer_engine.current_mode.value, _active))
 
+            # Phone current_app staleness check: if last_activity is >3 min old,
+            # it's a phantom open (real usage would get refreshed by the debounce
+            # or by a close event). Clear it to prevent false enforcement.
+            _phone_last = PHONE_STATE.get("last_activity")
+            _phone_app = PHONE_STATE.get("current_app")
+            if _phone_app and _phone_last:
+                try:
+                    _phone_age = (datetime.now() - datetime.fromisoformat(_phone_last)).total_seconds()
+                    if _phone_age > 180:  # 3 minutes stale
+                        print(f"TIMER: Clearing stale phone_app={_phone_app!r} (last_activity {_phone_age:.0f}s ago)")
+                        PHONE_STATE["current_app"] = None
+                        PHONE_STATE["is_distracted"] = False
+                        if _phone_app in ("twitter", "x", "com.twitter.android"):
+                            PHONE_STATE["twitter_open_since"] = None
+                        # Restore timer activity to working
+                        DESKTOP_STATE["current_mode"] = "silence"
+                        timer_engine.set_activity(Activity.WORKING, is_scrolling_gaming=False,
+                                                  now_mono_ms=int(time.monotonic() * 1000))
+                except Exception:
+                    pass
+
             # Twitter 7-minute enforcement
             twitter_since = PHONE_STATE.get("twitter_open_since")
             if twitter_since is not None:
@@ -6431,6 +6500,8 @@ async def timer_worker():
                             PHONE_STATE["twitter_open_since"] = None  # one-shot per session
                             PHONE_STATE["twitter_zapped"] = True  # block re-zap until confirmed close
                             PHONE_STATE["twitter_last_zap_at"] = now_mono
+                            PHONE_STATE["twitter_last_zap_wall"] = time.time()
+                            _persist_twitter_zap_cooldown()
                             asyncio.create_task(_async_enforce_twitter_timeout())
 
             now = time.time()
@@ -6447,8 +6518,8 @@ async def timer_worker():
                 async with aiosqlite.connect(DB_PATH) as db:
                     cursor = await db.execute(
                         """SELECT COUNT(*) FROM claude_instances
-                           WHERE is_processing = 1
-                           AND last_activity > datetime('now', '-2 minutes', 'localtime')"""
+                           WHERE status = 'processing'
+                           AND last_activity > datetime('now', '-60 seconds', 'localtime')"""
                     )
                     row = await cursor.fetchone()
                     any_processing = (row[0] if row else 0) > 0

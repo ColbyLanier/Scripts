@@ -142,11 +142,16 @@ def build_time_trigger(config):
 
 @trigger_builder("device_boot")
 def build_device_boot_trigger(config):
-    """Device Boot trigger."""
+    """Device Boot trigger.
+
+    MacroDroid uses DeviceEventsTrigger with m_option=0 for boot events.
+    The old class name 'DeviceBootTrigger' is not recognized on import.
+    """
     return {
+        "m_option": 0,  # 0 = device boot
         "disableLogging": config.get("disable_logging", False),
         "m_SIGUID": generate_guid(),
-        "m_classType": "DeviceBootTrigger",
+        "m_classType": "DeviceEventsTrigger",
         "m_constraintList": [],
         "m_isDisabled": config.get("disabled", False),
         "m_isOrCondition": False
