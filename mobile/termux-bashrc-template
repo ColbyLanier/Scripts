@@ -314,9 +314,9 @@ alias cc="clear &&"
 alias python="python3"
 
 # cdc - run claude on Mac (not installed on phone) with optional path/args
-# Uses zsh -i so Mac sources ~/.zshrc and finds the cdc function
+# Uses zsh -il (interactive login) so Mac sources ~/.zprofile (PATH) + ~/.zshrc (aliases)
 cdc() {
-    ssh -t mac "zsh -i -c 'cdc $*'"
+    ssh -t mac "zsh -il -c 'cdc $*'"
 }
 
 # ====================================================
@@ -344,7 +344,7 @@ command_not_found_handle() {
     # Use zsh -i on Mac / bash -i on WSL so ~/.zshrc is sourced and
     # aliases/functions (like claude, monitor) are available
     case "$choice" in
-        1) ssh -t mac "zsh -i -c '$cmd ${args[*]}'" ;;
+        1) ssh -t mac "zsh -il -c '$cmd ${args[*]}'" ;;
         2) ssh -t wsl "bash -ic '$cmd ${args[*]}'" ;;
         *) return 127 ;;
     esac
@@ -398,12 +398,12 @@ extract() {
 
 # ====================================================
 # MAC-SIDE COMMANDS — explicit functions (bypass routing modal)
-# Uses zsh -i -c so Mac's ~/.zshrc is sourced (needed for aliases/functions)
+# Uses zsh -il -c so Mac's ~/.zshrc is sourced (needed for aliases/functions)
 # ====================================================
-monitor()       { ssh -t mac "zsh -i -c 'monitor'"; }
-token-restart() { ssh -t mac "zsh -i -c 'token-restart $*'"; }
-token-status()  { ssh -t mac "zsh -i -c 'token-status $*'"; }
-instance-name() { ssh -t mac "zsh -i -c 'instance-name $*'"; }
+monitor()       { ssh -t mac "zsh -il -c 'monitor'"; }
+token-restart() { ssh -t mac "zsh -il -c 'token-restart $*'"; }
+token-status()  { ssh -t mac "zsh -il -c 'token-status $*'"; }
+instance-name() { ssh -t mac "zsh -il -c 'instance-name $*'"; }
 
 # ====================================================
 # GIT
