@@ -68,7 +68,7 @@ class TestBasicTick:
         """60s of WORKING → 60_000ms break earned (1:1 rate)."""
         engine = make_engine(0)
         advance(engine, 0, 60)
-        assert engine.accumulated_break_ms == 60_000
+        assert engine.break_balance_ms == 60_000
 
     def test_work_time_tracked(self):
         """60s of WORKING → 60_000ms total work time."""
@@ -80,10 +80,9 @@ class TestBasicTick:
         """No float drift — all values are exact integers."""
         engine = make_engine(0)
         advance(engine, 0, 123)
-        assert isinstance(engine.accumulated_break_ms, int)
+        assert isinstance(engine.break_balance_ms, int)
         assert isinstance(engine.total_work_time_ms, int)
         assert isinstance(engine.total_break_time_ms, int)
-        assert isinstance(engine.break_backlog_ms, int)
 
     def test_initial_mode_is_working(self):
         engine = TimerEngine(now_mono_ms=0)
@@ -95,7 +94,7 @@ class TestBasicTick:
         for i in range(1000):
             engine.tick(i * 100, "2026-02-11")  # 100ms ticks for 100s
         # 999 ticks of 100ms each = 99_900ms total, * 1/1 = 99_900ms
-        assert engine.accumulated_break_ms == 99_900
+        assert engine.break_balance_ms == 99_900
 
 
 # ---- Effective mode derivation ----
@@ -206,7 +205,7 @@ class TestMultitasking:
         engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=False, now_mono_ms=0)
         assert engine.effective_mode == TimerMode.MULTITASKING
         advance(engine, 0, 60)
-        assert engine.accumulated_break_ms == 0
+        assert engine.break_balance_ms == 0
 
     def test_multitasking_tracks_work_time(self):
         """MULTITASKING still counts as work time."""
@@ -231,7 +230,7 @@ class TestDistracted:
         engine = make_engine(0)
         # Earn 120s break first
         advance(engine, 0, 120)
-        assert engine.accumulated_break_ms == 120_000
+        assert engine.break_balance_ms == 120_000
 
         # Enter distraction (scrolling)
         engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=True, now_mono_ms=120_000)
@@ -356,12 +355,12 @@ class TestParameterizedIdle:
         """IDLE mode: no break earned, no work time change."""
         engine = make_engine(0)
         advance(engine, 0, 40)
-        break_before = engine.accumulated_break_ms
+        break_before = engine.break_balance_ms
         work_before = engine.total_work_time_ms
 
         engine.set_productivity(False, 40_000)
         advance(engine, 40_000, 60)
-        assert engine.accumulated_break_ms == break_before
+        assert engine.break_balance_ms == break_before
         assert engine.total_work_time_ms == work_before
 
     def test_idle_timeout_exempt(self):
@@ -391,26 +390,25 @@ class TestGymBounty:
         """+30 min break on gym exit."""
         engine = make_engine(0)
         result = engine.apply_gym_bounty(0)
-        assert engine.accumulated_break_ms == GYM_BOUNTY_MS
+        assert engine.break_balance_ms == GYM_BOUNTY_MS
 
     def test_gym_bounty_stacks_with_earned(self):
         """Bounty adds to existing break time."""
         engine = make_engine(0)
         advance(engine, 0, 60)  # earn 60_000ms
         engine.apply_gym_bounty(60_000)
-        assert engine.accumulated_break_ms == 60_000 + GYM_BOUNTY_MS
+        assert engine.break_balance_ms == 60_000 + GYM_BOUNTY_MS
 
     def test_gym_bounty_pays_off_backlog(self):
         """Bounty pays off backlog before accumulating."""
         engine = make_engine(0)
         # Create backlog by entering break with no earned time
         engine.enter_break(0)
-        advance(engine, 0, 30)  # 30s break consumed → 30_000 backlog
-        assert engine.break_backlog_ms == 30_000
+        advance(engine, 0, 30)  # 30s break consumed → -30_000 balance
+        assert engine.break_balance_ms == -30_000
         engine.resume(30_000)
         engine.apply_gym_bounty(30_000)
-        assert engine.break_backlog_ms == 0
-        assert engine.accumulated_break_ms == GYM_BOUNTY_MS - 30_000
+        assert engine.break_balance_ms == GYM_BOUNTY_MS - 30_000
 
 
 # ---- Break consumption ----
@@ -422,7 +420,7 @@ class TestBreakConsumption:
         advance(engine, 0, 60)  # 60_000ms break earned (1:1 rate)
         engine.enter_break(60_000)
         advance(engine, 60_000, 10)  # consume 10_000ms
-        assert engine.accumulated_break_ms == 50_000
+        assert engine.break_balance_ms == 50_000
         assert engine.total_break_time_ms == 10_000
 
     def test_break_tracks_break_time(self):
@@ -452,8 +450,7 @@ class TestBreakExhaustion:
         # Now advance 10s: tick 10 will go from 500 → -500 (overshoot → BREAK_EXHAUSTED)
         events = collect_events(engine, 10_500, 10)
         assert TimerEvent.BREAK_EXHAUSTED in events
-        assert engine.accumulated_break_ms == 0
-        assert engine.break_backlog_ms > 0
+        assert engine.break_balance_ms < 0
 
     def test_distracted_exhaustion(self):
         """DISTRACTED penalty can exhaust break (fires once on 0-crossing).
@@ -481,8 +478,7 @@ class TestBreakExhaustion:
         advance(engine, 0, 5)  # 5_000ms break (1:1 rate)
         engine.enter_break(5_000)
         advance(engine, 5_000, 5)  # consume exactly 5_000ms
-        assert engine.accumulated_break_ms == 0
-        assert engine.break_backlog_ms == 0
+        assert engine.break_balance_ms == 0
 
 
 # ---- Backlog mechanics ----
@@ -493,19 +489,17 @@ class TestBacklog:
         engine = make_engine(0)
         engine.enter_break(0)
         advance(engine, 0, 60)  # 60_000ms consumed → all backlog
-        assert engine.break_backlog_ms == 60_000
-        assert engine.accumulated_break_ms == 0
+        assert engine.break_balance_ms == -60_000
 
     def test_backlog_offset_before_accumulation(self):
         """Earn break with backlog → pay off backlog first."""
         engine = make_engine(0)
         engine.enter_break(0)
         advance(engine, 0, 10)  # 10_000ms backlog
-        assert engine.break_backlog_ms == 10_000
+        assert engine.break_balance_ms == -10_000
         engine.resume(10_000)
-        advance(engine, 10_000, 20)  # 20_000ms earned → 10k backlog, 10k break
-        assert engine.break_backlog_ms == 0
-        assert engine.accumulated_break_ms == 10_000
+        advance(engine, 10_000, 20)  # 20_000ms earned → pays off 10k debt + 10k positive
+        assert engine.break_balance_ms == 10_000
 
 
 # ---- Idle detection (gap) ----
@@ -519,14 +513,14 @@ class TestIdleDetection:
         result = engine.tick(10_000 + 15 * 60 * 1000, "2026-02-11")
         assert TimerEvent.BREAK_EXHAUSTED not in result.events
         # Only the first 10s of work should have accumulated (at 1:1 rate)
-        assert engine.accumulated_break_ms == 10_000
+        assert engine.break_balance_ms == 10_000
 
     def test_exactly_at_threshold(self):
         """Gap exactly at MAX_IDLE_MS is still idle."""
         engine = make_engine(0)
         gap_ms = MAX_IDLE_MS + 1  # just over threshold
         engine.tick(gap_ms, "2026-02-11")
-        assert engine.accumulated_break_ms == 0
+        assert engine.break_balance_ms == 0
 
 
 # ---- Daily reset ----
@@ -536,14 +530,14 @@ class TestDailyReset:
         """Tick with new date → DAILY_RESET event, counters zeroed."""
         engine = make_engine(0, "2026-02-10")
         advance(engine, 0, 60, date="2026-02-10")  # accumulate some state
-        assert engine.accumulated_break_ms == 60_000
+        assert engine.break_balance_ms == 60_000
 
         result = engine.tick(61_000, "2026-02-11", current_hour=8)
         assert TimerEvent.DAILY_RESET in result.events
         assert result.reset_date == "2026-02-10"
 
     def test_reset_productivity_score(self):
-        """Productivity score = accumulated_break_ms // (1000 * 60)."""
+        """Productivity score = break_balance_ms // (1000 * 60)."""
         engine = make_engine(0, "2026-02-10")
         advance(engine, 0, 60, date="2026-02-10")  # 60_000ms break (60s * 1/1)
         result = engine.tick(61_000, "2026-02-11", current_hour=8)
@@ -553,8 +547,7 @@ class TestDailyReset:
         engine = make_engine(0, "2026-02-10")
         advance(engine, 0, 60, date="2026-02-10")
         engine.tick(61_000, "2026-02-11", current_hour=8)
-        assert engine.accumulated_break_ms == DEFAULT_BREAK_BUFFER_MS
-        assert engine.break_backlog_ms == 0
+        assert engine.break_balance_ms == DEFAULT_BREAK_BUFFER_MS
         assert engine.total_work_time_ms == 0
         assert engine.total_break_time_ms == 0
         assert engine.current_mode == TimerMode.WORKING
@@ -698,10 +691,10 @@ class TestManualMode:
         """SLEEPING: no accumulation of any kind."""
         engine = make_engine(0)
         advance(engine, 0, 10)  # earn 10_000ms
-        break_before = engine.accumulated_break_ms
+        break_before = engine.break_balance_ms
         engine.enter_sleeping(10_000)
         advance(engine, 10_000, 60)
-        assert engine.accumulated_break_ms == break_before
+        assert engine.break_balance_ms == break_before
         assert engine.total_break_time_ms == 0
 
 
@@ -724,8 +717,7 @@ class TestSerialization:
         assert restored.activity == engine.activity
         assert restored.productivity_active == engine.productivity_active
         assert restored.manual_mode == engine.manual_mode
-        assert restored.accumulated_break_ms == engine.accumulated_break_ms
-        assert restored.break_backlog_ms == engine.break_backlog_ms
+        assert restored.break_balance_ms == engine.break_balance_ms
         assert restored.total_work_time_ms == engine.total_work_time_ms
         assert restored.total_break_time_ms == engine.total_break_time_ms
         assert restored.daily_start_date == engine.daily_start_date
@@ -814,7 +806,7 @@ class TestLegacyMigration:
         assert engine.productivity_active is True
         assert engine.manual_mode is None
         assert engine.effective_mode == TimerMode.WORKING
-        assert engine.accumulated_break_ms == 60000
+        assert engine.break_balance_ms == 60000
 
     def test_work_video_migration(self):
         old_data = {
@@ -893,7 +885,7 @@ class TestLegacyMigration:
         }
         engine = TimerEngine(now_mono_ms=0)
         engine.from_dict(old_data, now_mono_ms=0)
-        assert engine.accumulated_break_ms == 60000
+        assert engine.break_balance_ms == 60000
         assert engine.total_work_time_ms == 120000
 
 
@@ -904,13 +896,13 @@ class TestEdgeCases:
         """Tick with same timestamp → no change."""
         engine = make_engine(0)
         engine.tick(0, "2026-02-11")
-        assert engine.accumulated_break_ms == 0
+        assert engine.break_balance_ms == 0
 
     def test_negative_elapsed(self):
         """Monotonic clock should never go backward, but handle gracefully."""
         engine = make_engine(1000)
         engine.tick(500, "2026-02-11")  # earlier timestamp
-        assert engine.accumulated_break_ms == 0
+        assert engine.break_balance_ms == 0
 
     def test_rate_table_completeness(self):
         """All TimerModes have an entry in the rate table."""
