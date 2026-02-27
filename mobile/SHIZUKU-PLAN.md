@@ -1,6 +1,6 @@
 # Shizuku Reliability Plan
 
-**Status**: Logging phase — gathering data before next fix iteration
+**Status**: Root cause confirmed — investigating network-change behavior
 **Last updated**: 2026-02-26
 
 ---
@@ -8,15 +8,32 @@
 ## What We Know
 
 ### The Problem
-Shizuku (ADB shell service) on Samsung S24+ with One UI 7/8 dies hours after being started, not just on reboot. Previously it survived until device restart.
+Shizuku (ADB shell service) on Samsung S24+ with One UI 7/8 dies hours after being started, not just on reboot.
 
-### Root Cause (Working Theory)
-Samsung's One UI 6.1.1+ introduced aggressive background process killing that terminates the Shizuku service process directly — not just the ADB connection. This is a firmware regression confirmed across many S24/Z Fold 6 devices on GitHub issues #612, #1454, #1459.
+### Root Cause (Confirmed 2026-02-26)
+**Wireless debugging is required for Shizuku to stay alive.** Disabling wireless debugging kills Shizuku immediately (confirmed via direct test: enable Shizuku → disable wireless debugging → Shizuku stops within seconds).
 
-**Shizuku architecture**: Wireless debugging is only needed to *start* the service. Once running, Shizuku's binder service runs independently. It should survive network changes. The fact that it was surviving network changes before confirms this — Samsung's process killer is the culprit, not the network.
+The original theory ("Samsung's process killer runs independently of ADB") was wrong. The architecture is:
+- Shizuku's binder service depends on the ADB daemon staying active
+- Disabling wireless debugging kills the ADB daemon → Shizuku dies
+- Previously it was surviving network changes — this means either (a) wireless debugging wasn't auto-disabling on network change before, or (b) ADB was bound to a Tailscale IP (stable across network changes)
 
-### Why Standard Fixes Fail
-Samsung kills the Shizuku **process** directly, not via standard Android battery management. Battery optimization exclusions, Device Care exemptions, and "never sleeping apps" lists don't protect against Samsung's proprietary killer.
+### Open Question
+**Does a natural WiFi SSID change cause Android to auto-disable wireless debugging?**
+Test needed: Shizuku running → switch WiFi networks naturally (no explicit disable) → does Shizuku survive?
+- If yes → Samsung is NOT auto-disabling; something else changed recently
+- If no → Samsung auto-disables wireless debugging on network change → fix: bind ADB over Tailscale
+
+### Why It Was Working Before
+Unknown. Possible causes:
+1. Previous Shizuku starts were via USB (not wireless) — USB Shizuku doesn't depend on wireless debugging
+2. Wireless debugging was bound to Tailscale IP (100.x.x.x, stable across WiFi changes)
+3. A One UI or Shizuku update changed the behavior
+
+### Mitigation: Tailscale ADB Binding
+If Samsung auto-disables wireless debugging on WiFi change, the fix is to bind ADB to the Tailscale interface. The Tailscale IP (100.x.x.x) doesn't change when switching between home WiFi, campus WiFi, and mobile data. Starting Shizuku via `adb connect <tailscale-ip>:port` would make it survive all network changes.
+
+**Requires investigation**: how to configure wireless debugging to bind to Tailscale IP specifically.
 
 ### Device Context
 - **Device**: Samsung S24+ (US Snapdragon SM-S926U)
@@ -26,15 +43,16 @@ Samsung kills the Shizuku **process** directly, not via standard Android battery
 
 ---
 
-## Logging Infrastructure (In Place)
+## Detection Infrastructure
 
-### Shizuku Death Logger macro
-- Triggers: screen on + screen off
-- Checks `pidof moe.shizuku.privileged.api` → RUNNING or STOPPED
+### Shizuku Died / Shizuku Restored macros (current)
+- Triggers: MacroDroid notification trigger (option=1 = dismissed, option=0 = posted)
+- Fires when Shizuku's foreground service notification appears/disappears
+- Zero shell, zero permissions — purely event-driven
 - Logs to `/storage/emulated/0/MacroDroid/logs/shizuku.log`
-- Fields per entry: timestamp, SSID, battery %, charge state, screen state
-- Notifies + opens Shizuku on death (once per outage, no spam)
+- Notifies + opens Shizuku on death (once per outage, no spam via `shizuku_dead` global)
 - Reports `shizuku_died` / `shizuku_restored` events to Token-API `/phone`
+- **shizuku-death-logger.yaml is superseded and should be deleted from MacroDroid**
 
 ### To read logs
 ```bash

@@ -1,0 +1,62 @@
+# Shizuku Died Detector
+#
+# Event-driven: fires when Shizuku's foreground service notification is dismissed/removed
+# by the system (option=1). This happens immediately when Shizuku dies — no polling,
+# no shell, no permissions needed.
+#
+# Root cause (confirmed 2026-02-26): Shizuku requires wireless debugging to stay alive.
+# Disabling wireless debugging (or Android auto-disabling it on network/SSID change)
+# kills Shizuku immediately. Detection via notification dismiss is the cleanest approach.
+#
+# Constraint: shizuku_dead == false suppresses repeat alerts during a single outage.
+
+name: "Shizuku Died"
+category: "System"
+description: "Detects Shizuku death via notification dismiss event"
+enabled: true
+
+global_variables:
+  - name: shizuku_dead
+    type: boolean
+    value: false
+
+triggers:
+  - type: notification
+    package: "moe.shizuku.privileged.api"
+    option: 1  # 1 = dismissed/removed (service stopped)
+
+constraints:
+  - type: variable
+    variable: "shizuku_dead"
+    var_type: boolean
+    comparison: equals
+    value: "false"
+
+actions:
+  - type: set_variable
+    name: "shizuku_dead"
+    value: "true"
+    var_type: boolean
+
+  - type: notification
+    title: "Shizuku Died"
+    text: "Enforcement offline — re-enable Wireless Debugging, then tap to restart Shizuku"
+    channel_type: 1
+
+  - type: vibrate
+    pattern: [0, 300, 200, 300]
+
+  - type: shell
+    command: 'mkdir -p /storage/emulated/0/MacroDroid/logs; TS=$(date "+%Y-%m-%d %H:%M:%S"); BAT=$(dumpsys battery 2>/dev/null | grep -m1 "level:" | tr -d " " | cut -d: -f2); SSID=$(dumpsys wifi 2>/dev/null | grep -m1 "SSID:" | sed "s/.*SSID: //;s/,.*//" | tr -d " "); echo "$TS SHIZUKU_DIED wifi=$SSID bat=${BAT}%" >> /storage/emulated/0/MacroDroid/logs/shizuku.log'
+    block: false
+
+  - type: http_request
+    url: "http://100.95.109.23:7777/phone/event"
+    method: POST
+    body: '{"event": "shizuku_died", "time": "{system_time}"}'
+    content_type: "application/json"
+    block: false
+
+  - type: launch_app
+    app: "Shizuku"
+    package: "moe.shizuku.privileged.api"

@@ -37,22 +37,18 @@ triggers:
     screen_on: false
 
 actions:
-  # Check Shizuku process
+  # Check Shizuku process via MacroDroid helper (elevated perms needed to see other app processes)
+  # useHelper=true routes through Shizuku → can see all PIDs
+  # If Shizuku is dead → helper has no elevated perms → pidof returns nothing → STOPPED
   - type: shell
     command: 'pidof moe.shizuku.privileged.api > /dev/null 2>&1 && echo RUNNING || echo STOPPED'
     output_var: "shizuku_status"
+    use_helper: true
 
-  # Build log line with context
+  # Build log line: all context in one shell script (no folded yaml, no broken magic vars)
+  # Battery via dumpsys, WiFi SSID via getprop/dumpsys, timestamp via date command
   - type: shell
-    command: >
-      BAT=$(dumpsys battery 2>/dev/null | grep -m1 'level:' | awk '{print $2}')
-      CHG=$(dumpsys battery 2>/dev/null | grep -m1 'status:' | awk '{print $2}')
-      echo "{system_date} {system_time} shizuku={lv=shizuku_status} wifi={wifi_ssid} bat=${BAT}% charge_status=${CHG} screen={trigger_type}"
-    output_var: "log_line"
-
-  # Write to log
-  - type: shell
-    command: 'mkdir -p /storage/emulated/0/MacroDroid/logs && echo "{lv=log_line}" >> /storage/emulated/0/MacroDroid/logs/shizuku.log'
+    command: 'TS=$(date "+%Y-%m-%d %H:%M:%S"); BAT=$(dumpsys battery 2>/dev/null | grep -m1 "level:" | tr -d " " | cut -d: -f2); SSID=$(dumpsys wifi 2>/dev/null | grep -m1 "SSID:" | sed "s/.*SSID: //;s/,.*//" | tr -d " "); CHG=$(dumpsys battery 2>/dev/null | grep -m1 "status:" | tr -d " " | cut -d: -f2); mkdir -p /storage/emulated/0/MacroDroid/logs; echo "$TS shizuku={lv=shizuku_status} wifi=$SSID bat=${BAT}% charge=$CHG" >> /storage/emulated/0/MacroDroid/logs/shizuku.log'
     block: false
 
   # === Newly dead: was alive, now stopped ===
@@ -80,15 +76,15 @@ actions:
 
   - type: notification
     title: "Shizuku Died"
-    text: "wifi={wifi_ssid} bat={battery_level}% — tap to restart"
+    text: "Enforcement offline — tap to restart Shizuku"
     channel_type: 1
 
   - type: vibrate
     pattern: [0, 300, 200, 300]
 
-  # Log the death event explicitly
+  # Log death event with full context
   - type: shell
-    command: 'echo "{system_date} {system_time} SHIZUKU_DIED wifi={wifi_ssid} bat={battery_level}% screen={trigger_type}" >> /storage/emulated/0/MacroDroid/logs/shizuku.log'
+    command: 'TS=$(date "+%Y-%m-%d %H:%M:%S"); BAT=$(dumpsys battery 2>/dev/null | grep -m1 "level:" | tr -d " " | cut -d: -f2); SSID=$(dumpsys wifi 2>/dev/null | grep -m1 "SSID:" | sed "s/.*SSID: //;s/,.*//" | tr -d " "); echo "$TS SHIZUKU_DIED wifi=$SSID bat=${BAT}%" >> /storage/emulated/0/MacroDroid/logs/shizuku.log'
     block: false
 
   - type: launch_app
@@ -98,7 +94,7 @@ actions:
   - type: http_request
     url: "http://100.66.10.74:7777/phone"
     method: POST
-    body: '{"event": "shizuku_died", "wifi": "{wifi_ssid}", "battery": "{battery_level}", "screen": "{trigger_type}", "time": "{system_time}"}'
+    body: '{"event": "shizuku_died", "time": "{system_time}"}'
     content_type: "application/json"
     block: false
 
@@ -130,13 +126,13 @@ actions:
     var_type: boolean
 
   - type: shell
-    command: 'echo "{system_date} {system_time} SHIZUKU_RESTORED wifi={wifi_ssid} bat={battery_level}%" >> /storage/emulated/0/MacroDroid/logs/shizuku.log'
+    command: 'TS=$(date "+%Y-%m-%d %H:%M:%S"); SSID=$(dumpsys wifi 2>/dev/null | grep -m1 "SSID:" | sed "s/.*SSID: //;s/,.*//" | tr -d " "); echo "$TS SHIZUKU_RESTORED wifi=$SSID" >> /storage/emulated/0/MacroDroid/logs/shizuku.log'
     block: false
 
   - type: http_request
     url: "http://100.66.10.74:7777/phone"
     method: POST
-    body: '{"event": "shizuku_restored", "wifi": "{wifi_ssid}", "time": "{system_time}"}'
+    body: '{"event": "shizuku_restored", "time": "{system_time}"}'
     content_type: "application/json"
     block: false
 

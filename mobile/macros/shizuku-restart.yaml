@@ -33,7 +33,7 @@ actions:
     package: "moe.shizuku.privileged.api"
 
   - type: http_request
-    url: "http://100.66.10.74:7777/phone"
+    url: "http://100.95.109.23:7777/phone/event"
     method: POST
     body: '{"event": "shizuku_died", "time": "{system_time}"}'
     content_type: "application/json"

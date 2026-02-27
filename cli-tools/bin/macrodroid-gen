@@ -1381,6 +1381,32 @@ def build_music_active_constraint(config):
     }
 
 
+@constraint_builder("notification_present")
+def build_notification_present_constraint(config):
+    """Notification present constraint - check if a notification is currently shown.
+
+    Options:
+      package: app package name (e.g. "moe.shizuku.privileged.api")
+      app_name: app display name (optional)
+      text_contains: text that notification must contain (optional)
+      title_contains: title that notification must contain (optional)
+      present: true = notification is present, false = not present (default: true)
+    """
+    return {
+        "m_appName": config.get("app_name", ""),
+        "m_packageName": config.get("package", ""),
+        "m_textContentContains": config.get("text_contains", ""),
+        "m_titleContains": config.get("title_contains", ""),
+        "m_notificationPresent": config.get("present", True),
+        "disableLogging": config.get("disable_logging", False),
+        "m_SIGUID": generate_guid(),
+        "m_classType": "NotificationPresentConstraint",
+        "m_constraintList": [],
+        "m_isDisabled": config.get("disabled", False),
+        "m_isOrCondition": False
+    }
+
+
 # =============================================================================
 # VARIABLE BUILDER
 # =============================================================================

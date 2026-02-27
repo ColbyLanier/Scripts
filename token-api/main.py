@@ -377,6 +377,14 @@ class PhoneActivityResponse(BaseModel):
     message: Optional[str] = None
 
 
+class PhoneSystemEventRequest(BaseModel):
+    """Request from MacroDroid for phone system events (Shizuku, boot, heartbeat)."""
+    event: str  # "shizuku_died", "shizuku_restored", "device_boot", "heartbeat"
+    time: Optional[str] = None
+    server: Optional[str] = None  # heartbeat: server response code
+    shizuku_dead: Optional[str] = None  # heartbeat: current shizuku state
+
+
 # ============ Headless Mode Models ============
 
 class HeadlessStatusResponse(BaseModel):
@@ -2860,6 +2868,129 @@ PHONE_STATE = {
     "twitter_last_zap_at": 0,  # monotonic time of last twitter zap (30-min cooldown)
 }
 
+# Shizuku restart state
+SHIZUKU_STATE = {
+    "dead": False,
+    "last_death": None,  # ISO timestamp
+    "last_restart_attempt": None,  # ISO timestamp
+    "restart_count": 0,  # total restarts since server start
+    "consecutive_failures": 0,  # consecutive restart failures (resets on success)
+}
+
+# Phone Tailscale IP and wireless debugging port
+# Port must be updated manually when wireless debugging port changes
+SHIZUKU_CONFIG = {
+    "phone_tailscale_ip": PHONE_CONFIG["host"],  # 100.102.92.24
+    "wireless_debug_port": None,  # Set via /phone/shizuku/config or env
+    "start_script": "/storage/emulated/0/Android/data/moe.shizuku.privileged.api/start.sh",
+    "restart_cooldown_seconds": 60,  # min time between restart attempts
+    "max_consecutive_failures": 5,  # stop trying after N failures
+}
+
+
+async def attempt_shizuku_restart() -> dict:
+    """
+    Attempt to restart Shizuku on phone from Mac.
+
+    Flow:
+    1. SSH to phone → re-enable wireless debugging via settings command
+    2. Wait for ADB daemon to start
+    3. adb connect to phone via Tailscale IP
+    4. adb shell sh start.sh to start Shizuku
+
+    Requires:
+    - WRITE_SECURE_SETTINGS granted to com.termux (one-time via ADB)
+    - Wireless debugging port configured in SHIZUKU_CONFIG
+    """
+    now = datetime.now()
+
+    # Check cooldown
+    if SHIZUKU_STATE["last_restart_attempt"]:
+        last = datetime.fromisoformat(SHIZUKU_STATE["last_restart_attempt"])
+        elapsed = (now - last).total_seconds()
+        if elapsed < SHIZUKU_CONFIG["restart_cooldown_seconds"]:
+            return {"success": False, "reason": "cooldown", "wait_seconds": round(SHIZUKU_CONFIG["restart_cooldown_seconds"] - elapsed)}
+
+    # Check consecutive failures
+    if SHIZUKU_STATE["consecutive_failures"] >= SHIZUKU_CONFIG["max_consecutive_failures"]:
+        return {"success": False, "reason": "max_failures_reached", "failures": SHIZUKU_STATE["consecutive_failures"]}
+
+    port = SHIZUKU_CONFIG["wireless_debug_port"]
+    if not port:
+        return {"success": False, "reason": "no_wireless_debug_port", "hint": "Set via POST /phone/shizuku/config {\"port\": 12345}"}
+
+    ip = SHIZUKU_CONFIG["phone_tailscale_ip"]
+    start_script = SHIZUKU_CONFIG["start_script"]
+
+    SHIZUKU_STATE["last_restart_attempt"] = now.isoformat()
+    logger.info(f"Shizuku: attempting restart (attempt #{SHIZUKU_STATE['restart_count'] + 1})")
+
+    try:
+        # Step 1: Re-enable wireless debugging via SSH to Termux
+        logger.info("Shizuku: re-enabling wireless debugging via SSH")
+        proc = await asyncio.create_subprocess_exec(
+            "ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "phone",
+            "settings put global adb_wifi_enabled 1",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        if proc.returncode != 0:
+            err = stderr.decode().strip()
+            logger.warning(f"Shizuku: SSH settings command failed: {err}")
+            SHIZUKU_STATE["consecutive_failures"] += 1
+            return {"success": False, "reason": "ssh_settings_failed", "error": err}
+
+        # Step 2: Wait for ADB daemon to start
+        logger.info("Shizuku: waiting 3s for ADB daemon")
+        await asyncio.sleep(3)
+
+        # Step 3: Connect ADB over Tailscale
+        logger.info(f"Shizuku: adb connect {ip}:{port}")
+        proc = await asyncio.create_subprocess_exec(
+            "adb", "connect", f"{ip}:{port}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        adb_output = stdout.decode().strip()
+        if "connected" not in adb_output.lower() and "already" not in adb_output.lower():
+            logger.warning(f"Shizuku: adb connect failed: {adb_output}")
+            SHIZUKU_STATE["consecutive_failures"] += 1
+            return {"success": False, "reason": "adb_connect_failed", "output": adb_output}
+
+        # Step 4: Run Shizuku start script
+        logger.info(f"Shizuku: running start.sh")
+        proc = await asyncio.create_subprocess_exec(
+            "adb", "-s", f"{ip}:{port}", "shell",
+            "sh", start_script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        shell_output = stdout.decode().strip()
+        shell_err = stderr.decode().strip()
+
+        if proc.returncode != 0:
+            logger.warning(f"Shizuku: start.sh failed: {shell_err}")
+            SHIZUKU_STATE["consecutive_failures"] += 1
+            return {"success": False, "reason": "start_script_failed", "output": shell_output, "error": shell_err}
+
+        # Success
+        SHIZUKU_STATE["restart_count"] += 1
+        SHIZUKU_STATE["consecutive_failures"] = 0
+        logger.info(f"Shizuku: restart successful (total: {SHIZUKU_STATE['restart_count']})")
+        return {"success": True, "output": shell_output, "restart_count": SHIZUKU_STATE["restart_count"]}
+
+    except asyncio.TimeoutError:
+        SHIZUKU_STATE["consecutive_failures"] += 1
+        logger.warning("Shizuku: restart timed out")
+        return {"success": False, "reason": "timeout"}
+    except Exception as e:
+        SHIZUKU_STATE["consecutive_failures"] += 1
+        logger.warning(f"Shizuku: restart failed: {e}")
+        return {"success": False, "reason": "exception", "error": str(e)}
+
 # App categories for phone distraction detection
 PHONE_DISTRACTION_APPS = {
     # Twitter/X
@@ -4048,6 +4179,19 @@ async def handle_phone_activity(request: PhoneActivityRequest):
             message="App not in distraction list"
         )
 
+    # Phantom open guard: if Twitter was already zapped and we haven't received
+    # a confirmed close event, ignore all subsequent "open" events entirely.
+    # MacroDroid's app_launched trigger re-fires on notification banners, app
+    # switcher, etc. — these phantom opens were resetting current_app and
+    # restarting the 7-minute timer, causing repeat zaps.
+    if app_name in ("twitter", "x", "com.twitter.android") and PHONE_STATE.get("twitter_zapped"):
+        print(f"    Phantom Twitter open ignored (already zapped, awaiting confirmed close)")
+        return PhoneActivityResponse(
+            allowed=False,
+            reason="phantom_blocked",
+            message="Twitter already enforced, waiting for confirmed close"
+        )
+
     # Helper to sync timer activity layer for phone distraction
     def _sync_phone_timer():
         # If twitter was already zapped, don't let phantom opens change timer mode
@@ -4229,6 +4373,97 @@ async def manual_enforce_phone(app: str, action: str = "disable"):
     """Manually trigger phone enforcement (for testing)."""
     result = enforce_phone_app(app, action)
     return result
+
+
+@app.post("/phone/event")
+async def handle_phone_system_event(request: PhoneSystemEventRequest):
+    """
+    Handle phone system events from MacroDroid.
+
+    Events:
+    - shizuku_died: Shizuku service stopped. Triggers auto-restart from Mac.
+    - shizuku_restored: Shizuku came back. Resets restart state.
+    - device_boot: Phone rebooted.
+    - heartbeat: Periodic health check with server/shizuku status.
+    """
+    event = request.event
+    now = datetime.now().isoformat()
+
+    await log_event(f"phone_{event}", device_id="phone", details={
+        "time": request.time,
+        "server": request.server,
+        "shizuku_dead": request.shizuku_dead,
+    })
+
+    if event == "shizuku_died":
+        SHIZUKU_STATE["dead"] = True
+        SHIZUKU_STATE["last_death"] = now
+        logger.warning(f"Shizuku died at {request.time}")
+
+        # Attempt auto-restart in background
+        restart_result = await attempt_shizuku_restart()
+        return {"received": True, "event": event, "restart_attempt": restart_result}
+
+    elif event == "shizuku_restored":
+        SHIZUKU_STATE["dead"] = False
+        SHIZUKU_STATE["consecutive_failures"] = 0
+        logger.info(f"Shizuku restored at {request.time}")
+        return {"received": True, "event": event}
+
+    elif event == "device_boot":
+        SHIZUKU_STATE["dead"] = True  # Shizuku is dead after boot until manually started
+        logger.info(f"Phone booted at {request.time}")
+        return {"received": True, "event": event}
+
+    elif event == "heartbeat":
+        # Update reachability from heartbeat
+        PHONE_STATE["reachable"] = True
+        PHONE_STATE["last_reachable_check"] = now
+        if request.shizuku_dead:
+            SHIZUKU_STATE["dead"] = request.shizuku_dead.lower() == "true"
+        return {"received": True, "event": event, "shizuku_state": SHIZUKU_STATE}
+
+    return {"received": True, "event": event}
+
+
+@app.get("/phone/shizuku")
+async def get_shizuku_state():
+    """Get current Shizuku state and restart history."""
+    return {**SHIZUKU_STATE, "config": {
+        "port": SHIZUKU_CONFIG["wireless_debug_port"],
+        "cooldown": SHIZUKU_CONFIG["restart_cooldown_seconds"],
+        "max_failures": SHIZUKU_CONFIG["max_consecutive_failures"],
+    }}
+
+
+@app.post("/phone/shizuku/config")
+async def set_shizuku_config(port: int = None, cooldown: int = None):
+    """Configure Shizuku restart settings. Port is required for auto-restart."""
+    if port is not None:
+        SHIZUKU_CONFIG["wireless_debug_port"] = port
+        logger.info(f"Shizuku: wireless debug port set to {port}")
+    if cooldown is not None:
+        SHIZUKU_CONFIG["restart_cooldown_seconds"] = cooldown
+    return {"config": {
+        "port": SHIZUKU_CONFIG["wireless_debug_port"],
+        "cooldown": SHIZUKU_CONFIG["restart_cooldown_seconds"],
+    }}
+
+
+@app.post("/phone/shizuku/restart")
+async def manual_shizuku_restart():
+    """Manually trigger Shizuku restart from Mac."""
+    result = await attempt_shizuku_restart()
+    await log_event("shizuku_manual_restart", device_id="phone", details=result)
+    return result
+
+
+@app.post("/phone/shizuku/reset")
+async def reset_shizuku_state():
+    """Reset Shizuku failure counters (e.g., after fixing the underlying issue)."""
+    SHIZUKU_STATE["consecutive_failures"] = 0
+    SHIZUKU_STATE["dead"] = False
+    return {"reset": True, "state": SHIZUKU_STATE}
 
 
 @app.post("/api/timer/break-exhausted")

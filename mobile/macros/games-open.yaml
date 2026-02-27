@@ -59,7 +59,7 @@ actions:
 
   # Force run local management for this app
   - type: run_macro
-    macro_name: "Thronefall Management"
+    macro_name: "Games Management"
 
   # Enable all local fallbacks for future events
   - type: run_macro
