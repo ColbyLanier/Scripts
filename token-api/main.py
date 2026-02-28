@@ -447,6 +447,22 @@ class PreToolUseResponse(BaseModel):
     permissionDecisionReason: Optional[str] = None
 
 
+class DiscordMessageRequest(BaseModel):
+    """Forwarded Discord message from the discord-cli daemon."""
+    message_id: Optional[str] = None
+    channel_id: str
+    channel_name: Optional[str] = None
+    guild_id: Optional[str] = None
+    author: Optional[dict] = None
+    content: str
+    timestamp: Optional[str] = None
+    is_dm: bool = False
+    is_reply: bool = False
+    reply_to_message_id: Optional[str] = None
+    attachments: Optional[list] = None
+    embeds: Optional[int] = 0
+
+
 # ============ Hook Handler State ============
 # Debouncing for PostToolUse to avoid excessive API calls
 _post_tool_debounce: dict = {}  # session_id -> last_call_time
@@ -8037,6 +8053,32 @@ async def stash_clear_all():
             f.unlink()
             removed += 1
     return {"status": "cleared", "removed": removed}
+
+
+# ============ Discord Endpoints ============
+
+
+@app.post("/api/discord/message")
+async def receive_discord_message(request: DiscordMessageRequest):
+    """Receive a forwarded Discord message from the discord-cli daemon."""
+    author_name = request.author.get("username", "unknown") if request.author else "unknown"
+    author_id = request.author.get("id") if request.author else None
+
+    await log_event("discord_message", device_id="discord", details={
+        "channel_id": request.channel_id,
+        "channel_name": request.channel_name,
+        "author_id": author_id,
+        "author_name": author_name,
+        "content": request.content[:500],
+        "message_id": request.message_id,
+        "timestamp": request.timestamp,
+        "is_dm": request.is_dm,
+        "is_reply": request.is_reply,
+    })
+
+    logger.info(f"Discord [{request.channel_name or request.channel_id}] {author_name}: {request.content[:80]}")
+
+    return {"received": True, "message_id": request.message_id}
 
 
 if __name__ == "__main__":
