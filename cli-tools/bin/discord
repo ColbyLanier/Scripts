@@ -25,6 +25,7 @@
 #   discord read alerts --since "1h ago"
 #   discord react operations 1234567890123456789 ✅
 #   discord ask approvals --question "Proceed?" --options "Yes" "No" --timeout 1h
+#   discord ask approvals --question "Deploy now?" --react --timeout 30m
 #   discord subscribe general claw-chat
 #   echo "multi-line" | discord send tasks
 
@@ -151,10 +152,11 @@ cmd_react() {
 cmd_ask() {
   local channel="${1:-}"
   shift || true
-  [[ -z "$channel" ]] && die "Usage: discord ask <channel> --question <text> [--options ...] [--title <t>] [--timeout <dur>]"
+  [[ -z "$channel" ]] && die "Usage: discord ask <channel> --question <text> [--options ...] [--title <t>] [--timeout <dur>] [--react [emoji...]]"
 
-  local question="" title="" context_text="" blocking="" timeout_str="24h"
+  local question="" title="" context_text="" blocking="" timeout_str="24h" react_mode=false
   local -a options=()
+  local -a react_emojis=()
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -163,6 +165,15 @@ cmd_ask() {
       --context)  context_text="$2"; shift 2 ;;
       --blocking) blocking="$2"; shift 2 ;;
       --timeout)  timeout_str="$2"; shift 2 ;;
+      --react)
+        react_mode=true
+        shift
+        # Consume optional emoji arguments (anything not starting with --)
+        while [[ $# -gt 0 && ! "$1" =~ ^-- ]]; do
+          react_emojis+=("$1")
+          shift
+        done
+        ;;
       --options)
         shift
         while [[ $# -gt 0 && ! "$1" =~ ^-- ]]; do
@@ -176,6 +187,11 @@ cmd_ask() {
 
   [[ -z "$question" ]] && die "--question is required"
 
+  # Default react emojis if none specified
+  if $react_mode && [[ ${#react_emojis[@]} -eq 0 ]]; then
+    react_emojis=("✅" "❌")
+  fi
+
   # Build formatted message
   local msg=""
   [[ -n "$title" ]] && msg+="**$title**\n"
@@ -183,7 +199,12 @@ cmd_ask() {
   [[ -n "$context_text" ]] && msg+="> $context_text\n"
   msg+="\n**Question:** $question\n"
 
-  if [[ ${#options[@]} -gt 0 ]]; then
+  if $react_mode; then
+    msg+="\n_React to respond:_ "
+    for emoji in "${react_emojis[@]}"; do
+      msg+="$emoji  "
+    done
+  elif [[ ${#options[@]} -gt 0 ]]; then
     msg+="\n"
     local i=0
     local letters=(A B C D E F G H)
@@ -211,6 +232,16 @@ cmd_ask() {
   message_id=$(echo "$send_result" | jq -r '.message_id')
 
   [[ -z "$message_id" || "$message_id" == "null" ]] && die "Failed to send question"
+
+  # Pre-populate reactions so operator can click them
+  if $react_mode; then
+    for emoji in "${react_emojis[@]}"; do
+      local react_data
+      react_data=$(jq -n --arg ch "$channel" --arg mid "$message_id" --arg e "$emoji" \
+        '{channel: $ch, message_id: $mid, emoji: $e}')
+      post "/react" "$react_data" >/dev/null 2>&1
+    done
+  fi
 
   echo "Waiting for reply (timeout: $timeout_str)..." >&2
 
