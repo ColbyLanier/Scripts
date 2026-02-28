@@ -1,25 +1,23 @@
 [
   {
     "name": "fabricator-general",
-    "description": "Fleet orchestrator for Mechanicus swarm. Reads state, detects stuck jobs, triggers most urgent idle worker.",
+    "description": "Fleet orchestrator for Mechanicus swarm. Reads state, detects stuck jobs, triggers most urgent idle worker. Runs 24/7 — night is prime time.",
     "enabled": true,
     "schedule": { "type": "cron", "value": "0 * * * *", "tz": "America/Phoenix" },
     "command": "claude --model claude-sonnet-4-6 -p \"$(cat ~/.openclaw/workspace/memory/prompts/fabricator-general.md)\" --dangerously-skip-permissions",
     "timeout_seconds": 180,
-    "quiet_hours": [23, 7],
-    "max_runs_per_window": 5,
+    "max_runs_per_window": 8,
     "run_window_hours": 5,
     "session_type": "isolated"
   },
   {
     "name": "mechanicus-vault",
-    "description": "Claw-ENV vault domain worker. MOCs, notes, wikilinks, Codices expansion.",
+    "description": "Claw-ENV vault domain worker. MOCs, notes, wikilinks, Codices expansion. Fallback domain when others run dry.",
     "enabled": true,
     "schedule": { "type": "cron", "value": "0 */8 * * *", "tz": "America/Phoenix" },
     "command": "claude --model claude-sonnet-4-6 -p \"$(cat ~/.openclaw/workspace/memory/prompts/mechanicus-vault.md)\" --dangerously-skip-permissions",
     "timeout_seconds": 600,
-    "quiet_hours": [23, 7],
-    "max_runs_per_window": 2,
+    "max_runs_per_window": 4,
     "run_window_hours": 12,
     "session_type": "isolated"
   },
@@ -30,8 +28,7 @@
     "schedule": { "type": "cron", "value": "0 */8 * * *", "tz": "America/Phoenix" },
     "command": "claude --model claude-sonnet-4-6 -p \"$(cat ~/.openclaw/workspace/memory/prompts/mechanicus-token-api.md)\" --dangerously-skip-permissions",
     "timeout_seconds": 600,
-    "quiet_hours": [23, 7],
-    "max_runs_per_window": 2,
+    "max_runs_per_window": 3,
     "run_window_hours": 12,
     "session_type": "isolated"
   },
@@ -42,8 +39,7 @@
     "schedule": { "type": "cron", "value": "0 */8 * * *", "tz": "America/Phoenix" },
     "command": "claude --model claude-sonnet-4-6 -p \"$(cat ~/.openclaw/workspace/memory/prompts/mechanicus-cli-tools.md)\" --dangerously-skip-permissions",
     "timeout_seconds": 600,
-    "quiet_hours": [23, 7],
-    "max_runs_per_window": 2,
+    "max_runs_per_window": 3,
     "run_window_hours": 12,
     "session_type": "isolated"
   },
@@ -54,8 +50,7 @@
     "schedule": { "type": "cron", "value": "0 */12 * * *", "tz": "America/Phoenix" },
     "command": "claude --model claude-sonnet-4-6 -p \"$(cat ~/.openclaw/workspace/memory/prompts/mechanicus-discord.md)\" --dangerously-skip-permissions",
     "timeout_seconds": 600,
-    "quiet_hours": [23, 7],
-    "max_runs_per_window": 1,
+    "max_runs_per_window": 2,
     "run_window_hours": 12,
     "session_type": "isolated"
   },
