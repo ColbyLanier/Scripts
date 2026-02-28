@@ -36,6 +36,7 @@ from pydantic import BaseModel, Field
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
+from cron_engine import CronEngine
 from timer import (
     TimerEngine, TimerMode, TimerEvent, Activity,
     format_timer_time, IDLE_TO_BREAK_TIMEOUT_MS, DEFAULT_BREAK_BUFFER_MS,
@@ -184,6 +185,9 @@ ULTIMATE_FALLBACK = {"name": "fallback_david", "wsl_voice": "Microsoft David", "
 
 # Scheduler instance
 scheduler = AsyncIOScheduler()
+
+# Cron engine (initialized after DB in lifespan)
+cron_engine: CronEngine = None
 
 
 # Pydantic Models
@@ -742,6 +746,9 @@ async def init_db():
                 VALUES (?, ?, ?, 'cron', ?, 0)
             """, (task_id, name, desc, schedule))
 
+        # Cron engine tables
+        await CronEngine.init_tables(db)
+
         await db.commit()
         print(f"Database initialized at {DB_PATH}")
 
@@ -1169,6 +1176,11 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(timer_9am_reset, CronTrigger(hour=7, minute=0), id="timer_7am_reset", replace_existing=True)
     scheduler.start()
     print("Scheduler started")
+    # Initialize cron engine
+    global cron_engine
+    cron_engine = CronEngine(scheduler, DB_PATH)
+    await cron_engine.load_from_config()
+    print("Cron engine loaded")
     # Start TTS queue worker
     tts_worker_task = asyncio.create_task(tts_queue_worker())
     print("TTS queue worker started")
@@ -5780,53 +5792,80 @@ async def get_task_history(task_id: str, limit: int = 20):
 
 
 # ============ Cron & Heartbeat Endpoints ============
-# Expose Mac-local data (openclaw cron, log files) for remote TUI access
+# Local cron engine (replaced OpenClaw proxy) + heartbeat log access
 
 OPENCLAW_WORKSPACE = Path.home() / ".openclaw" / "workspace"
 HEARTBEAT_LOG_PATH = OPENCLAW_WORKSPACE / "memory" / "heartbeat_log.md"
 WATCHDOG_LOG_PATH = OPENCLAW_WORKSPACE / "memory" / "watchdog_log.md"
 HEARTBEAT_STATE_PATH = OPENCLAW_WORKSPACE / "memory" / "heartbeat-state.json"
-CRON_RUNS_DIR = Path.home() / ".openclaw" / "cron" / "runs"
 HEARTBEAT_INTERVAL_SECONDS = 15 * 60  # 15 minutes
 
 
 @app.get("/api/cron/jobs")
 async def list_cron_jobs():
-    """List openclaw cron jobs (wraps `openclaw cron list --json`)."""
-    try:
-        result = subprocess.run(
-            ["openclaw", "cron", "list", "--json"],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0:
-            parsed = json.loads(result.stdout)
-            if isinstance(parsed, list):
-                return {"jobs": parsed}
-            elif isinstance(parsed, dict) and isinstance(parsed.get("jobs"), list):
-                return parsed
-            return {"jobs": []}
-        return {"jobs": []}
-    except Exception:
-        return {"jobs": []}
+    """List all cron jobs from local engine."""
+    jobs = await cron_engine.get_jobs()
+    return {"jobs": jobs}
+
+
+@app.get("/api/cron/jobs/{job_id}")
+async def get_cron_job(job_id: str):
+    """Get a single cron job."""
+    job = await cron_engine.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+@app.post("/api/cron/jobs")
+async def create_cron_job(request: Request):
+    """Create a new cron job."""
+    data = await request.json()
+    if "name" not in data or "command" not in data or "schedule" not in data:
+        raise HTTPException(status_code=400, detail="name, command, and schedule are required")
+    job = await cron_engine.create_job(data)
+    return job
+
+
+@app.patch("/api/cron/jobs/{job_id}")
+async def update_cron_job(job_id: str, request: Request):
+    """Update a cron job (enable/disable, schedule, command, etc.)."""
+    data = await request.json()
+    job = await cron_engine.update_job(job_id, data)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+@app.delete("/api/cron/jobs/{job_id}")
+async def delete_cron_job(job_id: str):
+    """Delete a cron job and its run history."""
+    deleted = await cron_engine.delete_job(job_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"deleted": True}
+
+
+@app.post("/api/cron/jobs/{job_id}/trigger")
+async def trigger_cron_job(job_id: str):
+    """Manually trigger a cron job."""
+    result = await cron_engine.trigger_job(job_id)
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
 
 
 @app.get("/api/cron/jobs/{job_id}/runs")
-async def get_cron_job_runs(job_id: str, limit: int = 5):
-    """Get recent run history for a cron job from its JSONL log."""
-    run_file = CRON_RUNS_DIR / f"{job_id}.jsonl"
-    if not run_file.exists():
-        return {"runs": []}
-    try:
-        entries = []
-        for line in run_file.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            entries.append(json.loads(line))
-        # Most recent first, take last N
-        return {"runs": entries[-limit:][::-1]}
-    except Exception:
-        return {"runs": []}
+async def get_cron_job_runs(job_id: str, limit: int = 20):
+    """Get recent run history for a cron job."""
+    runs = await cron_engine.get_runs(job_id, limit=limit)
+    return {"runs": runs}
+
+
+@app.get("/api/cron/status")
+async def get_cron_status():
+    """Overall cron engine status."""
+    return await cron_engine.get_status()
 
 
 def _parse_heartbeat_entries(max_entries: int = 20) -> list:

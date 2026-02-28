@@ -1,0 +1,33 @@
+[
+  {
+    "name": "interrogative-butler",
+    "description": "Butler-style persistent conversation, tracks work, posts to #interrogative",
+    "enabled": false,
+    "schedule": { "type": "cron", "value": "0 8-22/2 * * *", "tz": "America/Phoenix" },
+    "command": "claude -p 'You are the interrogative butler. Check in on current work status, review recent activity via Token API telemetry, and post a brief update to Discord #interrogative.' --session resume --session-id butler",
+    "timeout_seconds": 120,
+    "quiet_hours": [22, 8],
+    "max_runs_per_window": 12,
+    "session_type": "resume"
+  },
+  {
+    "name": "morning-checkin",
+    "description": "Weekday morning check-in prompt",
+    "enabled": false,
+    "schedule": { "type": "cron", "value": "35 8 * * 1-5", "tz": "America/Phoenix" },
+    "command": "claude -p 'Good morning. Run the morning check-in: review overnight activity, check task list status, and prepare a brief morning briefing.' --session isolated",
+    "timeout_seconds": 60,
+    "session_type": "isolated"
+  },
+  {
+    "name": "security-monitor",
+    "description": "Health checks: gateway, Token API, Tailscale, caffeinate",
+    "enabled": false,
+    "schedule": { "type": "cron", "value": "0 */2 * * *", "tz": "America/Phoenix" },
+    "command": "claude -p 'Run health checks: curl localhost:7777/health, tailscale status, pgrep caffeinate. Log results to memory/logs/security_log.md.' --session isolated",
+    "timeout_seconds": 60,
+    "quiet_hours": [23, 7],
+    "max_runs_per_window": 6,
+    "session_type": "isolated"
+  }
+]
