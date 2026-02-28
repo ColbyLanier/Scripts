@@ -1,33 +1,38 @@
 [
   {
-    "name": "interrogative-butler",
-    "description": "Butler-style persistent conversation, tracks work, posts to #interrogative",
-    "enabled": false,
-    "schedule": { "type": "cron", "value": "0 8-22/2 * * *", "tz": "America/Phoenix" },
-    "command": "claude -p 'You are the interrogative butler. Check in on current work status, review recent activity via Token API telemetry, and post a brief update to Discord #interrogative.' --dangerously-skip-permissions -r butler",
-    "timeout_seconds": 120,
-    "quiet_hours": [22, 8],
-    "max_runs_per_window": 12,
-    "session_type": "resume"
-  },
-  {
-    "name": "morning-checkin",
-    "description": "Weekday morning check-in prompt",
-    "enabled": false,
-    "schedule": { "type": "cron", "value": "35 8 * * 1-5", "tz": "America/Phoenix" },
-    "command": "claude -p 'Good morning. Run the morning check-in: review overnight activity, check task list status, and prepare a brief morning briefing.' --dangerously-skip-permissions",
-    "timeout_seconds": 60,
+    "name": "adeptus-mechanicus",
+    "description": "Autonomous dev environment improvement agent. Rotates through 4 domains: Cron Engine, Claw-ENV vault, CLI tools, Shell/automation.",
+    "enabled": true,
+    "schedule": { "type": "cron", "value": "0 */3 * * *", "tz": "America/Phoenix" },
+    "command": "claude --model claude-sonnet-4-6 -p \"$(cat ~/.openclaw/workspace/memory/prompts/mechanicus.md)\" --dangerously-skip-permissions",
+    "timeout_seconds": 600,
+    "quiet_hours": [23, 7],
+    "max_runs_per_window": 3,
+    "run_window_hours": 12,
     "session_type": "isolated"
   },
   {
+    "name": "interrogative-butler",
+    "description": "Morning briefing: reads overnight logs, posts to #interrogative, asks one question.",
+    "enabled": true,
+    "schedule": { "type": "cron", "value": "35 8 * * *", "tz": "America/Phoenix" },
+    "command": "claude --model claude-sonnet-4-6 -p 'You are the interrogative butler. It is morning. Read ~/.openclaw/workspace/memory/logs/mechanicus_log.md and ~/.openclaw/workspace/memory/logs/security_log.md. Summarize what happened overnight in 3-5 bullet points. Post to Discord #interrogative (channel 1474963429902258176) via: openclaw message send --channel discord --target 1474963429902258176 --message \"...\". Then ask me one question about what I want to focus on today.' --dangerously-skip-permissions -r butler",
+    "timeout_seconds": 120,
+    "quiet_hours": [21, 8],
+    "max_runs_per_window": 3,
+    "run_window_hours": 12,
+    "session_type": "resume"
+  },
+  {
     "name": "security-monitor",
-    "description": "Health checks: gateway, Token API, Tailscale, caffeinate",
-    "enabled": false,
+    "description": "Health checks: Token API, Tailscale, caffeinate. Logs to security_log.md.",
+    "enabled": true,
     "schedule": { "type": "cron", "value": "0 */2 * * *", "tz": "America/Phoenix" },
-    "command": "claude -p 'Run health checks: curl localhost:7777/health, tailscale status, pgrep caffeinate. Log results to memory/logs/security_log.md.' --dangerously-skip-permissions",
+    "command": "claude --model claude-haiku-4-5-20251001 -p 'Run health checks and log results. Commands to run: (1) curl -s localhost:7777/health (2) tailscale status 2>&1 | head -3 (3) pgrep caffeinate && echo caffeinate:running || echo caffeinate:not_found. Append a single timestamped line to ~/.openclaw/workspace/memory/logs/security_log.md with format: TIMESTAMP | token_api:STATUS | tailscale:STATUS | caffeinate:STATUS' --dangerously-skip-permissions",
     "timeout_seconds": 60,
     "quiet_hours": [23, 7],
     "max_runs_per_window": 6,
+    "run_window_hours": 5,
     "session_type": "isolated"
   }
 ]
