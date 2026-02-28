@@ -441,6 +441,14 @@ class TestRunWrapper:
         runs = run(engine.get_runs(created["id"]))
         assert runs[0]["skip_reason"] == "test_reason"
 
+    def test_skip_if_disabled(self, engine):
+        """Disabled job must be skipped by _run_wrapper, even on manual trigger."""
+        created = run(engine.create_job(create_job_dict(name="guard-disabled", enabled=False)))
+        run(engine._run_wrapper(created["id"]))
+        runs = run(engine.get_runs(created["id"]))
+        assert runs[0]["status"] == "skipped"
+        assert runs[0]["skip_reason"] == "disabled"
+
 
 # ── Unit Tests: Config Loading ────────────────────────────────
 

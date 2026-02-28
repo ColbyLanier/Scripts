@@ -246,6 +246,11 @@ class CronEngine:
                 return
             job = dict(job)
 
+        # Guard: disabled
+        if not job.get("enabled"):
+            await self._log_skip(job_id, "disabled")
+            return
+
         # Guard: already running
         if job_id in self._running_jobs:
             await self._log_skip(job_id, "already_running")
