@@ -2142,6 +2142,33 @@ def _line_graph(values: list, width: int = 42, height: int = 3,
                 for r in span[1:-1]:
                     slope_overrides[(r, col)] = "│"
 
+    # Post-pass: bridge vertical gaps between adjacent slope columns with pipes.
+    # When consecutive columns both have slopes (e.g. a steep multi-column drop),
+    # fill the row gap between them so the edge looks continuous.
+    slope_by_col = {}
+    for (r, c), ch in slope_overrides.items():
+        slope_by_col.setdefault(c, set()).add(r)
+    for col in sorted(slope_by_col):
+        next_col = col + 1
+        if next_col not in slope_by_col:
+            continue
+        left_rows = slope_by_col[col]
+        right_rows = slope_by_col[next_col]
+        left_min, left_max = min(left_rows), max(left_rows)
+        right_min, right_max = min(right_rows), max(right_rows)
+        # Gap below left slopes, above right slopes (falling right)
+        if left_max < right_min - 1:
+            for r in range(left_max + 1, right_min):
+                if (r, next_col) not in slope_overrides:
+                    slope_overrides[(r, next_col)] = "│"
+                    slope_by_col[next_col].add(r)
+        # Gap below right slopes, above left slopes (rising right)
+        elif right_max < left_min - 1:
+            for r in range(right_max + 1, left_min):
+                if (r, col) not in slope_overrides:
+                    slope_overrides[(r, col)] = "│"
+                    slope_by_col[col].add(r)
+
     # Build Text rows with per-column styling
     rows = []
     for row_idx, row in enumerate(grid):
