@@ -2030,10 +2030,10 @@ def _line_graph(values: list, width: int = 42, height: int = 3,
         "work_gaming":     "#301414",
         "break":           "#301414",   # red
         "break_exhausted": "#301414",   # red
-        "idle":            "#000000",   # black
+        "idle":            "#4F4F4F",   # dark gray
         "multitasking":    "#141430",   # indigo
         "distracted":      "#301414",   # red
-        "sleeping":        "#000000",   # black
+        "sleeping":        "#4F4F4F",   # dark gray
     }
 
     # Braille dot bit positions: (col, row) -> bit
@@ -2107,7 +2107,6 @@ def _line_graph(values: list, width: int = 42, height: int = 3,
     # Slash until proven otherwise: if a slash fits, it should be present.
     slope_overrides = {}
     SLOPE_THRESHOLD = 8  # 2 cell heights — gentler slopes stay as braille
-    # (no max cap — pipes fill middle rows cleanly)
     for col in range(width):
         x0 = col * 2
         x1 = col * 2 + 1
