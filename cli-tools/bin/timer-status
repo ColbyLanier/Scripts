@@ -6,6 +6,7 @@
 
 Usage:
     timer-status              # One-line status
+    timer-status --layers     # One-line status + layer breakdown
     timer-status --watch      # Continuous monitoring (1s refresh)
     timer-status --json       # Raw JSON from API
 """
@@ -17,15 +18,14 @@ import urllib.request
 
 API_URL = "http://localhost:7777"
 
+# v2 effective modes (lowercase from API)
 MODE_ICONS = {
-    "work_silence": "\U0001f507",  # 🔇
-    "work_music": "\U0001f3b5",    # 🎵
-    "work_video": "\U0001f4fa",    # 📺
-    "work_gaming": "\U0001f3ae",   # 🎮
-    "work_gym": "\U0001f3cb",      # 🏋
-    "gym": "\U0001f3cb",           # 🏋
-    "break": "\u2615",             # ☕
-    "pause": "\u23f8",             # ⏸
+    "working":      "\U0001f4bc",   # 💼
+    "multitasking": "\u26a1",       # ⚡
+    "idle":         "\u23f8",       # ⏸
+    "distracted":   "\u26a0\ufe0f", # ⚠️
+    "break":        "\u2615",       # ☕
+    "sleeping":     "\U0001f319",   # 🌙
 }
 
 
@@ -62,10 +62,10 @@ def color(text, code):
     return f"\033[{code}m{text}\033[0m"
 
 
-def display(data):
-    mode = data["current_mode"]
-    icon = MODE_ICONS.get(mode, "?")
-    mode_name = mode.replace("work_", "").title()
+def display(data, show_layers=False):
+    mode = (data.get("current_mode") or "").lower()
+    icon = MODE_ICONS.get(mode, "\u2753")  # ❓ fallback
+    mode_name = mode.replace("_", " ").title() if mode else "?"
 
     break_s = data.get("accumulated_break_seconds", 0)
     break_str = fmt_time(break_s)
@@ -79,18 +79,30 @@ def display(data):
     else:
         break_colored = color(break_str, "31")  # red
 
+    # Layer context: desktop_mode or phone_app label
+    activity_detail = ""
+    desktop_mode = data.get("desktop_mode")
+    phone_app = data.get("phone_app")
+    if desktop_mode and desktop_mode not in ("silence", "working"):
+        activity_detail = color(f"  [{desktop_mode}]", "36")
+    elif phone_app:
+        activity_detail = color(f"  [phone:{phone_app}]", "36")
+
+    # Manual mode / lock indicator
+    lock = ""
+    manual = data.get("manual_mode")
+    if manual:
+        lock = color(f"  [{manual}]", "33")
+    elif data.get("manual_mode_lock"):
+        lock = color("  [locked]", "33")
+
     # Backlog indicator
     backlog = ""
     if data.get("is_in_backlog"):
         bl_s = round(data.get("break_backlog_ms", 0) / 1000)
         backlog = color(f"  Backlog: {fmt_time(bl_s)}", "31")
 
-    # Lock indicator
-    lock = ""
-    if data.get("manual_mode_lock"):
-        lock = color("  [locked]", "33")
-
-    # Work mode
+    # Work mode (clocked out / gym)
     wm = data.get("work_mode", "clocked_in")
     wm_str = ""
     if wm == "clocked_out":
@@ -98,7 +110,15 @@ def display(data):
     elif wm == "gym":
         wm_str = color("  GYM", "35")
 
-    print(f"{icon}  {mode_name}  Break: {break_colored}  Work: {work_str}{backlog}{lock}{wm_str}")
+    print(f"{icon}  {mode_name}  Break: {break_colored}  Work: {work_str}{activity_detail}{lock}{backlog}{wm_str}")
+
+    if show_layers:
+        activity = data.get("activity", "?")
+        prod_active = data.get("productivity_active", False)
+        prod_str = color("active", "32") if prod_active else color("inactive", "90")
+        manual_str = manual if manual else color("—", "90")
+        dm_str = desktop_mode or color("—", "90")
+        print(f"  Activity: {activity}  Desktop: {dm_str}  Productivity: {prod_str}  Manual: {manual_str}")
 
 
 def main():
@@ -117,13 +137,15 @@ def main():
             sys.exit(1)
         return
 
+    show_layers = "--layers" in args
+
     if "--watch" in args:
         try:
             while True:
                 print("\033[2J\033[H", end="")  # clear screen
                 data = get_timer()
                 if data:
-                    display(data)
+                    display(data, show_layers=show_layers)
                 else:
                     print(color("Server unreachable", "31"))
                 time.sleep(1)
@@ -133,7 +155,7 @@ def main():
 
     data = get_timer()
     if data:
-        display(data)
+        display(data, show_layers=show_layers)
     else:
         print(color("Server unreachable", "31"), file=sys.stderr)
         sys.exit(1)
