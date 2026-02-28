@@ -7,6 +7,7 @@
 Usage:
     timer-status              # One-line status
     timer-status --layers     # One-line status + layer breakdown
+    timer-status --shifts     # One-line status + session mode distribution
     timer-status --watch      # Continuous monitoring (1s refresh)
     timer-status --json       # Raw JSON from API
 """
@@ -38,6 +39,15 @@ def get_timer():
         return None
 
 
+def get_shifts():
+    try:
+        req = urllib.request.Request(f"{API_URL}/api/timer/shifts", method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
 def fmt_time(seconds):
     """Format seconds as HH:MM:SS or MM:SS."""
     if seconds <= 0:
@@ -48,6 +58,15 @@ def fmt_time(seconds):
     if h > 0:
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
+
+
+def fmt_seconds_hm(seconds):
+    """Format seconds as Xh Ym."""
+    h = int(seconds) // 3600
+    m = (int(seconds) % 3600) // 60
+    if h > 0:
+        return f"{h}h {m:02d}m"
+    return f"{m}m"
 
 
 def fmt_ms_hm(ms):
@@ -121,6 +140,56 @@ def display(data, show_layers=False):
         print(f"  Activity: {activity}  Desktop: {dm_str}  Productivity: {prod_str}  Manual: {manual_str}")
 
 
+def display_shifts(shifts):
+    """Print a compact session mode-distribution summary."""
+    dist = shifts.get("mode_distribution", {})
+    total_s = sum(dist.values()) or 1
+
+    # Mode order: productive → neutral → negative
+    mode_order = ["working", "multitasking", "idle", "break", "distracted", "sleeping"]
+    mode_colors = {
+        "working":      "32",  # green
+        "multitasking": "33",  # yellow
+        "idle":         "90",  # dim
+        "break":        "36",  # cyan
+        "distracted":   "31",  # red
+        "sleeping":     "34",  # blue
+    }
+
+    parts = []
+    for m in mode_order:
+        s = dist.get(m, 0)
+        if s == 0:
+            continue
+        pct = 100.0 * s / total_s
+        icon = MODE_ICONS.get(m, "?")
+        label = fmt_seconds_hm(s)
+        col = mode_colors.get(m, "37")
+        parts.append(f"{icon} {color(label, col)} ({pct:.0f}%)")
+
+    print("  " + "  ".join(parts))
+
+    # Trigger / enforcement row
+    triggers = shifts.get("shifts_by_trigger", {})
+    enforced = shifts.get("enforcement_count", 0)
+    twitter = shifts.get("twitter_shifts", 0)
+    total_shifts = shifts.get("total_shifts", 0)
+
+    trig_parts = []
+    for k, v in sorted(triggers.items(), key=lambda x: -x[1]):
+        if v > 0:
+            trig_parts.append(f"{k}:{v}")
+
+    trig_str = "  ".join(trig_parts) if trig_parts else "—"
+    enforced_str = color(str(enforced), "31") if enforced > 0 else "0"
+    twitter_str = color(str(twitter), "31") if twitter > 20 else str(twitter)
+
+    print(f"  {color(str(total_shifts) + ' shifts', '90')}  " +
+          color(f"Enforced:{enforced}  ", "31" if enforced > 50 else "37") +
+          color(f"Twitter:{twitter}  ", "31" if twitter > 20 else "37") +
+          color(f"[{trig_str}]", "90"))
+
+
 def main():
     args = sys.argv[1:]
 
@@ -138,6 +207,7 @@ def main():
         return
 
     show_layers = "--layers" in args
+    show_shifts = "--shifts" in args
 
     if "--watch" in args:
         try:
@@ -146,6 +216,10 @@ def main():
                 data = get_timer()
                 if data:
                     display(data, show_layers=show_layers)
+                    if show_shifts:
+                        shifts = get_shifts()
+                        if shifts:
+                            display_shifts(shifts)
                 else:
                     print(color("Server unreachable", "31"))
                 time.sleep(1)
@@ -156,6 +230,12 @@ def main():
     data = get_timer()
     if data:
         display(data, show_layers=show_layers)
+        if show_shifts:
+            shifts = get_shifts()
+            if shifts:
+                display_shifts(shifts)
+            else:
+                print(color("  (shifts unavailable)", "90"), file=sys.stderr)
     else:
         print(color("Server unreachable", "31"), file=sys.stderr)
         sys.exit(1)
