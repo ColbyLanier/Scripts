@@ -2019,18 +2019,19 @@ def _line_graph(values: list, width: int = 42, height: int = 3,
     if not values:
         return []
 
-    # Mode → background color mapping (very dark, muted tints)
+    # Mode → background color mapping
+    # Working=dark blue, Multi=dark green, Idle=dark orange, Break=dark red
     MODE_BG = {
-        "working": "#1a1a1a",
-        "work_silence": "#1a1a1a",
-        "work_music": "#152025",
-        "work_video": "#252015",
-        "work_scrolling": "#201520",
-        "work_gaming": "#251515",
-        "break": "#151525",
-        "idle": "#141414",
-        "multitasking": "#252015",
-        "distracted": "#251515",
+        "working": "#0a1428",
+        "work_silence": "#0a1428",
+        "work_music": "#0a1428",
+        "work_video": "#0a2814",
+        "work_scrolling": "#281414",
+        "work_gaming": "#281414",
+        "break": "#280a0a",
+        "idle": "#28200a",
+        "multitasking": "#0a2814",
+        "distracted": "#280a0a",
         "sleeping": "#101010",
     }
 
@@ -2101,10 +2102,10 @@ def _line_graph(values: list, width: int = 42, height: int = 3,
                 grid[zero_char_row][c] |= DOT_BITS[(0, zero_dot_row)]
                 grid[zero_char_row][c] |= DOT_BITS[(1, zero_dot_row)]
 
-    # Detect dramatic slopes — mark columns with steep transitions
-    # slope_overrides: dict of (row, col) -> char for steep sections
+    # Detect slopes — use ╱╲ wherever the vertical gap exceeds one cell height (4 dots).
+    # Slash until proven otherwise: if a slash fits, it should be present.
     slope_overrides = {}
-    SLOPE_THRESHOLD = max(6, v_res // 3)  # ~33% of graph height = dramatic
+    SLOPE_THRESHOLD = 4  # one braille cell height — if gap > this, use slash
     for col in range(width):
         x0 = col * 2
         x1 = col * 2 + 1
