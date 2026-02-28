@@ -2215,24 +2215,38 @@ def create_timer_stats_panel(max_lines: int = 10) -> Panel:
             content.append_text(Text.from_markup("[dim]No timer shifts recorded today[/dim]"))
         return Panel(content, title="Timer Stats", border_style="magenta")
 
+    # Trim context for compact viewports (Activity + Prod only)
+    if layout_mode in ("mobile", "compact"):
+        lines = lines[:2]
+
     lines.append("")  # spacer
 
     # Determine available content width for graph
-    # The label prefix " Brk 92m " takes ~10 chars, panel border+padding takes 4
+    # Label prefix takes LABEL_PAD chars + 1 trailing space = 11 total
     LABEL_PAD = 10
+    LABEL_TOTAL = LABEL_PAD + 1  # includes trailing space after label
     PANEL_CHROME = 4  # 2 border + 2 padding
     try:
         con_width = console.width if console else 80
     except Exception:
         con_width = 80
-    # In full mode, sidebar is Layout ratio=2 out of (3+2)
-    # The Layout allocates floor(width * 2/5) minus its own overhead
+
     if layout_mode == "full":
-        sidebar_width = (con_width * 2) // 5 - 1  # -1 for Layout column gap
-        graph_width = max(10, sidebar_width - PANEL_CHROME - LABEL_PAD)
+        # Sidebar: ratio=2 of split_row(3, 2); Layout rounds down with 1-char gap
+        sidebar_width = (con_width * 2) // 5 - 1
+        graph_width = max(10, sidebar_width - PANEL_CHROME - LABEL_TOTAL)
+    elif layout_mode == "mobile":
+        # Full-width but narrow terminal — extra -2 safety for rounding
+        graph_width = max(6, con_width - PANEL_CHROME - LABEL_TOTAL - 2)
     else:
-        graph_width = max(10, con_width - PANEL_CHROME - LABEL_PAD)
-    graph_height = max(2, max_lines - 5)  # graph dominates, leave room for axis + stats
+        # vertical, compact: full-width panel
+        graph_width = max(10, con_width - PANEL_CHROME - LABEL_TOTAL)
+
+    # Graph height per mode
+    if layout_mode in ("mobile", "compact"):
+        graph_height = 2  # minimal useful graph
+    else:
+        graph_height = max(3, max_lines - 9)  # leave room for context(4) + spacer + labels + stats
 
     # Break balance line graph (braille with colored backgrounds)
     series = data.get("balance_series", [])

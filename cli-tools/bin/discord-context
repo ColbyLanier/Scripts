@@ -1,33 +1,18 @@
 #!/usr/bin/env bash
-# discord-context - Dump recent Discord channel messages to context/discord-recent.md
+# discord-context - Dump recent Discord channel messages to context file
 # TAGS: claw, discord, context
 # AUDIENCE: human, agent
 #
-# Usage: discord-context [--limit N] [--channels "id1 id2 id3"]
+# DEPRECATED: This tool now wraps `discord read`. Use `discord read` directly.
 #
-# Default channels pulled from MEMORY (key channels for session continuity):
-#   genal (1472043387535495323), questions (1472316252805664986)
-#   + first TokenClaw guild channels
+# Usage: discord-context [--limit N] [--channels "name1 name2"] [--output PATH]
 
 set -euo pipefail
 
 WORKSPACE="$HOME/.openclaw/workspace"
-# Must be named AGENTS.md so bootstrap-extra-files hook loads it (only recognizes AGENTS.md/TOOLS.md)
 OUTPUT="$WORKSPACE/context/discord/AGENTS.md"
 LIMIT=25
-
-# Key channel IDs to pull (TokenClaw guild: 1472713270337994793)
-# Only channels in the allowlist and most relevant for session continuity
-CHANNELS=(
-  "1472713270916944020"   # #general
-  "1472722308199219352"   # #claw-chat
-  "1473154087490158656"   # #tasks
-  "1473154111301091469"   # #approvals
-  "1473154160202612831"   # #alerts
-  "1473154180200927264"   # #meta
-  "1473154201331699874"   # #research
-  "1473184628155088918"   # #operations
-)
+CHANNELS=(general claw-chat tasks approvals alerts meta research operations)
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -41,6 +26,12 @@ done
 
 mkdir -p "$(dirname "$OUTPUT")"
 
+# Check if new daemon is running; fall back to old openclaw method
+USE_NEW=false
+if curl -sf "http://127.0.0.1:7779/status" >/dev/null 2>&1; then
+  USE_NEW=true
+fi
+
 {
   echo "# Discord Recent Context"
   echo "_Generated: $(date '+%Y-%m-%d %H:%M:%S')_"
@@ -48,29 +39,55 @@ mkdir -p "$(dirname "$OUTPUT")"
   echo ""
 } > "$OUTPUT"
 
-for CHANNEL_ID in "${CHANNELS[@]}"; do
-  echo "Pulling channel $CHANNEL_ID (limit $LIMIT)..." >&2
+for CHANNEL in "${CHANNELS[@]}"; do
+  echo "Pulling $CHANNEL (limit $LIMIT)..." >&2
 
-  MSGS=$(openclaw message read \
-    --channel discord \
-    --target "channel:$CHANNEL_ID" \
-    --limit "$LIMIT" \
-    --json 2>/dev/null) || {
-    echo "  [WARN] Failed to read channel $CHANNEL_ID" >&2
-    continue
-  }
+  if [[ "$USE_NEW" == true ]]; then
+    # Use new discord CLI
+    MSGS=$(discord read "$CHANNEL" --limit "$LIMIT" 2>/dev/null) || {
+      echo "  [WARN] Failed to read channel $CHANNEL" >&2
+      continue
+    }
+    {
+      echo "## #$CHANNEL"
+      echo ""
+      echo "$MSGS"
+      echo ""
+    } >> "$OUTPUT"
+  else
+    # Legacy: fall back to openclaw
+    if ! command -v openclaw &>/dev/null; then
+      echo "  [WARN] Neither discord daemon nor openclaw available" >&2
+      continue
+    fi
 
-  # Extract channel name and messages from payload structure
-  CHANNEL_NAME=$(echo "$MSGS" | jq -r '.payload.messages[0].channel_id // "unknown"' 2>/dev/null || echo "unknown")
+    # Resolve channel name to ID for openclaw
+    case "$CHANNEL" in
+      general)       CID="1472713270916944020" ;;
+      claw-chat)     CID="1472722308199219352" ;;
+      tasks)         CID="1473154087490158656" ;;
+      approvals)     CID="1473154111301091469" ;;
+      alerts)        CID="1473154160202612831" ;;
+      meta)          CID="1473154180200927264" ;;
+      research)      CID="1473154201331699874" ;;
+      operations)    CID="1473184628155088918" ;;
+      interrogative) CID="1474963429902258176" ;;
+      *) CID="$CHANNEL" ;;
+    esac
 
-  {
-    echo "## Channel $CHANNEL_ID"
-    echo ""
-    echo "$MSGS" | jq -r '.payload.messages[] | "**[\(.timestampUtc[0:16])] \(.author.username // "unknown")**: \(.content)"' 2>/dev/null \
-      | head -"$LIMIT" \
-      || echo "_No messages or parse error_"
-    echo ""
-  } >> "$OUTPUT"
+    RAW=$(openclaw message read --channel discord --target "channel:$CID" --limit "$LIMIT" --json 2>/dev/null) || {
+      echo "  [WARN] Failed to read channel $CHANNEL" >&2
+      continue
+    }
+    {
+      echo "## #$CHANNEL"
+      echo ""
+      echo "$RAW" | jq -r '.payload.messages[] | "**[\(.timestampUtc[0:16])] \(.author.username // "unknown")**: \(.content)"' 2>/dev/null \
+        | head -"$LIMIT" \
+        || echo "_No messages or parse error_"
+      echo ""
+    } >> "$OUTPUT"
+  fi
 done
 
 echo "discord-context: wrote $OUTPUT" >&2

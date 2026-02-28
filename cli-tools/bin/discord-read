@@ -1,19 +1,39 @@
 #!/usr/bin/env bash
-# discord-read - Read Discord messages with channel and timestamp filtering
+# discord-read - Read Discord messages (DEPRECATED: use `discord read` instead)
 # TAGS: claw, discord
 # AUDIENCE: human, agent
 #
+# This script now wraps `discord read`. Use `discord read` directly.
+#
 # Usage: discord-read --channel <name-or-id> [--after <ISO-timestamp>] [--limit N] [--json]
-#
-# Channel name shortcuts:
-#   general, claw-chat, tasks, approvals, alerts, meta, research, operations, interrogative
-#
-# Examples:
-#   discord-read --channel general
-#   discord-read --channel claw-chat --limit 10
-#   discord-read --channel 1472713270916944020 --after 2026-02-22T10:00:00 --json
 
 set -euo pipefail
+
+# Check if new daemon is available
+if curl -sf "http://127.0.0.1:7779/status" >/dev/null 2>&1; then
+  # Parse args to translate to new format
+  CHANNEL="" LIMIT=25 JSON_FLAG="" AFTER=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --channel) CHANNEL="$2"; shift 2 ;;
+      --after)   AFTER="$2"; shift 2 ;;
+      --limit)   LIMIT="$2"; shift 2 ;;
+      --json)    JSON_FLAG="--json"; shift ;;
+      -h|--help) exec discord read --help ;;
+      *) shift ;;
+    esac
+  done
+  [[ -z "$CHANNEL" ]] && { echo "Error: --channel is required" >&2; exit 1; }
+
+  ARGS=("$CHANNEL" --limit "$LIMIT")
+  [[ -n "$AFTER" ]] && ARGS+=(--since "$AFTER")
+  [[ -n "$JSON_FLAG" ]] && ARGS+=("$JSON_FLAG")
+
+  exec discord read "${ARGS[@]}"
+fi
+
+# Legacy fallback: original openclaw-based implementation
+echo "Warning: discord daemon not running, falling back to openclaw" >&2
 
 # --- Channel aliases ---
 resolve_channel() {
@@ -27,95 +47,38 @@ resolve_channel() {
     research)      echo "1473154201331699874" ;;
     operations)    echo "1473184628155088918" ;;
     interrogative) echo "1474963429902258176" ;;
-    *)
-      # If it looks like a numeric ID, pass through
-      if [[ "$1" =~ ^[0-9]+$ ]]; then
-        echo "$1"
-      else
-        echo "Error: Unknown channel alias '$1'" >&2
-        echo "Valid aliases: general, claw-chat, tasks, approvals, alerts, meta, research, operations, interrogative" >&2
-        exit 1
-      fi
-      ;;
+    *) if [[ "$1" =~ ^[0-9]+$ ]]; then echo "$1"; else echo "Error: Unknown channel '$1'" >&2; exit 1; fi ;;
   esac
 }
 
-# --- Defaults ---
-CHANNEL=""
-AFTER=""
-LIMIT=25
-JSON_OUTPUT=false
-
-# --- Parse args ---
+CHANNEL="" AFTER="" LIMIT=25 JSON_OUTPUT=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --channel)
-      [[ -z "${2:-}" ]] && { echo "Error: --channel requires a value" >&2; exit 1; }
-      CHANNEL="$2"; shift 2 ;;
-    --after)
-      [[ -z "${2:-}" ]] && { echo "Error: --after requires a value" >&2; exit 1; }
-      AFTER="$2"; shift 2 ;;
-    --limit)
-      [[ -z "${2:-}" ]] && { echo "Error: --limit requires a value" >&2; exit 1; }
-      LIMIT="$2"; shift 2 ;;
-    --json)
-      JSON_OUTPUT=true; shift ;;
-    -h|--help)
-      awk '/^#!/{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
-      exit 0 ;;
-    *)
-      echo "Error: Unknown option '$1'" >&2
-      echo "Usage: discord-read --channel <name-or-id> [--after <ISO-timestamp>] [--limit N] [--json]" >&2
-      exit 1 ;;
+    --channel) CHANNEL="$2"; shift 2 ;;
+    --after) AFTER="$2"; shift 2 ;;
+    --limit) LIMIT="$2"; shift 2 ;;
+    --json) JSON_OUTPUT=true; shift ;;
+    *) shift ;;
   esac
 done
 
-# --- Validate ---
-if [[ -z "$CHANNEL" ]]; then
-  echo "Error: --channel is required" >&2
-  echo "Usage: discord-read --channel <name-or-id> [--after <ISO-timestamp>] [--limit N] [--json]" >&2
-  exit 1
-fi
-
+[[ -z "$CHANNEL" ]] && { echo "Error: --channel is required" >&2; exit 1; }
 CHANNEL_ID=$(resolve_channel "$CHANNEL")
 
-# --- Check openclaw availability ---
-if ! command -v openclaw &>/dev/null; then
-  echo "Error: openclaw command not found" >&2
-  exit 1
-fi
+command -v openclaw &>/dev/null || { echo "Error: openclaw not found" >&2; exit 1; }
 
-# --- Fetch messages ---
-RAW=$(openclaw message read \
-  --channel discord \
-  --target "channel:$CHANNEL_ID" \
-  --limit "$LIMIT" \
-  --json 2>/dev/null) || {
-  echo "Error: Failed to read channel $CHANNEL (id: $CHANNEL_ID). Is the gateway running?" >&2
-  exit 1
+RAW=$(openclaw message read --channel discord --target "channel:$CHANNEL_ID" --limit "$LIMIT" --json 2>/dev/null) || {
+  echo "Error: Failed to read channel $CHANNEL" >&2; exit 1
 }
 
-# --- Apply --after filter if provided ---
 if [[ -n "$AFTER" ]]; then
-  RAW=$(echo "$RAW" | jq --arg after "$AFTER" '
-    .payload.messages |= [.[] | select(.timestampUtc >= $after)]
-  ') || {
-    echo "Error: Failed to apply --after filter. Check timestamp format (ISO-8601)." >&2
-    exit 1
-  }
+  RAW=$(echo "$RAW" | jq --arg after "$AFTER" '.payload.messages |= [.[] | select(.timestampUtc >= $after)]')
 fi
 
-# --- Output ---
 if [[ "$JSON_OUTPUT" == true ]]; then
   echo "$RAW" | jq .
 else
-  echo "$RAW" | jq -r '
-    .payload.messages[]
-    | "[" + (.timestampUtc[0:16] | gsub("T"; " ")) + "] "
-      + (.author.username // "unknown") + ": "
-      + .content
-  ' 2>/dev/null || {
-    echo "No messages found or parse error." >&2
-    exit 1
+  echo "$RAW" | jq -r '.payload.messages[] | "[\(.timestampUtc[0:16] | gsub("T"; " "))] \(.author.username // "unknown"): \(.content)"' 2>/dev/null || {
+    echo "No messages found." >&2; exit 1
   }
 fi

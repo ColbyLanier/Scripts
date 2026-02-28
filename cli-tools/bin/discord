@@ -1,0 +1,374 @@
+#!/usr/bin/env bash
+# discord - Standalone Discord CLI tool (OpenClaw-free)
+# TAGS: claw, discord
+# AUDIENCE: human, agent
+#
+# Usage: discord <command> [args...]
+#
+# Commands:
+#   send <channel> <message>          Post to a channel (or pipe from stdin)
+#   read <channel> [--limit N]        Read recent messages
+#   ask <channel> [options]           Post question, block for reply
+#   declare <channel> [options]       Post formatted status
+#   dm <message>                      DM the operator
+#   subscribe [channels...]           Stream messages (SSE) from channels
+#   status                            Daemon health check
+#   channels                          List available channels
+#
+# Channel aliases:
+#   general, claw-chat, tasks, approvals, alerts, meta, research, operations, interrogative
+#
+# Examples:
+#   discord send alerts "[deploy] token-api restarted"
+#   discord read general --limit 10
+#   discord read alerts --since "1h ago"
+#   discord ask approvals --question "Proceed?" --options "Yes" "No" --timeout 1h
+#   discord subscribe general claw-chat
+#   echo "multi-line" | discord send tasks
+
+set -euo pipefail
+
+DAEMON_URL="http://127.0.0.1:7779"
+
+# --- Helpers ---
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+daemon_check() {
+  curl -sf "$DAEMON_URL/status" >/dev/null 2>&1 || die "Discord daemon not running. Start with: discord-daemon start"
+}
+
+# POST JSON to daemon
+post() {
+  local endpoint="$1"
+  local data="$2"
+  curl -sf -X POST "$DAEMON_URL$endpoint" \
+    -H "Content-Type: application/json" \
+    -d "$data" 2>/dev/null || die "Request to daemon failed ($endpoint)"
+}
+
+# GET from daemon
+get() {
+  local url="$1"
+  curl -sf "$DAEMON_URL$url" 2>/dev/null || die "Request to daemon failed ($url)"
+}
+
+show_help() {
+  awk '/^#!/{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
+  exit 0
+}
+
+# --- Commands ---
+
+cmd_send() {
+  local channel="${1:-}"
+  shift || true
+  [[ -z "$channel" ]] && die "Usage: discord send <channel> <message>"
+
+  local message=""
+  if [[ $# -gt 0 ]]; then
+    message="$*"
+  elif [[ ! -t 0 ]]; then
+    # Read from stdin
+    message=$(cat)
+  else
+    die "Usage: discord send <channel> <message> (or pipe from stdin)"
+  fi
+
+  local reply_to=""
+  # Check for --reply-to flag in original args
+  # (We already consumed args above, so check env var pattern)
+
+  local json_data
+  json_data=$(jq -n --arg ch "$channel" --arg msg "$message" \
+    '{channel: $ch, content: $msg}')
+
+  result=$(post "/send" "$json_data")
+  echo "$result" | jq -r '.message_id // empty' 2>/dev/null && exit 0
+  echo "$result"
+}
+
+cmd_read() {
+  local channel="${1:-}"
+  shift || true
+  [[ -z "$channel" ]] && die "Usage: discord read <channel> [--limit N] [--since <time>] [--json]"
+
+  local limit=25
+  local since=""
+  local json_output=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --limit) limit="$2"; shift 2 ;;
+      --since) since="$2"; shift 2 ;;
+      --json)  json_output=true; shift ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+
+  local url="/read?channel=$channel&limit=$limit"
+  [[ -n "$since" ]] && url="$url&since=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$since'))")"
+
+  local result
+  result=$(get "$url")
+
+  if [[ "$json_output" == true ]]; then
+    echo "$result" | jq .
+  else
+    echo "$result" | jq -r '.messages[] |
+      "[\(.timestamp[0:16] | gsub("T"; " "))] \(.author.displayName // .author.username): \(.content)"' 2>/dev/null \
+      || echo "No messages found."
+  fi
+}
+
+cmd_ask() {
+  local channel="${1:-}"
+  shift || true
+  [[ -z "$channel" ]] && die "Usage: discord ask <channel> --question <text> [--options ...] [--title <t>] [--timeout <dur>]"
+
+  local question="" title="" context_text="" blocking="" timeout_str="24h"
+  local -a options=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --question) question="$2"; shift 2 ;;
+      --title)    title="$2"; shift 2 ;;
+      --context)  context_text="$2"; shift 2 ;;
+      --blocking) blocking="$2"; shift 2 ;;
+      --timeout)  timeout_str="$2"; shift 2 ;;
+      --options)
+        shift
+        while [[ $# -gt 0 && ! "$1" =~ ^-- ]]; do
+          options+=("$1")
+          shift
+        done
+        ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+
+  [[ -z "$question" ]] && die "--question is required"
+
+  # Build formatted message
+  local msg=""
+  [[ -n "$title" ]] && msg+="**$title**\n"
+  [[ -n "$blocking" ]] && msg+="_Blocking: $blocking_\n"
+  [[ -n "$context_text" ]] && msg+="> $context_text\n"
+  msg+="\n**Question:** $question\n"
+
+  if [[ ${#options[@]} -gt 0 ]]; then
+    msg+="\n"
+    local i=0
+    local letters=(A B C D E F G H)
+    for opt in "${options[@]}"; do
+      msg+="**${letters[$i]})** $opt\n"
+      ((i++))
+    done
+    msg+="\n_Reply with a letter or your answer._"
+  fi
+
+  # Convert timeout string to seconds
+  local timeout_sec
+  timeout_sec=$(parse_timeout "$timeout_str")
+
+  # Send the question
+  local formatted
+  formatted=$(echo -e "$msg")
+  local send_data
+  send_data=$(jq -n --arg ch "$channel" --arg content "$formatted" \
+    '{channel: $ch, content: $content}')
+
+  local send_result
+  send_result=$(post "/send" "$send_data")
+  local message_id
+  message_id=$(echo "$send_result" | jq -r '.message_id')
+
+  [[ -z "$message_id" || "$message_id" == "null" ]] && die "Failed to send question"
+
+  echo "Waiting for reply (timeout: $timeout_str)..." >&2
+
+  # Wait for reply
+  local wait_data
+  wait_data=$(jq -n --arg mid "$message_id" --arg ch "$channel" --argjson ts "$timeout_sec" \
+    '{message_id: $mid, channel: $ch, timeout_seconds: $ts}')
+
+  local wait_result
+  wait_result=$(curl -sf -X POST "$DAEMON_URL/wait" \
+    -H "Content-Type: application/json" \
+    -d "$wait_data" \
+    --max-time "$((timeout_sec + 5))" 2>/dev/null) || {
+    echo "TIMEOUT" >&2
+    exit 2
+  }
+
+  local timed_out
+  timed_out=$(echo "$wait_result" | jq -r '.timeout')
+
+  if [[ "$timed_out" == "true" ]]; then
+    echo "TIMEOUT" >&2
+    exit 2
+  fi
+
+  # Extract the answer
+  local answer
+  answer=$(echo "$wait_result" | jq -r '.reply.content // .reply.emoji // empty')
+
+  # Try to match to option letter
+  if [[ ${#options[@]} -gt 0 ]]; then
+    local upper
+    upper=$(echo "$answer" | tr '[:lower:]' '[:upper:]' | head -c1)
+    local letters=(A B C D E F G H)
+    for i in "${!letters[@]}"; do
+      if [[ "$upper" == "${letters[$i]}" && $i -lt ${#options[@]} ]]; then
+        echo "${letters[$i]}"
+        exit 0
+      fi
+    done
+  fi
+
+  echo "$answer"
+}
+
+cmd_declare() {
+  local channel="${1:-}"
+  shift || true
+  [[ -z "$channel" ]] && die "Usage: discord declare <channel> --job <name> --status <ok|fail|warn> [--duration <dur>] [--next <time>] [--quota <info>]"
+
+  local job="" status_val="" duration="" next="" quota=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --job)      job="$2"; shift 2 ;;
+      --status)   status_val="$2"; shift 2 ;;
+      --duration) duration="$2"; shift 2 ;;
+      --next)     next="$2"; shift 2 ;;
+      --quota)    quota="$2"; shift 2 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+
+  [[ -z "$job" ]] && die "--job is required"
+  [[ -z "$status_val" ]] && die "--status is required"
+
+  # Build formatted message
+  local msg="\`[cron]\` **$job** — $status_val"
+  [[ -n "$duration" ]] && msg+=" ($duration)"
+  [[ -n "$next" ]] && msg+="\n  Next: $next"
+  [[ -n "$quota" ]] && msg+="\n  Quota: $quota"
+
+  local formatted
+  formatted=$(echo -e "$msg")
+  local json_data
+  json_data=$(jq -n --arg ch "$channel" --arg content "$formatted" \
+    '{channel: $ch, content: $content}')
+
+  post "/send" "$json_data" | jq -r '.message_id // empty' 2>/dev/null
+}
+
+cmd_dm() {
+  local message=""
+  if [[ $# -gt 0 ]]; then
+    message="$*"
+  elif [[ ! -t 0 ]]; then
+    message=$(cat)
+  else
+    die "Usage: discord dm <message>"
+  fi
+
+  local json_data
+  json_data=$(jq -n --arg msg "$message" '{content: $msg}')
+  post "/dm" "$json_data" | jq -r '.message_id // empty' 2>/dev/null
+}
+
+cmd_subscribe() {
+  # Stream messages via SSE
+  local channels=""
+  if [[ $# -gt 0 ]]; then
+    channels=$(IFS=,; echo "$*")
+  fi
+
+  local url="/subscribe"
+  [[ -n "$channels" ]] && url="$url?channels=$channels"
+
+  echo "Subscribing to messages (Ctrl+C to stop)..." >&2
+
+  curl -sf -N "$DAEMON_URL$url" 2>/dev/null | while IFS= read -r line; do
+    if [[ "$line" =~ ^data:\ (.+)$ ]]; then
+      local data="${BASH_REMATCH[1]}"
+      local type
+      type=$(echo "$data" | jq -r '.type // empty' 2>/dev/null)
+
+      if [[ "$type" == "connected" ]]; then
+        echo "Connected. Listening..." >&2
+        continue
+      fi
+
+      # Format: [channel] user: message
+      echo "$data" | jq -r '"[\(.channel_name)] \(.author.displayName // .author.username): \(.content)"' 2>/dev/null
+    fi
+  done
+}
+
+cmd_status() {
+  local result
+  result=$(get "/status")
+  local connected ping uptime user
+  connected=$(echo "$result" | jq -r '.connected')
+  ping=$(echo "$result" | jq -r '.ping')
+  uptime=$(echo "$result" | jq -r '.uptime')
+  user=$(echo "$result" | jq -r '.user')
+
+  if [[ "$connected" == "true" ]]; then
+    local uptime_hr
+    uptime_hr=$(python3 -c "
+s = ${uptime:-0} / 1000
+h, r = divmod(int(s), 3600)
+m, sec = divmod(r, 60)
+print(f'{h}h {m}m {sec}s')
+" 2>/dev/null || echo "${uptime}ms")
+    echo "Connected as $user | Ping: ${ping}ms | Uptime: $uptime_hr"
+  else
+    echo "Disconnected (status: $(echo "$result" | jq -r '.status'))"
+    exit 1
+  fi
+}
+
+cmd_channels() {
+  get "/channels" | jq -r '.channels[] | "\(.name)\t\(.id)"' 2>/dev/null | column -t
+}
+
+# Parse timeout strings like "1h", "30m", "24h", "300" (seconds)
+parse_timeout() {
+  local str="$1"
+  if [[ "$str" =~ ^([0-9]+)h$ ]]; then
+    echo $(( ${BASH_REMATCH[1]} * 3600 ))
+  elif [[ "$str" =~ ^([0-9]+)m$ ]]; then
+    echo $(( ${BASH_REMATCH[1]} * 60 ))
+  elif [[ "$str" =~ ^([0-9]+)s?$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+  elif [[ "$str" =~ ^([0-9]+)d$ ]]; then
+    echo $(( ${BASH_REMATCH[1]} * 86400 ))
+  else
+    echo "86400" # default 24h
+  fi
+}
+
+# --- Main dispatch ---
+
+[[ $# -eq 0 ]] && show_help
+
+COMMAND="$1"
+shift
+
+case "$COMMAND" in
+  send)      daemon_check; cmd_send "$@" ;;
+  read)      daemon_check; cmd_read "$@" ;;
+  ask)       daemon_check; cmd_ask "$@" ;;
+  declare)   daemon_check; cmd_declare "$@" ;;
+  dm)        daemon_check; cmd_dm "$@" ;;
+  subscribe) daemon_check; cmd_subscribe "$@" ;;
+  status)    daemon_check; cmd_status ;;
+  channels)  daemon_check; cmd_channels ;;
+  -h|--help|help) show_help ;;
+  *)         die "Unknown command: $COMMAND. Run 'discord --help' for usage." ;;
+esac

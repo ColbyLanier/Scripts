@@ -28,7 +28,7 @@ _clip_copy() {
     if command -v pbcopy &>/dev/null; then
         pbcopy
     elif command -v clip.exe &>/dev/null; then
-        clip.exe
+        iconv -f utf-8 -t utf-16le | clip.exe
     else
         return 1
     fi

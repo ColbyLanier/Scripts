@@ -291,7 +291,8 @@ class CronEngine:
         exit_code = None
         output_summary = ""
         error_summary = ""
-        start_time = asyncio.get_event_loop().time()
+        import time as _time
+        start_time = _time.monotonic()
 
         try:
             proc = await asyncio.create_subprocess_shell(
@@ -323,18 +324,21 @@ class CronEngine:
 
         finally:
             self._running_jobs.pop(job_id, None)
-            duration = asyncio.get_event_loop().time() - start_time
+            duration = _time.monotonic() - start_time
             finished_at = _now_iso()
 
-            async with aiosqlite.connect(self.db_path) as db:
-                await db.execute("""
-                    UPDATE cron_runs SET
-                        finished_at = ?, status = ?, duration_seconds = ?,
-                        exit_code = ?, output_summary = ?, error_summary = ?
-                    WHERE id = ?
-                """, (finished_at, status, round(duration, 2),
-                      exit_code, output_summary, error_summary, run_id))
-                await db.commit()
+            try:
+                async with aiosqlite.connect(self.db_path) as db:
+                    await db.execute("""
+                        UPDATE cron_runs SET
+                            finished_at = ?, status = ?, duration_seconds = ?,
+                            exit_code = ?, output_summary = ?, error_summary = ?
+                        WHERE id = ?
+                    """, (finished_at, status, round(duration, 2),
+                          exit_code, output_summary, error_summary, run_id))
+                    await db.commit()
+            except Exception as db_err:
+                print(f"CronEngine: DB update failed for '{job['name']}': {db_err}")
 
             print(f"CronEngine: '{job['name']}' finished: {status} ({duration:.1f}s)")
 
