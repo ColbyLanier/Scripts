@@ -9,8 +9,7 @@
 #   send <channel> [--reply-to <id>] <message>   Post to a channel (or pipe from stdin)
 #   read <channel> [--limit N]        Read recent messages
 #   react <channel> <message_id> <emoji>          Add a reaction to a message
-#   ask <channel> [options]           Post question; returns message_id immediately (non-blocking)
-#                                     Use --blocking to wait for a reply
+#   ask <channel> [options]           Post question, wait up to --timeout (default 1h) for reply
 #   poll --message-id <id> --channel <ch>         Check if a message has a human reaction
 #   declare <channel> [options]       Post formatted status
 #   dm <message>                      DM the operator
@@ -158,7 +157,7 @@ cmd_ask() {
   shift || true
   [[ -z "$channel" ]] && die "Usage: discord ask <channel> --question <text> [--options ...] [--title <t>] [--timeout <dur>] [--react [emoji...]] [--blocking]"
 
-  local question="" title="" context_text="" timeout_str="24h" react_mode=false blocking=false
+  local question="" title="" context_text="" timeout_str="1h" react_mode=false blocking=false
   local -a options=()
   local -a react_emojis=()
 
@@ -246,54 +245,45 @@ cmd_ask() {
     done
   fi
 
-  # Non-blocking (default): return the message ID immediately
-  if ! $blocking; then
-    echo "$message_id"
-    return 0
-  fi
-
   echo "Waiting for reply (timeout: $timeout_str)..." >&2
 
-  # Blocking: wait for reply via /wait endpoint
   local wait_data
   wait_data=$(jq -n --arg mid "$message_id" --arg ch "$channel" --argjson ts "$timeout_sec" \
     '{message_id: $mid, channel: $ch, timeout_seconds: $ts}')
 
-  local wait_result
+  local wait_result http_ok
   wait_result=$(curl -sf -X POST "$DAEMON_URL/wait" \
     -H "Content-Type: application/json" \
     -d "$wait_data" \
-    --max-time "$((timeout_sec + 5))" 2>/dev/null) || {
-    echo "TIMEOUT" >&2
-    exit 2
-  }
+    --max-time "$((timeout_sec + 5))" 2>/dev/null)
+  http_ok=$?
 
-  local timed_out
-  timed_out=$(echo "$wait_result" | jq -r '.timeout')
+  local timed_out=true
+  [[ $http_ok -eq 0 ]] && [[ $(echo "$wait_result" | jq -r '.timeout // true') == "false" ]] && timed_out=false
 
-  if [[ "$timed_out" == "true" ]]; then
+  # --blocking: error on timeout
+  if $blocking && $timed_out; then
     echo "TIMEOUT" >&2
     exit 2
   fi
 
-  # Extract the answer
-  local answer
-  answer=$(echo "$wait_result" | jq -r '.reply.content // .reply.emoji // empty')
+  # Return JSON either way
+  if $timed_out; then
+    jq -n --arg mid "$message_id" '{message_id: $mid, answered: false}'
+  else
+    local emoji user_id content
+    emoji=$(echo "$wait_result"   | jq -r '.reply.emoji   // empty')
+    user_id=$(echo "$wait_result" | jq -r '.reply.user_id // empty')
+    content=$(echo "$wait_result" | jq -r '.reply.content // empty')
 
-  # Try to match to option letter
-  if [[ ${#options[@]} -gt 0 ]]; then
-    local upper
-    upper=$(echo "$answer" | tr '[:lower:]' '[:upper:]' | head -c1)
-    local letters=(A B C D E F G H)
-    for i in "${!letters[@]}"; do
-      if [[ "$upper" == "${letters[$i]}" && $i -lt ${#options[@]} ]]; then
-        echo "${letters[$i]}"
-        exit 0
-      fi
-    done
+    if [[ -n "$emoji" ]]; then
+      jq -n --arg mid "$message_id" --arg e "$emoji" --arg uid "$user_id" \
+        '{message_id: $mid, answered: true, emoji: $e, user_id: $uid}'
+    else
+      jq -n --arg mid "$message_id" --arg c "$content" \
+        '{message_id: $mid, answered: true, content: $c}'
+    fi
   fi
-
-  echo "$answer"
 }
 
 cmd_poll() {
