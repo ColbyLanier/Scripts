@@ -1,0 +1,13 @@
+{
+  "name": "discord-cli-daemon",
+  "version": "1.0.0",
+  "description": "Standalone Discord WebSocket daemon for CLI access",
+  "main": "daemon.js",
+  "type": "module",
+  "scripts": {
+    "start": "node daemon.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.0"
+  }
+}

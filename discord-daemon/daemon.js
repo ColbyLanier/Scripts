@@ -1,0 +1,144 @@
+#!/usr/bin/env node
+// daemon.js — Discord CLI daemon entry point
+// Maintains WebSocket connection, exposes local HTTP API
+
+import { createDiscordClient, loadConfig } from './discord-client.js';
+import { createHttpServer } from './http-server.js';
+import { createMessageStore } from './message-store.js';
+import { writeFileSync, unlinkSync, mkdirSync, appendFileSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const BASE_DIR = join(__dirname, '..');
+const PID_FILE = join(BASE_DIR, 'daemon.pid');
+const LOG_DIR = join(BASE_DIR, 'logs');
+
+mkdirSync(LOG_DIR, { recursive: true });
+
+// --- Logger ---
+const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
+
+function createLogger(level = 'info') {
+  const minLevel = LOG_LEVELS[level] ?? 1;
+  const logFile = join(LOG_DIR, `daemon-${new Date().toISOString().slice(0, 10)}.log`);
+
+  function log(lvl, msg) {
+    if (LOG_LEVELS[lvl] < minLevel) return;
+    const line = `${new Date().toISOString()} [${lvl.toUpperCase().padEnd(5)}] ${msg}`;
+    console.log(line);
+    try {
+      appendFileSync(logFile, line + '\n');
+    } catch {
+      // Don't crash on log write failure
+    }
+  }
+
+  return {
+    debug: (msg) => log('debug', msg),
+    info: (msg) => log('info', msg),
+    warn: (msg) => log('warn', msg),
+    error: (msg) => log('error', msg),
+  };
+}
+
+// --- Main ---
+async function main() {
+  const config = loadConfig();
+  const logger = createLogger(config.log_level || 'info');
+
+  logger.info('Discord CLI daemon starting...');
+  logger.info(`PID: ${process.pid}`);
+
+  // Write PID file
+  writeFileSync(PID_FILE, String(process.pid));
+
+  // Create components
+  const messageStore = createMessageStore(logger);
+  const discordClient = createDiscordClient(config, logger);
+  const httpServer = createHttpServer(discordClient, messageStore, config, logger);
+
+  // Forward incoming messages to Token API if configured
+  if (config.forward_to_token_api) {
+    discordClient.onMessage(async (msg) => {
+      // Don't forward bot messages
+      if (msg.author.bot) return;
+
+      try {
+        const resp = await fetch(`http://127.0.0.1:${config.token_api_port}/api/discord/message`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(msg),
+        });
+        if (!resp.ok) {
+          logger.debug(`Token API forward returned ${resp.status}`);
+        }
+      } catch {
+        // Token API might not be running — that's OK, don't spam logs
+      }
+    });
+  }
+
+  // Recover pending messages from crash
+  const pending = messageStore.loadPending();
+  if (pending.length > 0) {
+    logger.info(`Recovering ${pending.length} pending messages...`);
+  }
+
+  // Start discord client
+  await discordClient.start();
+
+  // Retry pending messages after connection
+  for (const msg of pending) {
+    try {
+      const channelId = config.channels[msg.channel] || msg.channelId;
+      if (channelId && msg.content) {
+        await discordClient.sendMessage(channelId, msg.content);
+        logger.info(`Recovered pending message to ${msg.channel}`);
+      }
+      // Remove from pending regardless (stale messages shouldn't block forever)
+      const pendingFile = join(BASE_DIR, 'pending', `${msg.persisted_at?.replace(/[:.]/g, '-') || 'unknown'}.json`);
+      try { unlinkSync(pendingFile); } catch {}
+    } catch (err) {
+      logger.error(`Failed to recover pending message: ${err.message}`);
+    }
+  }
+
+  // Start HTTP server
+  await httpServer.start();
+
+  logger.info('Daemon ready.');
+
+  // --- Graceful shutdown ---
+  async function shutdown(signal) {
+    logger.info(`Received ${signal}, shutting down...`);
+    try {
+      await httpServer.stop();
+      await discordClient.stop();
+      unlinkSync(PID_FILE);
+    } catch (err) {
+      logger.error(`Shutdown error: ${err.message}`);
+    }
+    logger.info('Daemon stopped.');
+    process.exit(0);
+  }
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+
+  // Keep alive
+  process.on('uncaughtException', (err) => {
+    logger.error(`Uncaught exception: ${err.message}\n${err.stack}`);
+    // Don't crash — discord.js should handle reconnection
+  });
+
+  process.on('unhandledRejection', (reason) => {
+    logger.error(`Unhandled rejection: ${reason}`);
+  });
+}
+
+main().catch((err) => {
+  console.error(`Fatal: ${err.message}`);
+  try { unlinkSync(PID_FILE); } catch {}
+  process.exit(1);
+});
