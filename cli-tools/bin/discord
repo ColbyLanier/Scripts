@@ -6,7 +6,7 @@
 # Usage: discord <command> [args...]
 #
 # Commands:
-#   send <channel> <message>          Post to a channel (or pipe from stdin)
+#   send <channel> [--reply-to <id>] <message>   Post to a channel (or pipe from stdin)
 #   read <channel> [--limit N]        Read recent messages
 #   ask <channel> [options]           Post question, block for reply
 #   declare <channel> [options]       Post formatted status
@@ -63,11 +63,21 @@ show_help() {
 cmd_send() {
   local channel="${1:-}"
   shift || true
-  [[ -z "$channel" ]] && die "Usage: discord send <channel> <message>"
+  [[ -z "$channel" ]] && die "Usage: discord send <channel> [--reply-to <id>] <message>"
+
+  local reply_to=""
+  local -a message_parts=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --reply-to) reply_to="$2"; shift 2 ;;
+      *) message_parts+=("$1"); shift ;;
+    esac
+  done
 
   local message=""
-  if [[ $# -gt 0 ]]; then
-    message="$*"
+  if [[ ${#message_parts[@]} -gt 0 ]]; then
+    message="${message_parts[*]}"
   elif [[ ! -t 0 ]]; then
     # Read from stdin
     message=$(cat)
@@ -75,13 +85,14 @@ cmd_send() {
     die "Usage: discord send <channel> <message> (or pipe from stdin)"
   fi
 
-  local reply_to=""
-  # Check for --reply-to flag in original args
-  # (We already consumed args above, so check env var pattern)
-
   local json_data
-  json_data=$(jq -n --arg ch "$channel" --arg msg "$message" \
-    '{channel: $ch, content: $msg}')
+  if [[ -n "$reply_to" ]]; then
+    json_data=$(jq -n --arg ch "$channel" --arg msg "$message" --arg rt "$reply_to" \
+      '{channel: $ch, content: $msg, reply_to: $rt}')
+  else
+    json_data=$(jq -n --arg ch "$channel" --arg msg "$message" \
+      '{channel: $ch, content: $msg}')
+  fi
 
   result=$(post "/send" "$json_data")
   echo "$result" | jq -r '.message_id // empty' 2>/dev/null && exit 0
