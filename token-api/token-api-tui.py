@@ -2019,19 +2019,19 @@ def _line_graph(values: list, width: int = 42, height: int = 3,
     if not values:
         return []
 
-    # Mode → background color mapping
+    # Mode → background color mapping (very dark, muted tints)
     MODE_BG = {
-        "working": "grey15",
-        "work_silence": "grey15",
-        "work_music": "dark_cyan",
-        "work_video": "dark_goldenrod",
-        "work_scrolling": "purple4",
-        "work_gaming": "dark_red",
-        "break": "navy_blue",
-        "idle": "grey11",
-        "multitasking": "dark_goldenrod",
-        "distracted": "red3",
-        "sleeping": "grey3",
+        "working": "#1a1a1a",
+        "work_silence": "#1a1a1a",
+        "work_music": "#152025",
+        "work_video": "#252015",
+        "work_scrolling": "#201520",
+        "work_gaming": "#251515",
+        "break": "#151525",
+        "idle": "#141414",
+        "multitasking": "#252015",
+        "distracted": "#251515",
+        "sleeping": "#101010",
     }
 
     # Braille dot bit positions: (col, row) -> bit
@@ -2101,16 +2101,49 @@ def _line_graph(values: list, width: int = 42, height: int = 3,
                 grid[zero_char_row][c] |= DOT_BITS[(0, zero_dot_row)]
                 grid[zero_char_row][c] |= DOT_BITS[(1, zero_dot_row)]
 
+    # Detect dramatic slopes — mark columns with steep transitions
+    # slope_overrides: dict of (row, col) -> char for steep sections
+    slope_overrides = {}
+    SLOPE_THRESHOLD = max(6, v_res // 3)  # ~33% of graph height = dramatic
+    for col in range(width):
+        x0 = col * 2
+        x1 = col * 2 + 1
+        if x1 >= len(scaled):
+            break
+        # Intra-column slope
+        intra = scaled[x1] - scaled[x0]
+        # Inter-column slope (previous col's right → this col's left)
+        inter = 0
+        if col > 0:
+            prev_x1 = (col - 1) * 2 + 1
+            if prev_x1 < len(scaled):
+                inter = scaled[x0] - scaled[prev_x1]
+        # Use whichever is steeper
+        delta = intra if abs(intra) >= abs(inter) else inter
+        if abs(delta) >= SLOPE_THRESHOLD:
+            # Which rows does the transition span?
+            y_lo = min(scaled[x0], scaled[x1])
+            y_hi = max(scaled[x0], scaled[x1])
+            dot_y_top = (v_res - 1) - y_hi
+            dot_y_bot = (v_res - 1) - y_lo
+            row_top = max(0, dot_y_top // 4)
+            row_bot = min(height - 1, dot_y_bot // 4)
+            slope_char = "╱" if delta > 0 else "╲"
+            for r in range(row_top, row_bot + 1):
+                slope_overrides[(r, col)] = slope_char
+
     # Build Text rows with per-column styling
     rows = []
     for row_idx, row in enumerate(grid):
         text = Text()
         for col_idx, cell in enumerate(row):
-            ch = chr(BRAILLE_BASE + cell)
+            if (row_idx, col_idx) in slope_overrides:
+                ch = slope_overrides[(row_idx, col_idx)]
+            else:
+                ch = chr(BRAILLE_BASE + cell)
             mode = col_modes[col_idx]
             bg = MODE_BG.get(mode, "")
             if bg:
-                # Zero-line dots get dim style, data gets bright
                 style = f"bright_white on {bg}"
             else:
                 style = "bright_white"

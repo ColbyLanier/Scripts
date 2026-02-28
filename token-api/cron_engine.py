@@ -28,6 +28,31 @@ except ImportError:
 
 CRON_JOBS_CONFIG = Path(__file__).parent / "cron-jobs.json"
 
+# Ensure critical paths are available to subprocess shells.
+# LaunchAgent environments have a minimal PATH; this guarantees
+# claude, openclaw, and homebrew tools are reachable.
+_HOME = str(Path.home())
+_EXTRA_PATHS = [
+    f"{_HOME}/Scripts/cli-tools/bin",
+    f"{_HOME}/.local/bin",
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+]
+
+
+def _subprocess_env(**extras) -> dict:
+    """Build environment dict for subprocess shells with full PATH."""
+    env = dict(os.environ)
+    current_path = env.get("PATH", "")
+    for p in reversed(_EXTRA_PATHS):
+        if p not in current_path:
+            current_path = f"{p}:{current_path}"
+    env["PATH"] = current_path
+    env["HOME"] = _HOME
+    env.update(extras)
+    return env
+
 
 def _now_iso() -> str:
     return datetime.now().isoformat()
@@ -299,7 +324,7 @@ class CronEngine:
                 job["command"],
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, "CRON_JOB_NAME": job["name"], "CRON_JOB_ID": job_id},
+                env=_subprocess_env(CRON_JOB_NAME=job["name"], CRON_JOB_ID=job_id),
             )
             self._running_jobs[job_id] = proc
 
