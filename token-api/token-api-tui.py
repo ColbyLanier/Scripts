@@ -936,6 +936,13 @@ def create_mobile_instances_table(instances: list, selected_idx: int) -> Table:
 
 def _format_cron_schedule(job: dict) -> str:
     """Format cron job schedule as a compact string."""
+    stype = job.get("schedule_type", "")
+    sval = job.get("schedule_value", "")
+    if stype == "interval" and sval:
+        return sval  # Already compact like "15m", "2h"
+    elif stype == "cron" and sval:
+        return sval
+    # Fallback for old format
     schedule = job.get("schedule", {})
     every_ms = schedule.get("everyMs", 0)
     if every_ms >= 3600000:
@@ -947,11 +954,22 @@ def _format_cron_schedule(job: dict) -> str:
 
 def _format_cron_next(job: dict) -> str:
     """Format next run countdown for a cron job."""
-    state = job.get("state", {})
-    next_run_ms = state.get("nextRunAtMs")
-    if not next_run_ms:
-        return "[dim]--:--[/dim]"
-    secs_left = max(0, int((next_run_ms / 1000) - time.time()))
+    # New local engine format: ISO string
+    next_run_at = job.get("next_run_at")
+    if next_run_at:
+        try:
+            next_dt = datetime.fromisoformat(next_run_at)
+            secs_left = max(0, int((next_dt - datetime.now(next_dt.tzinfo)).total_seconds()))
+        except (ValueError, TypeError):
+            return "[dim]--:--[/dim]"
+    else:
+        # Fallback for old format
+        state = job.get("state", {})
+        next_run_ms = state.get("nextRunAtMs")
+        if not next_run_ms:
+            return "[dim]--:--[/dim]"
+        secs_left = max(0, int((next_run_ms / 1000) - time.time()))
+
     mins, secs = divmod(secs_left, 60)
     if mins >= 60:
         hours = mins // 60
@@ -970,6 +988,24 @@ def _format_cron_next(job: dict) -> str:
 
 def _format_cron_last(job: dict) -> str:
     """Format last run time for a cron job."""
+    # Try new format: fetch from cached run history
+    job_id = job.get("id", "")
+    if job_id:
+        runs = get_cached_cron_run_history(job_id, max_runs=1)
+        if runs:
+            started = runs[0].get("started_at", "")
+            if started:
+                try:
+                    last_dt = datetime.fromisoformat(started)
+                    last_ago = int((datetime.now() - last_dt).total_seconds())
+                    if last_ago < 60:
+                        return f"{last_ago}s ago"
+                    elif last_ago < 3600:
+                        return f"{last_ago // 60}m ago"
+                    return f"{last_ago // 3600}h ago"
+                except (ValueError, TypeError):
+                    pass
+    # Fallback for old format
     state = job.get("state", {})
     last_run_ms = state.get("lastRunAtMs")
     if not last_run_ms:
@@ -984,8 +1020,14 @@ def _format_cron_last(job: dict) -> str:
 
 def _format_cron_status(job: dict) -> str:
     """Format cron job status."""
-    if not job.get("enabled", True):
+    enabled = job.get("enabled")
+    # Handle both bool and int (new engine uses 0/1)
+    if enabled is not None and not enabled:
         return "[dim]disabled[/dim]"
+    # New format: is_running bool
+    if job.get("is_running"):
+        return "[green bold]running[/green bold]"
+    # Old format: state.status
     state = job.get("state", {})
     job_status = state.get("status", "idle")
     if job_status == "running":
@@ -1152,39 +1194,52 @@ def create_cron_details_panel(job: dict, max_lines: int = 8) -> Panel:
     lines = []
     name = job.get("name", job.get("id", "?"))
     job_id = job.get("id", "")
-    enabled = job.get("enabled", True)
+    enabled = job.get("enabled")
     schedule_str = _format_cron_schedule(job)
-    state = job.get("state", {})
-    job_status = state.get("status", "idle")
+    is_running = job.get("is_running", False)
 
-    # Header: name + status
+    # Header: name + status + quota info
     status_tag = "[green]enabled[/green]" if enabled else "[red]disabled[/red]"
-    if job_status == "running":
+    if is_running:
         status_tag = "[green bold]RUNNING[/green bold]"
-    errors = state.get("consecutiveErrors", 0)
-    error_tag = f"  [red bold]{errors} consecutive errors[/red bold]" if errors > 0 else ""
-    lines.append(f"[bold]{name}[/bold]  ({schedule_str})  {status_tag}{error_tag}")
+    quota_tag = ""
+    max_runs = job.get("max_runs_per_window")
+    if max_runs:
+        window = job.get("run_window_hours", 5)
+        quota_tag = f"  [dim]quota: {max_runs}/{window}h[/dim]"
+    quiet_start = job.get("quiet_hours_start")
+    quiet_end = job.get("quiet_hours_end")
+    quiet_tag = ""
+    if quiet_start is not None and quiet_end is not None:
+        quiet_tag = f"  [dim]quiet: {quiet_start}-{quiet_end}[/dim]"
+    lines.append(f"[bold]{name}[/bold]  ({schedule_str})  {status_tag}{quota_tag}{quiet_tag}")
 
-    # Last/next timing
-    last_run_ms = state.get("lastRunAtMs")
-    if last_run_ms:
-        last_dt = datetime.fromtimestamp(last_run_ms / 1000)
-        last_str = last_dt.strftime("%H:%M:%S")
-        duration_ms = state.get("lastDurationMs")
-        dur_str = f" ({duration_ms // 1000}s)" if duration_ms else ""
-        last_status = state.get("lastStatus", "")
-        result_style = "green" if last_status in ("ok", "success", "") else "red"
-        result_tag = f"[{result_style}]{last_status}[/{result_style}]" if last_status else ""
-        lines.append(f"Last: [cyan]{last_str}[/cyan]{dur_str} {result_tag}  Next: {_format_cron_next(job)}")
-    else:
-        lines.append(f"[dim]No previous runs[/dim]  Next: {_format_cron_next(job)}")
-
-    # Load run transcript — the real content
+    # Last/next timing from run history
     runs = get_cached_cron_run_history(job_id, max_runs=3)
     if runs:
         latest = runs[0]
-        summary = latest.get("summary", "")
-        error = latest.get("error", "")
+        started = latest.get("started_at", "")
+        try:
+            last_dt = datetime.fromisoformat(started)
+            last_str = last_dt.strftime("%H:%M:%S")
+        except (ValueError, TypeError):
+            last_str = "?"
+        dur = latest.get("duration_seconds")
+        dur_str = f" ({dur:.0f}s)" if dur else ""
+        last_status = latest.get("status", "")
+        result_style = "green" if last_status in ("ok", "success", "") else ("yellow" if last_status == "skipped" else "red")
+        result_tag = f"[{result_style}]{last_status}[/{result_style}]" if last_status else ""
+        skip_reason = latest.get("skip_reason", "")
+        skip_tag = f" [dim]({skip_reason})[/dim]" if skip_reason else ""
+        lines.append(f"Last: [cyan]{last_str}[/cyan]{dur_str} {result_tag}{skip_tag}  Next: {_format_cron_next(job)}")
+    else:
+        lines.append(f"[dim]No previous runs[/dim]  Next: {_format_cron_next(job)}")
+
+    # Run transcript content
+    if runs:
+        latest = runs[0]
+        summary = latest.get("output_summary", "") or latest.get("summary", "")
+        error = latest.get("error_summary", "") or latest.get("error", "")
 
         if error:
             lines.append(f"[red]{error}[/red]")
@@ -1217,23 +1272,21 @@ def create_compact_cron_details_panel(job: dict) -> Panel:
     name = job.get("name", job.get("id", "?"))
     job_id = job.get("id", "")
     schedule_str = _format_cron_schedule(job)
-    state = job.get("state", {})
-    job_status = state.get("status", "idle")
 
     parts = [f"[bold]{name}[/bold]"]
     parts.append(f"[dim]({schedule_str})[/dim]")
 
-    if job_status == "running":
+    if job.get("is_running"):
         parts.append("[green bold]RUNNING[/green bold]")
-    elif not job.get("enabled", True):
+    elif not job.get("enabled"):
         parts.append("[red]disabled[/red]")
 
     # First line of last run summary
     runs = get_cached_cron_run_history(job_id, max_runs=1)
     if runs:
         latest = runs[0]
-        error = latest.get("error", "")
-        summary = latest.get("summary", "")
+        error = latest.get("error_summary", "") or latest.get("error", "")
+        summary = latest.get("output_summary", "") or latest.get("summary", "")
         if error:
             if len(error) > 40:
                 error = error[:37] + "..."
@@ -1260,18 +1313,18 @@ def create_mobile_cron_details_panel(job: dict) -> Panel:
     lines = []
     name = job.get("name", job.get("id", "?"))
     job_id = job.get("id", "")
-    state = job.get("state", {})
-    job_status = state.get("status", "idle")
 
-    status_icon = "[green]>[/green]" if job_status == "running" else "[cyan]*[/cyan]"
+    status_icon = "[green]>[/green]" if job.get("is_running") else "[cyan]*[/cyan]"
+    if not job.get("enabled"):
+        status_icon = "[dim]-[/dim]"
     lines.append(f"{status_icon} [bold]{name}[/bold]  [dim]{_format_cron_schedule(job)}[/dim]")
 
     # Last run summary from transcript
     runs = get_cached_cron_run_history(job_id, max_runs=1)
     if runs:
         latest = runs[0]
-        error = latest.get("error", "")
-        summary = latest.get("summary", "")
+        error = latest.get("error_summary", "") or latest.get("error", "")
+        summary = latest.get("output_summary", "") or latest.get("summary", "")
         if error:
             if len(error) > 35:
                 error = error[:32] + "..."
