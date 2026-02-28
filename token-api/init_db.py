@@ -172,6 +172,30 @@ def init_database():
         )
     """)
 
+    # Create agent_state table (generic state blob per agent type)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS agent_state (
+            id       TEXT PRIMARY KEY,
+            state_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    # Create guard_runs table (Imperial Guards post-run validation results)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS guard_runs (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            cron_run_id INTEGER NOT NULL,
+            job_id      TEXT NOT NULL,
+            guard_index INTEGER NOT NULL,
+            verdict     TEXT NOT NULL,
+            findings    TEXT,
+            model       TEXT DEFAULT 'claude-haiku-4-5-20251001',
+            duration_ms INTEGER,
+            created_at  TEXT NOT NULL
+        )
+    """)
+
     # Seed devices
     cursor.execute("""
         INSERT OR IGNORE INTO devices (id, name, type, tailscale_ip, notification_method, tts_engine)

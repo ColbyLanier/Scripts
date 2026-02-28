@@ -8082,6 +8082,115 @@ async def receive_discord_message(request: DiscordMessageRequest):
     return {"received": True, "message_id": request.message_id}
 
 
+# ============ Fleet State Endpoints ============
+
+_FLEET_STATE_DEFAULTS = {
+    "machine_spirit": 1.0,
+    "domain_priority": ["discord", "cli-tools", "vault", "token-api"],
+    "last_successful_runs": {},
+    "stuck_jobs": [],
+    "last_fg_run": None,
+    "simulation_mode": False,
+    "pending_confirmations": {},
+    "autonomy_queue": {"completable": [], "researchable": []},
+    "notes": [],
+}
+
+_LEGACY_STATE_PATH = Path.home() / ".openclaw" / "workspace" / "memory" / "fabricator-state.json"
+
+
+async def _get_fleet_state_row(db: aiosqlite.Connection) -> Optional[dict]:
+    cursor = await db.execute("SELECT state_json FROM agent_state WHERE id = 'fabricator'")
+    row = await cursor.fetchone()
+    if row:
+        return json.loads(row[0])
+    return None
+
+
+async def _ensure_agent_state_table(db: aiosqlite.Connection):
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS agent_state (
+            id       TEXT PRIMARY KEY,
+            state_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    await db.commit()
+
+
+@app.get("/api/fleet/state")
+async def get_fleet_state():
+    """Return current fleet state. Seeds from legacy file on first access."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_agent_state_table(db)
+        state = await _get_fleet_state_row(db)
+        if state is None:
+            # One-time migration from legacy file
+            if _LEGACY_STATE_PATH.exists():
+                try:
+                    state = json.loads(_LEGACY_STATE_PATH.read_text())
+                except Exception:
+                    state = dict(_FLEET_STATE_DEFAULTS)
+            else:
+                state = dict(_FLEET_STATE_DEFAULTS)
+            now = datetime.now().isoformat()
+            await db.execute(
+                "INSERT INTO agent_state (id, state_json, updated_at) VALUES ('fabricator', ?, ?)",
+                (json.dumps(state), now),
+            )
+            await db.commit()
+    return state
+
+
+@app.patch("/api/fleet/state")
+async def patch_fleet_state(request: Request):
+    """Merge-patch update: only provided keys are updated, others preserved."""
+    updates = await request.json()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_agent_state_table(db)
+        state = await _get_fleet_state_row(db)
+        if state is None:
+            state = dict(_FLEET_STATE_DEFAULTS)
+        state.update(updates)
+        now = datetime.now().isoformat()
+        await db.execute(
+            "INSERT OR REPLACE INTO agent_state (id, state_json, updated_at) VALUES ('fabricator', ?, ?)",
+            (json.dumps(state), now),
+        )
+        await db.commit()
+    return state
+
+
+@app.put("/api/fleet/state")
+async def put_fleet_state(request: Request):
+    """Full replacement of fleet state."""
+    new_state = await request.json()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_agent_state_table(db)
+        now = datetime.now().isoformat()
+        await db.execute(
+            "INSERT OR REPLACE INTO agent_state (id, state_json, updated_at) VALUES ('fabricator', ?, ?)",
+            (json.dumps(new_state), now),
+        )
+        await db.commit()
+    return new_state
+
+
+@app.post("/api/fleet/state/reset")
+async def reset_fleet_state():
+    """Reset fleet state to defaults."""
+    state = dict(_FLEET_STATE_DEFAULTS)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_agent_state_table(db)
+        now = datetime.now().isoformat()
+        await db.execute(
+            "INSERT OR REPLACE INTO agent_state (id, state_json, updated_at) VALUES ('fabricator', ?, ?)",
+            (json.dumps(state), now),
+        )
+        await db.commit()
+    return state
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT)

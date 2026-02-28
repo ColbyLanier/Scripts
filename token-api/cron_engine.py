@@ -8,6 +8,7 @@ job definitions and run history in agents.db.
 import asyncio
 import json
 import os
+import re
 import subprocess
 import uuid
 from datetime import datetime, timedelta
@@ -27,6 +28,8 @@ except ImportError:
 
 
 CRON_JOBS_CONFIG = Path(__file__).parent / "cron-jobs.json"
+
+VICTORY_RE = re.compile(r'##IMPERIUM_VICTORIOUS:\s*(.+?)##', re.DOTALL)
 
 # Ensure critical paths are available to subprocess shells.
 # LaunchAgent environments have a minimal PATH; this guarantees
@@ -118,6 +121,7 @@ class CronEngine:
                 exit_code INTEGER,
                 output_summary TEXT,
                 error_summary TEXT,
+                victory_reason TEXT DEFAULT NULL,
                 created_at TEXT NOT NULL
             )
         """)
@@ -126,6 +130,21 @@ class CronEngine:
             CREATE INDEX IF NOT EXISTS idx_cron_runs_job_id
             ON cron_runs(job_id, started_at DESC)
         """)
+
+        # Migrations: add new columns to existing tables if absent
+        cursor = await db.execute("PRAGMA table_info(cron_jobs)")
+        cron_jobs_cols = {row[1] for row in await cursor.fetchall()}
+        if "guards_count" not in cron_jobs_cols:
+            await db.execute("ALTER TABLE cron_jobs ADD COLUMN guards_count INTEGER DEFAULT 0")
+        if "followup_delay_seconds" not in cron_jobs_cols:
+            await db.execute("ALTER TABLE cron_jobs ADD COLUMN followup_delay_seconds INTEGER DEFAULT NULL")
+
+        cursor = await db.execute("PRAGMA table_info(cron_runs)")
+        cron_runs_cols = {row[1] for row in await cursor.fetchall()}
+        if "victory_reason" not in cron_runs_cols:
+            await db.execute("ALTER TABLE cron_runs ADD COLUMN victory_reason TEXT DEFAULT NULL")
+
+        await db.commit()
 
     # ── Load / Sync ────────────────────────────────────────────
 
@@ -339,8 +358,8 @@ class CronEngine:
                     timeout=job.get("timeout_seconds", 120),
                 )
                 exit_code = proc.returncode
-                output_summary = (stdout or b"").decode("utf-8", errors="replace")[-500:]
-                error_summary = (stderr or b"").decode("utf-8", errors="replace")[-500:]
+                output_summary = (stdout or b"").decode("utf-8", errors="replace")[-4000:]
+                error_summary = (stderr or b"").decode("utf-8", errors="replace")[-4000:]
                 status = "ok" if exit_code == 0 else "error"
             except asyncio.TimeoutError:
                 proc.kill()
@@ -350,27 +369,77 @@ class CronEngine:
 
         except Exception as e:
             status = "error"
-            error_summary = str(e)[:500]
+            error_summary = str(e)[:4000]
 
         finally:
             self._running_jobs.pop(job_id, None)
             duration = _time.monotonic() - start_time
             finished_at = _now_iso()
 
+            # Detect victory signal
+            victory_match = VICTORY_RE.search(output_summary)
+            victory_reason = victory_match.group(1).strip() if victory_match else None
+
             try:
                 async with aiosqlite.connect(self.db_path) as db:
                     await db.execute("""
                         UPDATE cron_runs SET
                             finished_at = ?, status = ?, duration_seconds = ?,
-                            exit_code = ?, output_summary = ?, error_summary = ?
+                            exit_code = ?, output_summary = ?, error_summary = ?,
+                            victory_reason = ?
                         WHERE id = ?
                     """, (finished_at, status, round(duration, 2),
-                          exit_code, output_summary, error_summary, run_id))
+                          exit_code, output_summary, error_summary,
+                          victory_reason, run_id))
                     await db.commit()
             except Exception as db_err:
                 print(f"CronEngine: DB update failed for '{job['name']}': {db_err}")
 
             print(f"CronEngine: '{job['name']}' finished: {status} ({duration:.1f}s)")
+
+            # Post-run: victory handling or follow-up scheduling
+            if status == "ok":
+                if victory_reason:
+                    asyncio.create_task(self._handle_victory(job, run_id, victory_reason))
+                elif job.get("followup_delay_seconds"):
+                    delay = job["followup_delay_seconds"]
+                    async def _delayed_followup(jid=job_id, d=delay):
+                        await asyncio.sleep(d)
+                        await self._run_wrapper(jid)
+                    asyncio.create_task(_delayed_followup())
+
+            # Post-run graph (guards + victory chain via LangGraph)
+            guards_count = job.get("guards_count", 0)
+            followup_delay = job.get("followup_delay_seconds")
+            if guards_count or followup_delay:
+                try:
+                    from post_run_graph import post_run_graph
+                    asyncio.create_task(post_run_graph.ainvoke({
+                        "job_id": job_id,
+                        "job_name": job["name"],
+                        "cron_run_id": run_id,
+                        "full_output": output_summary,
+                        "guards_count": guards_count or 0,
+                        "followup_delay_seconds": followup_delay,
+                        "victory_reason": victory_reason,
+                        "guard_results": [],
+                        "followup_scheduled": False,
+                    }))
+                except ImportError:
+                    pass  # post_run_graph not yet installed
+
+    async def _handle_victory(self, job: dict, run_id: int, reason: str):
+        """Fire Discord victory notification when an agent raises the victory banner."""
+        msg = f"⚔️ **IMPERIUM VICTORIOUS** — {job['name']}\n> {reason}"
+        try:
+            subprocess.run(
+                ["discord", "send", "operations", "--message", msg],
+                timeout=10,
+                env=_subprocess_env(),
+            )
+        except Exception as e:
+            print(f"CronEngine: Victory Discord notify failed: {e}")
+        print(f"CronEngine: '{job['name']}' declared victory: {reason}")
 
     async def _log_skip(self, job_id: str, reason: str):
         """Record a skipped run."""
