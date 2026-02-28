@@ -2022,17 +2022,18 @@ def _line_graph(values: list, width: int = 42, height: int = 3,
     # Mode → background color mapping
     # Working=dark blue, Multi=dark green, Idle=dark orange, Break=dark red
     MODE_BG = {
-        "working":      "#0e1c30",   # navy
-        "work_silence": "#0e1c30",
-        "work_music":   "#0e1c30",
-        "work_video":   "#0e2a1c",   # teal
-        "work_scrolling":"#2c1616",  # maroon
-        "work_gaming":  "#2c1616",
-        "break":        "#2c1010",   # red
-        "idle":         "#2c2006",   # amber
-        "multitasking": "#0e2a1c",   # green
-        "distracted":   "#2c1010",   # red
-        "sleeping":     "#161616",   # dark grey
+        "working":         "#0e1c30",   # navy
+        "work_silence":    "#0e1c30",
+        "work_music":      "#0e1c30",
+        "work_video":      "#0e2a1c",   # teal
+        "work_scrolling":  "#2c1616",   # maroon
+        "work_gaming":     "#2c1616",
+        "break":           "#2c1010",   # red
+        "break_exhausted": "#301018",   # deep magenta
+        "idle":            "#1c1c0a",   # dim olive
+        "multitasking":    "#0e2a1c",   # green
+        "distracted":      "#2c1010",   # red
+        "sleeping":        "#161616",   # dark grey
     }
 
     # Braille dot bit positions: (col, row) -> bit
@@ -2133,13 +2134,15 @@ def _line_graph(values: list, width: int = 42, height: int = 3,
             slope_char = "╱" if delta > 0 else "╲"
             span = list(range(row_top, row_bot + 1))
             if len(span) > MAX_SLASH_ROWS:
-                # Keep top, middle, and bottom rows only
-                keep = {span[0], span[-1]}
-                mid = len(span) // 2
-                keep.add(span[mid])
-                span = [r for r in span if r in keep]
-            for r in span:
-                slope_overrides[(r, col)] = slope_char
+                # Top and bottom get directional slash, middle gets │
+                for r in span:
+                    if r == span[0] or r == span[-1]:
+                        slope_overrides[(r, col)] = slope_char
+                    elif r == span[len(span) // 2]:
+                        slope_overrides[(r, col)] = "│"
+            else:
+                for r in span:
+                    slope_overrides[(r, col)] = slope_char
 
     # Build Text rows with per-column styling
     rows = []
