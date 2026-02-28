@@ -7,7 +7,7 @@
 Usage:
     timer-status              # One-line status
     timer-status --layers     # One-line status + layer breakdown
-    timer-status --shifts     # One-line status + session mode distribution
+    timer-status --shifts     # One-line status + session mode distribution + sparkline
     timer-status --watch      # Continuous monitoring (1s refresh)
     timer-status --json       # Raw JSON from API
 """
@@ -140,6 +140,48 @@ def display(data, show_layers=False):
         print(f"  Activity: {activity}  Desktop: {dm_str}  Productivity: {prod_str}  Manual: {manual_str}")
 
 
+def sparkline(series, width=50):
+    """Render a balance trajectory as a colored ASCII spark line.
+
+    Each character maps to a sampled point. Positive balance = green,
+    negative = red, zero = dim. Uses block chars ▁▂▃▄▅▆▇█ (8 levels).
+    Returns the colored string + a brief label.
+    """
+    blocks = "▁▂▃▄▅▆▇█"
+    if not series or len(series) < 2:
+        return color("  (no data)", "90")
+
+    # Downsample to `width` evenly-spaced points
+    n = len(series)
+    indices = [int(round(i * (n - 1) / (width - 1))) for i in range(width)]
+    sampled = [series[i] for i in indices]
+
+    lo = min(series)
+    hi = max(series)
+    span = hi - lo if hi != lo else 1.0
+
+    bar_chars = []
+    for v in sampled:
+        level = int((v - lo) / span * 7)
+        ch = blocks[level]
+        if v > 0:
+            bar_chars.append(color(ch, "32"))   # green
+        elif v < 0:
+            bar_chars.append(color(ch, "31"))   # red
+        else:
+            bar_chars.append(color(ch, "90"))   # dim
+
+    current = series[-1]
+    sign = "+" if current >= 0 else ""
+    lo_sign = "+" if lo >= 0 else ""
+    hi_sign = "+" if hi >= 0 else ""
+    label = (color(f"{lo_sign}{lo:.0f}", "31") + "→" +
+             color(f"{hi_sign}{hi:.0f}", "32") +
+             "  now:" + (color(f"{sign}{current:.0f}", "32") if current >= 0 else color(f"{sign}{current:.0f}", "31")))
+
+    return "  " + "".join(bar_chars) + "  " + label
+
+
 def display_shifts(shifts):
     """Print a compact session mode-distribution summary."""
     dist = shifts.get("mode_distribution", {})
@@ -188,6 +230,11 @@ def display_shifts(shifts):
           color(f"Enforced:{enforced}  ", "31" if enforced > 50 else "37") +
           color(f"Twitter:{twitter}  ", "31" if twitter > 20 else "37") +
           color(f"[{trig_str}]", "90"))
+
+    # Balance trajectory sparkline
+    series = shifts.get("balance_series", [])
+    if series:
+        print(sparkline(series))
 
 
 def main():
