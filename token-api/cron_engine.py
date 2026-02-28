@@ -538,9 +538,10 @@ class CronEngine:
             await db.commit()
             return cursor.rowcount > 0
 
-    async def trigger_job(self, job_id: str, dry_run: bool = False) -> dict:
+    async def trigger_job(self, job_id: str, dry_run: bool = False, delay_seconds: int = 0) -> dict:
         """Manually trigger a job, bypassing schedule (but respecting quiet hours and quota).
-        If dry_run=True, check all guards and log but don't execute the command."""
+        If dry_run=True, check all guards and log but don't execute the command.
+        If delay_seconds > 0, schedule execution in the future instead of running immediately."""
         job = await self.get_job(job_id)
         if not job:
             return {"error": "Job not found"}
@@ -548,7 +549,13 @@ class CronEngine:
         if dry_run:
             return await self._dry_run(job)
 
-        # Run in background
+        if delay_seconds > 0:
+            async def _delayed_run():
+                await asyncio.sleep(delay_seconds)
+                await self._run_wrapper(job_id)
+            asyncio.create_task(_delayed_run())
+            return {"triggered": True, "job": job["name"], "delay_seconds": delay_seconds}
+
         asyncio.create_task(self._run_wrapper(job_id))
         return {"triggered": True, "job": job["name"]}
 

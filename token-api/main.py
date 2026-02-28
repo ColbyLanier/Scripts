@@ -5863,9 +5863,10 @@ async def delete_cron_job(job_id: str):
 
 
 @app.post("/api/cron/jobs/{job_id}/trigger")
-async def trigger_cron_job(job_id: str, dry_run: bool = False):
-    """Manually trigger a cron job. Use ?dry_run=true to simulate without executing."""
-    result = await cron_engine.trigger_job(job_id, dry_run=dry_run)
+async def trigger_cron_job(job_id: str, dry_run: bool = False, delay_seconds: int = 0):
+    """Manually trigger a cron job. Use ?dry_run=true to simulate without executing.
+    Use ?delay_seconds=N to schedule execution in the future."""
+    result = await cron_engine.trigger_job(job_id, dry_run=dry_run, delay_seconds=delay_seconds)
     if "error" in result:
         raise HTTPException(status_code=404, detail=result["error"])
     return result

@@ -355,6 +355,29 @@ class TestDryRun:
         assert "error" in result
 
 
+class TestDelayedTrigger:
+    def test_trigger_with_delay_returns_correct_response(self, engine):
+        """trigger_job with delay_seconds returns triggered=True and delay_seconds in response."""
+        created = run(engine.create_job(create_job_dict(name="delayed-trigger")))
+        result = run(engine.trigger_job(created["id"], delay_seconds=60))
+        assert result["triggered"] is True
+        assert result["delay_seconds"] == 60
+        assert result["job"] == "delayed-trigger"
+
+    def test_trigger_with_delay_does_not_run_immediately(self, engine):
+        """trigger_job with delay_seconds must not add job to _running_jobs immediately."""
+        created = run(engine.create_job(create_job_dict(name="delayed-not-immediate")))
+        run(engine.trigger_job(created["id"], delay_seconds=3600))
+        assert created["id"] not in engine._running_jobs
+
+    def test_trigger_zero_delay_no_delay_key(self, engine):
+        """trigger_job with delay_seconds=0 returns triggered without delay_seconds key."""
+        created = run(engine.create_job(create_job_dict(name="no-delay")))
+        result = run(engine.trigger_job(created["id"], delay_seconds=0))
+        assert result["triggered"] is True
+        assert "delay_seconds" not in result
+
+
 # ── Unit Tests: Execution ─────────────────────────────────────
 
 
