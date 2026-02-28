@@ -504,15 +504,69 @@ class CronEngine:
             await db.commit()
             return cursor.rowcount > 0
 
-    async def trigger_job(self, job_id: str) -> dict:
-        """Manually trigger a job, bypassing schedule (but respecting quiet hours and quota)."""
+    async def trigger_job(self, job_id: str, dry_run: bool = False) -> dict:
+        """Manually trigger a job, bypassing schedule (but respecting quiet hours and quota).
+        If dry_run=True, check all guards and log but don't execute the command."""
         job = await self.get_job(job_id)
         if not job:
             return {"error": "Job not found"}
 
+        if dry_run:
+            return await self._dry_run(job)
+
         # Run in background
         asyncio.create_task(self._run_wrapper(job_id))
         return {"triggered": True, "job": job["name"]}
+
+    async def _dry_run(self, job: dict) -> dict:
+        """Simulate a job run: check all guards, log result, don't execute."""
+        job_id = job["id"]
+        now = _now_iso()
+        tz = ZoneInfo(job.get("timezone", "America/Phoenix"))
+        current_hour = datetime.now(tz).hour
+
+        checks = {
+            "quiet_hours": self._check_quiet_hours(job),
+            "quota": await self._check_quota(job),
+            "enabled": bool(job.get("enabled")),
+            "not_running": job_id not in self._running_jobs,
+        }
+        would_run = all(checks.values())
+
+        # Build descriptive output
+        details = []
+        details.append(f"Job: {job['name']} ({job_id})")
+        details.append(f"Command: {job['command']}")
+        details.append(f"Current hour ({tz}): {current_hour}")
+        quiet_s, quiet_e = job.get("quiet_hours_start"), job.get("quiet_hours_end")
+        if quiet_s is not None:
+            details.append(f"Quiet hours: {quiet_s}-{quiet_e} → {'BLOCKED' if not checks['quiet_hours'] else 'clear'}")
+        max_runs = job.get("max_runs_per_window")
+        if max_runs:
+            details.append(f"Quota: {max_runs}/{job.get('run_window_hours', 5)}h → {'BLOCKED' if not checks['quota'] else 'clear'}")
+        details.append(f"Enabled: {checks['enabled']}")
+        details.append(f"Would run: {'YES' if would_run else 'NO'}")
+
+        output = "\n".join(details)
+
+        # Log as a dry_run in the audit trail
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT INTO cron_runs (job_id, started_at, finished_at, status, skip_reason, duration_seconds, output_summary, created_at)
+                VALUES (?, ?, ?, 'dry_run', ?, 0, ?, ?)
+            """, (job_id, now, now,
+                  None if would_run else "would_be_blocked",
+                  output, now))
+            await db.commit()
+
+        print(f"CronEngine: '{job['name']}' dry-run: would_run={would_run}")
+        return {
+            "dry_run": True,
+            "job": job["name"],
+            "would_run": would_run,
+            "checks": checks,
+            "details": output,
+        }
 
     async def get_runs(self, job_id: str, limit: int = 20) -> list[dict]:
         """Get recent run history for a job."""
