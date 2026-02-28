@@ -8,6 +8,7 @@
 # Commands:
 #   send <channel> [--reply-to <id>] <message>   Post to a channel (or pipe from stdin)
 #   read <channel> [--limit N]        Read recent messages
+#   react <channel> <message_id> <emoji>          Add a reaction to a message
 #   ask <channel> [options]           Post question, block for reply
 #   declare <channel> [options]       Post formatted status
 #   dm <message>                      DM the operator
@@ -22,6 +23,7 @@
 #   discord send alerts "[deploy] token-api restarted"
 #   discord read general --limit 10
 #   discord read alerts --since "1h ago"
+#   discord react operations 1234567890123456789 ✅
 #   discord ask approvals --question "Proceed?" --options "Yes" "No" --timeout 1h
 #   discord subscribe general claw-chat
 #   echo "multi-line" | discord send tasks
@@ -130,6 +132,20 @@ cmd_read() {
       "[\(.timestamp[0:16] | gsub("T"; " "))] \(.author.displayName // .author.username): \(.content)"' 2>/dev/null \
       || echo "No messages found."
   fi
+}
+
+cmd_react() {
+  local channel="${1:-}"
+  local message_id="${2:-}"
+  local emoji="${3:-}"
+  [[ -z "$channel" || -z "$message_id" || -z "$emoji" ]] && \
+    die "Usage: discord react <channel> <message_id> <emoji>"
+
+  local json_data
+  json_data=$(jq -n --arg ch "$channel" --arg mid "$message_id" --arg em "$emoji" \
+    '{channel: $ch, message_id: $mid, emoji: $em}')
+
+  post "/react" "$json_data" | jq -r 'if .ok then "reacted" else "failed: \(.error // "unknown")" end' 2>/dev/null
 }
 
 cmd_ask() {
@@ -374,6 +390,7 @@ shift
 case "$COMMAND" in
   send)      daemon_check; cmd_send "$@" ;;
   read)      daemon_check; cmd_read "$@" ;;
+  react)     daemon_check; cmd_react "$@" ;;
   ask)       daemon_check; cmd_ask "$@" ;;
   declare)   daemon_check; cmd_declare "$@" ;;
   dm)        daemon_check; cmd_dm "$@" ;;
