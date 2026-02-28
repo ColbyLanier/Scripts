@@ -2022,17 +2022,17 @@ def _line_graph(values: list, width: int = 42, height: int = 3,
     # Mode → background color mapping
     # Working=dark blue, Multi=dark green, Idle=dark orange, Break=dark red
     MODE_BG = {
-        "working":      "#0d2244",   # dark blue
-        "work_silence": "#0d2244",
-        "work_music":   "#0d2244",
-        "work_video":   "#0d3820",   # dark teal-green
-        "work_scrolling":"#3a1a1a",  # dark crimson
-        "work_gaming":  "#3a1a1a",
-        "break":        "#3a0f0f",   # dark red
-        "idle":         "#3a2800",   # dark amber/orange
-        "multitasking": "#0d3820",   # dark green
-        "distracted":   "#3a0f0f",   # dark red
-        "sleeping":     "#111111",   # near-black
+        "working":      "#0a1530",   # muted navy
+        "work_silence": "#0a1530",
+        "work_music":   "#0a1530",
+        "work_video":   "#0a2518",   # muted teal
+        "work_scrolling":"#251212",  # muted maroon
+        "work_gaming":  "#251212",
+        "break":        "#250a0a",   # muted red
+        "idle":         "#251a00",   # muted amber
+        "multitasking": "#0a2518",   # muted green
+        "distracted":   "#250a0a",   # muted red
+        "sleeping":     "#0e0e0e",   # near-black
     }
 
     # Braille dot bit positions: (col, row) -> bit
