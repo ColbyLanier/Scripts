@@ -254,8 +254,9 @@ class CronEngine:
 
     # ── Execution ──────────────────────────────────────────────
 
-    async def _run_wrapper(self, job_id: str):
-        """Entry point called by APScheduler. Checks guards, then executes."""
+    async def _run_wrapper(self, job_id: str, bypass_enabled: bool = False):
+        """Entry point called by APScheduler. Checks guards, then executes.
+        If bypass_enabled=True, skip the disabled check (used by manual trigger)."""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM cron_jobs WHERE id = ?", (job_id,))
@@ -265,8 +266,8 @@ class CronEngine:
                 return
             job = dict(job)
 
-        # Guard: disabled
-        if not job.get("enabled"):
+        # Guard: disabled (skipped for manual triggers)
+        if not bypass_enabled and not job.get("enabled"):
             await self._log_skip(job_id, "disabled")
             return
 
@@ -621,11 +622,11 @@ class CronEngine:
         if delay_seconds > 0:
             async def _delayed_run():
                 await asyncio.sleep(delay_seconds)
-                await self._run_wrapper(job_id)
+                await self._run_wrapper(job_id, bypass_enabled=True)
             asyncio.create_task(_delayed_run())
             return {"triggered": True, "job": job["name"], "delay_seconds": delay_seconds}
 
-        asyncio.create_task(self._run_wrapper(job_id))
+        asyncio.create_task(self._run_wrapper(job_id, bypass_enabled=True))
         return {"triggered": True, "job": job["name"]}
 
     async def _dry_run(self, job: dict) -> dict:
