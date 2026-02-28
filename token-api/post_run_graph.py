@@ -12,12 +12,28 @@ Non-victory path: run N haiku guards in parallel, aggregate findings, then decid
 """
 
 import asyncio
+import json
 import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, TypedDict
 
+import httpx
 from langgraph.graph import END, StateGraph
+
+_MINIMAX_BASE_URL = "https://api.minimax.io/anthropic"
+_MINIMAX_MODEL = "MiniMax-M2.5"
+_AUTH_PROFILES_PATH = Path.home() / ".openclaw" / "agents" / "main" / "agent" / "auth-profiles.json"
+
+
+def _get_minimax_key() -> str:
+    """Read MiniMax API key from openclaw auth-profiles."""
+    try:
+        profiles = json.loads(_AUTH_PROFILES_PATH.read_text())
+        return profiles["profiles"]["minimax:default"]["key"]
+    except Exception as e:
+        raise RuntimeError(f"Could not load MiniMax API key from {_AUTH_PROFILES_PATH}: {e}")
+
 
 # Guard lenses cycle through these validation perspectives
 _GUARD_LENSES = [
@@ -64,6 +80,8 @@ async def run_guards_node(state: PostRunState) -> PostRunState:
     full_output = state["full_output"]
     cron_run_id = state["cron_run_id"]
 
+    minimax_key = _get_minimax_key()
+
     async def _run_one_guard(index: int) -> dict:
         lens = _GUARD_LENSES[index % len(_GUARD_LENSES)]
         prompt = (
@@ -80,18 +98,29 @@ async def run_guards_node(state: PostRunState) -> PostRunState:
         verdict = "concern"
         findings = ""
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "claude", "--model", "claude-haiku-4-5-20251001",
-                "-p", prompt,
-                "--dangerously-skip-permissions",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-                env=_subprocess_env(),
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=90)
-            output = (stdout or b"").decode("utf-8", errors="replace")
+            async with httpx.AsyncClient(timeout=90) as client:
+                resp = await client.post(
+                    f"{_MINIMAX_BASE_URL}/v1/messages",
+                    headers={
+                        "x-api-key": minimax_key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": _MINIMAX_MODEL,
+                        "max_tokens": 256,
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                # Extract text from Anthropic-compatible response
+                output = ""
+                for block in data.get("content", []):
+                    if block.get("type") == "text":
+                        output += block["text"]
 
-            # Parse verdict line
+            # Parse verdict/findings lines
             for line in output.splitlines():
                 line = line.strip()
                 if line.lower().startswith("verdict:"):
@@ -143,7 +172,7 @@ async def aggregate_guards_node(state: PostRunState) -> PostRunState:
                 """, (
                     cron_run_id, job_id, r["guard_index"],
                     r["verdict"], r["findings"],
-                    "claude-haiku-4-5-20251001",
+                    _MINIMAX_MODEL,
                     r["duration_ms"],
                     datetime.now().isoformat(),
                 ))

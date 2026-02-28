@@ -190,7 +190,7 @@ def init_database():
             guard_index INTEGER NOT NULL,
             verdict     TEXT NOT NULL,
             findings    TEXT,
-            model       TEXT DEFAULT 'claude-haiku-4-5-20251001',
+            model       TEXT DEFAULT 'MiniMax-M2.5',
             duration_ms INTEGER,
             created_at  TEXT NOT NULL
         )

@@ -765,6 +765,28 @@ async def init_db():
         # Cron engine tables
         await CronEngine.init_tables(db)
 
+        # Agent state + guard runs tables
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS agent_state (
+                id       TEXT PRIMARY KEY,
+                state_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS guard_runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                cron_run_id INTEGER NOT NULL,
+                job_id      TEXT NOT NULL,
+                guard_index INTEGER NOT NULL,
+                verdict     TEXT NOT NULL,
+                findings    TEXT,
+                model       TEXT DEFAULT 'MiniMax-M2.5',
+                duration_ms INTEGER,
+                created_at  TEXT NOT NULL
+            )
+        """)
+
         await db.commit()
         print(f"Database initialized at {DB_PATH}")
 
