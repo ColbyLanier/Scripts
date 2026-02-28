@@ -2107,7 +2107,7 @@ def _line_graph(values: list, width: int = 42, height: int = 3,
     # Slash until proven otherwise: if a slash fits, it should be present.
     slope_overrides = {}
     SLOPE_THRESHOLD = 8  # 2 cell heights — gentler slopes stay as braille
-    MAX_SLASH_ROWS = 3   # cap per column to avoid solid walls
+    # (no max cap — pipes fill middle rows cleanly)
     for col in range(width):
         x0 = col * 2
         x1 = col * 2 + 1
@@ -2133,14 +2133,14 @@ def _line_graph(values: list, width: int = 42, height: int = 3,
             row_bot = min(height - 1, dot_y_bot // 4)
             slope_char = "╱" if delta > 0 else "╲"
             span = list(range(row_top, row_bot + 1))
-            if len(span) > MAX_SLASH_ROWS:
-                # Keep top, middle, and bottom rows only
-                keep = {span[0], span[-1]}
-                mid = len(span) // 2
-                keep.add(span[mid])
-                span = [r for r in span if r in keep]
-            for r in span:
-                slope_overrides[(r, col)] = slope_char
+            if len(span) <= 2:
+                for r in span:
+                    slope_overrides[(r, col)] = slope_char
+            else:
+                slope_overrides[(span[0], col)] = slope_char
+                slope_overrides[(span[-1], col)] = slope_char
+                for r in span[1:-1]:
+                    slope_overrides[(r, col)] = "│"
 
     # Build Text rows with per-column styling
     rows = []
