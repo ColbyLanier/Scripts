@@ -2217,17 +2217,21 @@ def create_timer_stats_panel(max_lines: int = 10) -> Panel:
 
     lines.append("")  # spacer
 
-    # Determine available panel width for graph
-    LABEL_PAD = 8  # "  -5m " prefix
+    # Determine available content width for graph
+    # The label prefix " Brk 92m " takes ~10 chars, panel border+padding takes 4
+    LABEL_PAD = 10
+    PANEL_CHROME = 4  # 2 border + 2 padding
     try:
-        con_width = Console().width if not console else console.width
+        con_width = console.width if console else 80
     except Exception:
         con_width = 80
-    if layout_mode in ("mobile", "compact", "vertical"):
-        panel_width = con_width - 2  # panel borders
+    # In full mode, sidebar is Layout ratio=2 out of (3+2)
+    # The Layout allocates floor(width * 2/5) minus its own overhead
+    if layout_mode == "full":
+        sidebar_width = (con_width * 2) // 5 - 1  # -1 for Layout column gap
+        graph_width = max(10, sidebar_width - PANEL_CHROME - LABEL_PAD)
     else:
-        panel_width = int(con_width * 2 / 5) - 2  # sidebar ratio
-    graph_width = max(10, panel_width - LABEL_PAD)
+        graph_width = max(10, con_width - PANEL_CHROME - LABEL_PAD)
     graph_height = max(2, max_lines - 5)  # graph dominates, leave room for axis + stats
 
     # Break balance line graph (braille with colored backgrounds)
