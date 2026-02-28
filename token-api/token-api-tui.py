@@ -648,9 +648,10 @@ def _read_timer() -> dict:
         req = urllib.request.Request(f"{API_URL}/api/timer")
         with urllib.request.urlopen(req, timeout=1) as resp:
             data = json.loads(resp.read().decode())
+        bal_ms = data.get("break_balance_ms", data.get("accumulated_break_ms", 0) - data.get("break_backlog_ms", 0))
         _timer_cache = {
-            "break_secs": round(data.get("accumulated_break_ms", 0) / 1000),
-            "backlog_secs": round(data.get("break_backlog_ms", 0) / 1000),
+            "break_secs": round(max(0, bal_ms) / 1000),
+            "backlog_secs": round(abs(min(0, bal_ms)) / 1000),
             "mode": data.get("current_mode", "working"),
             "work_mode": data.get("work_mode", "clocked_in"),
             "desktop_mode": data.get("desktop_mode", "silence"),
@@ -1899,21 +1900,6 @@ def create_monitor_panel(max_lines: int = 8) -> Panel:
 
             content.append("\n")
 
-    # Break balance graph (compact, below cron jobs)
-    shifts_data = _fetch_timer_shifts()
-    series = (shifts_data or {}).get("balance_series", [])
-    if series and len(series) >= 2:
-        content.append("\n")
-        graph = _line_graph(series, width=30, height=2)
-        mn, mx = min(series), max(series)
-        graph_lines = graph.split("\n")
-        content.append(f"Brk ", style="bold")
-        content.append(f"{mx:.0f}m ", style="dim")
-        content.append(graph_lines[0])
-        if len(graph_lines) > 1:
-            content.append(f"\n    {mn:.0f}m ", style="dim")
-            content.append(graph_lines[-1])
-
     # Remove trailing newline
     if content.plain.endswith("\n"):
         content.right_crop(1)
@@ -1968,15 +1954,32 @@ def _fetch_timer_shifts() -> dict:
     return _timer_shifts_cache
 
 
-def _line_graph(values: list, width: int = 42, height: int = 3) -> str:
-    """Render a braille line graph.
+def _line_graph(values: list, width: int = 42, height: int = 3,
+                modes: list | None = None) -> list:
+    """Render a braille line graph with optional per-column background colors.
 
     Each braille char is a 2-wide x 4-tall dot grid, giving
     width*2 horizontal and height*4 vertical resolution.
-    Returns multi-line string (height lines) or empty string if no values.
+    Y-axis always includes 0 so negatives render below a zero line.
+    Returns list[Text] (one per row) or empty list if no values.
     """
     if not values:
-        return ""
+        return []
+
+    # Mode → background color mapping
+    MODE_BG = {
+        "working": "grey15",
+        "work_silence": "grey15",
+        "work_music": "dark_cyan",
+        "work_video": "dark_goldenrod",
+        "work_scrolling": "purple4",
+        "work_gaming": "dark_red",
+        "break": "navy_blue",
+        "idle": "grey11",
+        "multitasking": "dark_goldenrod",
+        "distracted": "red3",
+        "sleeping": "grey3",
+    }
 
     # Braille dot bit positions: (col, row) -> bit
     # col 0: rows 0-3 = bits 0,1,2,6   col 1: rows 0-3 = bits 3,4,5,7
@@ -2003,30 +2006,64 @@ def _line_graph(values: list, width: int = 42, height: int = 3) -> str:
             frac = idx - lo
             sampled.append(values[lo] * (1 - frac) + values[hi] * frac)
 
-    mn = min(sampled)
-    mx = max(sampled)
+    # Resample modes to width columns (nearest-neighbor)
+    col_modes = [None] * width
+    if modes and len(modes) > 0:
+        for c in range(width):
+            idx = int(c * (len(modes) - 1) / max(1, width - 1))
+            col_modes[c] = modes[min(idx, len(modes) - 1)]
+
+    # Y-range always includes 0
+    mn = min(min(sampled), 0)
+    mx = max(max(sampled), 0)
     rng = mx - mn if mx != mn else 1
 
-    # Scale to 0..v_res-1 (0 = bottom)
+    # Scale to 0..v_res-1 (0 = bottom, v_res-1 = top)
     scaled = [int((v - mn) / rng * (v_res - 1)) for v in sampled]
+
+    # Zero line position in dot-space (0 = bottom)
+    zero_y = int((0 - mn) / rng * (v_res - 1))
 
     # Build braille grid: grid[row][col] where row 0 = top
     grid = [[0] * width for _ in range(height)]
 
+    # Draw the data line
     for x, y in enumerate(scaled):
         char_col = x // 2
         dot_col = x % 2
-        # y=0 is bottom, convert to top-origin
         dot_y = (v_res - 1) - y
         char_row = dot_y // 4
         dot_row = dot_y % 4
         if 0 <= char_row < height and 0 <= char_col < width:
             grid[char_row][char_col] |= DOT_BITS[(dot_col, dot_row)]
 
-    lines = []
-    for row in grid:
-        lines.append("".join(chr(BRAILLE_BASE + cell) for cell in row))
-    return "\n".join(lines)
+    # Draw zero line (dim dots) when range crosses zero
+    if mn < 0 < mx:
+        zero_dot_y = (v_res - 1) - zero_y
+        zero_char_row = zero_dot_y // 4
+        zero_dot_row = zero_dot_y % 4
+        if 0 <= zero_char_row < height:
+            for c in range(width):
+                # Add both columns of dots at the zero row
+                grid[zero_char_row][c] |= DOT_BITS[(0, zero_dot_row)]
+                grid[zero_char_row][c] |= DOT_BITS[(1, zero_dot_row)]
+
+    # Build Text rows with per-column styling
+    rows = []
+    for row_idx, row in enumerate(grid):
+        text = Text()
+        for col_idx, cell in enumerate(row):
+            ch = chr(BRAILLE_BASE + cell)
+            mode = col_modes[col_idx]
+            bg = MODE_BG.get(mode, "")
+            if bg:
+                # Zero-line dots get dim style, data gets bright
+                style = f"bright_white on {bg}"
+            else:
+                style = "bright_white"
+            text.append(ch, style=style)
+        rows.append(text)
+    return rows
 
 
 def _mode_bar(mode_dist: dict, width: int = 36) -> Text:
@@ -2127,33 +2164,46 @@ def create_timer_stats_panel(max_lines: int = 10) -> Panel:
 
     lines.append("")  # spacer
 
-    # Break balance line graph (braille)
+    # Determine available panel width for graph
+    LABEL_PAD = 8  # "  -5m " prefix
+    try:
+        con_width = Console().width if not console else console.width
+    except Exception:
+        con_width = 80
+    if layout_mode in ("mobile", "compact", "vertical"):
+        panel_width = con_width - 2  # panel borders
+    else:
+        panel_width = int(con_width * 2 / 5) - 2  # sidebar ratio
+    graph_width = max(10, panel_width - LABEL_PAD)
+    graph_height = max(2, max_lines - 5)  # graph dominates, leave room for axis + stats
+
+    # Break balance line graph (braille with colored backgrounds)
     series = data.get("balance_series", [])
-    if series:
-        graph = _line_graph(series, width=42, height=3)
-        mn = min(series)
-        mx = max(series)
-        graph_lines = graph.split("\n")
-        # Fixed-width prefix: "Break 14m " or "       0m " — all 10 chars
+    timeline = data.get("balance_timeline", [])
+    graph_modes = [e.get("mode", "") for e in timeline] if timeline else None
+    if series and len(series) >= 2:
+        graph_rows = _line_graph(series, width=graph_width, height=graph_height, modes=graph_modes)
+        mn = min(min(series), 0)
+        mx = max(max(series), 0)
         mx_label = f"{mx:.0f}m"
         mn_label = f"{mn:.0f}m"
-        pad = 10  # consistent prefix width
-        # First line: label + max
+        # First line: label + max + graph row
         first = Text()
-        first.append(f"{'Brk ' + mx_label:>{pad}} ", style="bold")
-        first.append(graph_lines[0])
+        first.append(f"{'Brk ' + mx_label:>{LABEL_PAD}} ", style="bold")
+        if graph_rows:
+            first.append_text(graph_rows[0])
         lines.append(first)
         # Middle lines
-        for gl in graph_lines[1:-1]:
+        for gr in graph_rows[1:-1]:
             mid = Text()
-            mid.append(" " * (pad + 1))
-            mid.append(gl)
+            mid.append(" " * (LABEL_PAD + 1))
+            mid.append_text(gr)
             lines.append(mid)
         # Last line: min
-        if len(graph_lines) > 1:
+        if len(graph_rows) > 1:
             last = Text()
-            last.append(f"{mn_label:>{pad}} ", style="dim")
-            last.append(graph_lines[-1])
+            last.append(f"{mn_label:>{LABEL_PAD}} ", style="dim")
+            last.append_text(graph_rows[-1])
             lines.append(last)
     else:
         lines.append("[bold]Break Balance[/bold]  [dim]no data[/dim]")

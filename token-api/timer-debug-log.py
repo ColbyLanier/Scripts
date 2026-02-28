@@ -32,9 +32,12 @@ def read_db():
         conn.close()
         if row:
             state = json.loads(row[0])
+            bal = state.get("break_balance_ms")
+            if bal is None:
+                bal = state.get("accumulated_break_ms", 0) - state.get("break_backlog_ms", 0)
             return {
-                "break_ms": state.get("accumulated_break_ms", 0),
-                "backlog_ms": state.get("break_backlog_ms", 0),
+                "break_ms": max(0, bal),
+                "backlog_ms": abs(min(0, bal)),
                 "mode": state.get("current_mode", "work_silence"),
             }
     except Exception as e:
@@ -47,9 +50,12 @@ def read_api():
         req = urllib.request.Request(f"{API_URL}/api/timer")
         with urllib.request.urlopen(req, timeout=1) as resp:
             data = json.loads(resp.read().decode())
+            bal_ms = data.get("break_balance_ms")
+            if bal_ms is None:
+                bal_ms = data.get("accumulated_break_ms", 0) - data.get("break_backlog_ms", 0)
             return {
-                "break_ms": data.get("accumulated_break_ms", 0),
-                "backlog_ms": data.get("break_backlog_ms", 0),
+                "break_ms": max(0, bal_ms),
+                "backlog_ms": abs(min(0, bal_ms)),
                 "mode": data.get("current_mode", "?"),
             }
     except Exception as e:

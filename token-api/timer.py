@@ -108,8 +108,7 @@ class TimerEngine:
         # Counters
         self._total_work_time_ms: int = 0
         self._total_break_time_ms: int = 0
-        self._accumulated_break_ms: int = 0
-        self._break_backlog_ms: int = 0
+        self._break_balance_ms: int = 0  # positive = available, negative = backlog/debt
 
         # Timing
         self._daily_start_date: str | None = None
@@ -151,12 +150,22 @@ class TimerEngine:
         return self.effective_mode
 
     @property
+    def break_balance_ms(self) -> int:
+        """Signed break balance: positive = available, negative = backlog/debt."""
+        return self._break_balance_ms
+
+    @property
+    def is_in_backlog(self) -> bool:
+        return self._break_balance_ms < 0
+
+    # Backward compat properties (derived from single signed value)
+    @property
     def accumulated_break_ms(self) -> int:
-        return self._accumulated_break_ms
+        return max(0, self._break_balance_ms)
 
     @property
     def break_backlog_ms(self) -> int:
-        return self._break_backlog_ms
+        return abs(min(0, self._break_balance_ms))
 
     @property
     def manual_mode_lock(self) -> bool:
@@ -409,8 +418,7 @@ class TimerEngine:
             # Counters
             "total_work_time_ms": self._total_work_time_ms,
             "total_break_time_ms": self._total_break_time_ms,
-            "accumulated_break_ms": self._accumulated_break_ms,
-            "break_backlog_ms": self._break_backlog_ms,
+            "break_balance_ms": self._break_balance_ms,
             # Timing
             "daily_start_date": self._daily_start_date,
             # Productivity substate
@@ -429,9 +437,10 @@ class TimerEngine:
             "activity": self._activity.value,
             "productivityActive": self._productivity_active,
             "manualMode": self._manual_mode.value if self._manual_mode else None,
-            "breakAvailableSeconds": round(self._accumulated_break_ms / 1000),
-            "isInBacklog": self._break_backlog_ms > 0,
-            "backlogSeconds": round(self._break_backlog_ms / 1000),
+            "breakAvailableSeconds": round(max(0, self._break_balance_ms) / 1000),
+            "breakBalanceSeconds": round(self._break_balance_ms / 1000),
+            "isInBacklog": self._break_balance_ms < 0,
+            "backlogSeconds": round(abs(min(0, self._break_balance_ms)) / 1000),
             "workTimeSeconds": round(self._total_work_time_ms / 1000),
             "breakUsedSeconds": round(self._total_break_time_ms / 1000),
         }
@@ -454,8 +463,13 @@ class TimerEngine:
 
         self._total_work_time_ms = int(data.get("total_work_time_ms", 0))
         self._total_break_time_ms = int(data.get("total_break_time_ms", 0))
-        self._accumulated_break_ms = int(data.get("accumulated_break_ms", 0))
-        self._break_backlog_ms = int(data.get("break_backlog_ms", 0))
+        # New signed key, fallback to old two-counter format
+        if "break_balance_ms" in data:
+            self._break_balance_ms = int(data["break_balance_ms"])
+        else:
+            acc = int(data.get("accumulated_break_ms", 0))
+            bl = int(data.get("break_backlog_ms", 0))
+            self._break_balance_ms = acc - bl
         self._daily_start_date = data.get("daily_start_date")
 
         # Manual substate
@@ -542,8 +556,9 @@ class TimerEngine:
         # Restore counters
         self._total_work_time_ms = int(data.get("total_work_time_ms", 0))
         self._total_break_time_ms = int(data.get("total_break_time_ms", 0))
-        self._accumulated_break_ms = int(data.get("accumulated_break_ms", 0))
-        self._break_backlog_ms = int(data.get("break_backlog_ms", 0))
+        acc = int(data.get("accumulated_break_ms", 0))
+        bl = int(data.get("break_backlog_ms", 0))
+        self._break_balance_ms = acc - bl
         self._daily_start_date = data.get("daily_start_date")
 
         # Restore manual substate from legacy lock fields
@@ -576,7 +591,7 @@ class TimerEngine:
 
     def force_daily_reset(self, now_mono_ms: int, today_date: str) -> TickResult:
         """Force a daily reset regardless of date. Used for scheduled reset."""
-        productivity_score = max(0, self._accumulated_break_ms // (1000 * 60))
+        productivity_score = max(0, self._break_balance_ms // (1000 * 60))
 
         result = TickResult()
         result.events.append(TimerEvent.DAILY_RESET)
@@ -643,13 +658,7 @@ class TimerEngine:
 
         elif mode == TimerMode.BREAK:
             self._total_break_time_ms += elapsed_ms
-            was_positive = self._accumulated_break_ms > 0
-            self._accumulated_break_ms -= elapsed_ms
-            if self._accumulated_break_ms < 0:
-                self._break_backlog_ms += abs(self._accumulated_break_ms)
-                self._accumulated_break_ms = 0
-                if was_positive:  # Only fire on 0-crossing, not every tick
-                    result.events.append(TimerEvent.BREAK_EXHAUSTED)
+            self._apply_break_delta(-elapsed_ms, result)
 
         # SLEEPING: no accumulation
 
@@ -669,7 +678,7 @@ class TimerEngine:
             return None
 
         # Day changed (and past reset hour) — calculate productivity score and reset
-        productivity_score = max(0, self._accumulated_break_ms // (1000 * 60))
+        productivity_score = max(0, self._break_balance_ms // (1000 * 60))
 
         result = TickResult()
         result.events.append(TimerEvent.DAILY_RESET)
@@ -692,25 +701,13 @@ class TimerEngine:
         }
         self._total_work_time_ms = 0
         self._total_break_time_ms = 0
-        self._accumulated_break_ms = DEFAULT_BREAK_BUFFER_MS if with_buffer else 0
-        self._break_backlog_ms = 0
+        self._break_balance_ms = DEFAULT_BREAK_BUFFER_MS if with_buffer else 0
         self._daily_start_date = today_date
         self._last_tick_ms = now_mono_ms
 
     def _apply_break_delta(self, break_delta_ms: int, result: TickResult) -> None:
-        """Apply break time change. Handles backlog offset and exhaustion."""
-        if self._break_backlog_ms > 0:
-            if break_delta_ms >= self._break_backlog_ms:
-                remaining = break_delta_ms - self._break_backlog_ms
-                self._break_backlog_ms = 0
-                self._accumulated_break_ms += remaining
-            else:
-                self._break_backlog_ms -= break_delta_ms
-        else:
-            was_positive = self._accumulated_break_ms > 0
-            self._accumulated_break_ms += break_delta_ms
-            if self._accumulated_break_ms < 0:
-                self._break_backlog_ms += abs(self._accumulated_break_ms)
-                self._accumulated_break_ms = 0
-                if was_positive:  # Only fire on 0-crossing, not every tick
-                    result.events.append(TimerEvent.BREAK_EXHAUSTED)
+        """Apply break time change. Fires BREAK_EXHAUSTED on zero-crossing."""
+        was_positive = self._break_balance_ms > 0
+        self._break_balance_ms += break_delta_ms
+        if was_positive and self._break_balance_ms <= 0:
+            result.events.append(TimerEvent.BREAK_EXHAUSTED)

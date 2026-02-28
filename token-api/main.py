@@ -3184,7 +3184,7 @@ def _sync_log_shift(old_mode: str | None, new_mode: str, trigger: str, source: s
            break_balance_ms, break_backlog_ms, work_time_ms, active_instances, phone_app, details)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (_dt.now().isoformat(), old_mode, new_mode, trigger, source,
-         timer_engine.accumulated_break_ms, timer_engine.break_backlog_ms,
+         timer_engine.break_balance_ms, abs(min(0, timer_engine.break_balance_ms)),
          timer_engine.total_work_time_ms, active_instances, phone_app, details)
     )
     conn.commit()
@@ -3397,11 +3397,11 @@ def _sync_update_daily_note():
         "timer_status": timer_engine.current_mode.value,
         "timer_work_time": format_timer_time(timer_engine.total_work_time_ms),
         "timer_break_earned": format_timer_time(
-            timer_engine.accumulated_break_ms + timer_engine.total_break_time_ms
+            max(0, timer_engine.break_balance_ms) + timer_engine.total_break_time_ms
         ),
         "timer_break_used": format_timer_time(timer_engine.total_break_time_ms),
-        "timer_break_available": format_timer_time(timer_engine.accumulated_break_ms),
-        "timer_backlog": format_timer_time(timer_engine.break_backlog_ms),
+        "timer_break_available": format_timer_time(max(0, timer_engine.break_balance_ms)),
+        "timer_backlog": format_timer_time(abs(min(0, timer_engine.break_balance_ms))),
         "timer_sessions": session_count,
         "timer_mode_changes": mode_change_count,
         "last_timer_update": datetime.now().strftime("%H:%M:%S"),
@@ -3557,7 +3557,7 @@ def timer_load_from_db():
         if row:
             saved = json.loads(row[0])
             timer_engine.from_dict(saved, now_mono_ms=now_ms)
-            print(f"TIMER: Restored state from DB (mode={timer_engine.current_mode.value}, break={timer_engine.accumulated_break_ms / 1000:.0f}s)")
+            print(f"TIMER: Restored state from DB (mode={timer_engine.current_mode.value}, break={timer_engine.break_balance_ms / 1000:.0f}s)")
             return
     except Exception as e:
         print(f"TIMER: DB load failed: {e}")
@@ -3996,8 +3996,8 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
         print(f"    Gym mode - all modes allowed")
     # CLOCKED IN: Video/gaming mode requires either break time OR productivity
     elif detected_mode == "video" or detected_mode == "gaming":
-        has_break_time = timer_engine.accumulated_break_ms > 0
-        break_secs = round(timer_engine.accumulated_break_ms / 1000)
+        has_break_time = timer_engine.break_balance_ms > 0
+        break_secs = round(timer_engine.break_balance_ms / 1000)
 
         if has_break_time:
             allowed = True
@@ -4311,7 +4311,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         )
 
     # Clocked in - check break time and productivity
-    break_secs = round(timer_engine.accumulated_break_ms / 1000)
+    break_secs = round(timer_engine.break_balance_ms / 1000)
 
     # Check productivity (active Claude instances)
     async with aiosqlite.connect(DB_PATH) as db:
@@ -4414,7 +4414,7 @@ async def get_phone_state():
         "current_app": PHONE_STATE.get("current_app"),
         "is_distracted": PHONE_STATE.get("is_distracted", False),
         "last_activity": PHONE_STATE.get("last_activity"),
-        "break_seconds": round(timer_engine.accumulated_break_ms / 1000),
+        "break_seconds": round(timer_engine.break_balance_ms / 1000),
         "work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
         "reachable": PHONE_STATE.get("reachable"),
         "last_reachable_check": PHONE_STATE.get("last_reachable_check"),
@@ -4545,34 +4545,28 @@ async def handle_break_exhausted():
 @app.post("/api/timer/set-break")
 async def set_break_time(seconds: int):
     """Debug: directly set accumulated break time (in seconds). Negative values set backlog."""
-    if seconds < 0:
-        timer_engine._accumulated_break_ms = 0
-        timer_engine._break_backlog_ms = abs(seconds) * 1000
-    else:
-        timer_engine._accumulated_break_ms = seconds * 1000
-        timer_engine._break_backlog_ms = 0
+    timer_engine._break_balance_ms = seconds * 1000
     await log_event("timer_debug_set_break", details={"seconds": seconds})
     await timer_save_to_db()
     return {
-        "accumulated_break_seconds": max(seconds, 0),
-        "accumulated_break_ms": timer_engine._accumulated_break_ms,
-        "backlog_seconds": round(timer_engine._break_backlog_ms / 1000),
-        "backlog_ms": timer_engine._break_backlog_ms,
+        "break_balance_ms": timer_engine._break_balance_ms,
+        "break_balance_seconds": seconds,
+        "accumulated_break_ms": max(0, timer_engine._break_balance_ms),
+        "backlog_ms": abs(min(0, timer_engine._break_balance_ms)),
     }
 
 
 @app.get("/api/widget/break")
 async def get_widget_break():
     """Slim break-time endpoint for phone widget on-demand pull."""
-    break_ms = timer_engine.accumulated_break_ms
-    backlog_ms = timer_engine.break_backlog_ms
-    in_backlog = backlog_ms > 0
+    bal = timer_engine.break_balance_ms
+    in_backlog = bal < 0
     # Show minutes, rounded to 1 decimal
     if in_backlog:
-        minutes = round(backlog_ms / 60000, 1)
+        minutes = round(abs(bal) / 60000, 1)
         label = f"-{minutes}m"
     else:
-        minutes = round(break_ms / 60000, 1)
+        minutes = round(bal / 60000, 1)
         label = f"{minutes}m"
     return {
         "break_minutes": minutes,
@@ -4594,12 +4588,13 @@ async def get_timer_state():
         "total_work_time_ms": timer_engine.total_work_time_ms,
         "total_break_time": format_timer_time(timer_engine.total_break_time_ms),
         "total_break_time_ms": timer_engine.total_break_time_ms,
-        "accumulated_break": format_timer_time(timer_engine.accumulated_break_ms),
-        "accumulated_break_ms": timer_engine.accumulated_break_ms,
-        "accumulated_break_seconds": round(timer_engine.accumulated_break_ms / 1000),
-        "break_backlog": format_timer_time(timer_engine.break_backlog_ms),
-        "break_backlog_ms": timer_engine.break_backlog_ms,
-        "is_in_backlog": timer_engine.break_backlog_ms > 0,
+        "break_balance_ms": timer_engine.break_balance_ms,
+        "accumulated_break": format_timer_time(max(0, timer_engine.break_balance_ms)),
+        "accumulated_break_ms": max(0, timer_engine.break_balance_ms),
+        "accumulated_break_seconds": round(max(0, timer_engine.break_balance_ms) / 1000),
+        "break_backlog": format_timer_time(abs(min(0, timer_engine.break_balance_ms))),
+        "break_backlog_ms": abs(min(0, timer_engine.break_balance_ms)),
+        "is_in_backlog": timer_engine.break_balance_ms < 0,
         "daily_start_date": timer_engine.daily_start_date,
         "manual_mode_lock": timer_engine.manual_mode_lock,
         "manual_trigger": timer_engine.manual_trigger,
@@ -4634,6 +4629,7 @@ async def get_timer_shifts():
             rows = rows[1:]
 
     balance_series = []
+    balance_timeline = []
     mode_time = defaultdict(int)
     shifts_by_trigger = defaultdict(int)
     enforcement_count = 0
@@ -4641,8 +4637,17 @@ async def get_timer_shifts():
     prev_time = None
 
     for r in rows:
-        bal = r["break_balance_ms"] or 0
-        balance_series.append(round(bal / 60000, 1))  # minutes for sparkline
+        bal_ms = r["break_balance_ms"] or 0
+        backlog_ms = r["break_backlog_ms"] or 0
+        # After refactor, break_balance_ms is signed; for old data, compute:
+        effective = bal_ms - backlog_ms
+        bal_min = round(effective / 60000, 1)
+        balance_series.append(bal_min)
+        balance_timeline.append({
+            "t": r["timestamp"],
+            "bal": bal_min,
+            "mode": r["new_mode"],
+        })
         shifts_by_trigger[r["trigger"] or "unknown"] += 1
         if r["trigger"] == "enforcement":
             enforcement_count += 1
@@ -4664,6 +4669,7 @@ async def get_timer_shifts():
     return {
         "total_shifts": len(rows),
         "balance_series": balance_series,
+        "balance_timeline": balance_timeline,
         "mode_distribution": dict(mode_time),
         "shifts_by_trigger": dict(shifts_by_trigger),
         "enforcement_count": enforcement_count,
@@ -4675,7 +4681,7 @@ async def get_timer_shifts():
 async def enter_break_mode():
     """Enter break mode (for Stream Deck / TUI / manual control)."""
     global _current_session_id, _session_start_ms
-    if timer_engine.accumulated_break_ms <= 0:
+    if timer_engine.break_balance_ms <= 0:
         raise HTTPException(status_code=400, detail="No break time available")
 
     now_ms = int(time.monotonic() * 1000)
@@ -4689,7 +4695,7 @@ async def enter_break_mode():
         _current_session_id = await timer_start_session("break", today)
         _session_start_ms = now_ms
         await log_event("timer_mode_change", details={"new_mode": "break", "source": "api"})
-    return {"status": "break", "changed": changed, "break_available_seconds": round(timer_engine.accumulated_break_ms / 1000)}
+    return {"status": "break", "changed": changed, "break_available_seconds": round(max(0, timer_engine.break_balance_ms) / 1000)}
 
 
 @app.post("/api/timer/pause")
@@ -4758,7 +4764,7 @@ async def manual_daily_reset():
     await timer_9am_reset()
     return {
         "status": "reset",
-        "accumulated_break_ms": timer_engine.accumulated_break_ms,
+        "break_balance_ms": timer_engine.break_balance_ms,
         "daily_start_date": timer_engine.daily_start_date,
     }
 
@@ -4776,7 +4782,7 @@ async def reset_timer():
 
     # Reset timer state using force_daily_reset
     timer_engine.force_daily_reset(now_ms, today)
-    timer_engine._accumulated_break_ms = DEFAULT_BREAK_BUFFER_MS
+    timer_engine._break_balance_ms = DEFAULT_BREAK_BUFFER_MS
 
     # Start fresh session
     _current_session_id = await timer_start_session(timer_engine.current_mode.value, today)
@@ -5016,7 +5022,7 @@ async def handle_location_event(request: LocationEventRequest):
     if location == "gym" and action == "exit":
         now_ms = int(time.monotonic() * 1000)
         timer_engine.apply_gym_bounty(now_ms)
-        bounty_min = round(timer_engine.accumulated_break_ms / 60000, 1)
+        bounty_min = round(timer_engine.break_balance_ms / 60000, 1)
         print(f">>> Gym bounty applied: +30min break (total: {bounty_min}min)")
         await log_event("gym_bounty", details={"break_minutes": bounty_min})
 
