@@ -135,6 +135,18 @@ POST   /restart                         # Git pull + systemd restart
 
 **KVM Watchdog**: Background thread manages DeskFlow lifecycle. Starts DeskFlow at boot, monitors Mac via token-api health check (30s interval), wakes Mac display + starts client when Mac is reachable, stops DeskFlow when Mac goes down. Replaces the old "Deskflow" Windows scheduled task (now disabled).
 
+### Discord Integration
+```
+POST   /api/discord/message           # Receive forwarded message from discord-cli daemon
+```
+
+The discord-cli daemon (port 7779) forwards all incoming Discord messages to this endpoint. Messages are logged to the `events` table with `event_type='discord_message'` and `device_id='discord'`.
+
+Query recent Discord messages:
+```bash
+agents-db query "SELECT json_extract(details, '$.channel_name') as channel, json_extract(details, '$.author_name') as author, json_extract(details, '$.content') as msg, created_at FROM events WHERE event_type='discord_message' ORDER BY created_at DESC LIMIT 10"
+```
+
 ## Timer State Machine (v2 — Layered Composite Model)
 
 Three independent layers compose into 6 effective modes:

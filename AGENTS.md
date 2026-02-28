@@ -41,6 +41,25 @@ Scripts/
 
 **See**: `~/Scripts/token-api/CLAUDE.md` for details
 
+### Discord Daemon (port 7779)
+
+**Location**: `~/.discord-cli/`
+**Service**: LaunchAgent `ai.tokenclaw.discord` (KeepAlive)
+**Logs**: `~/.discord-cli/logs/`
+
+Standalone Discord WebSocket daemon (discord.js v14) replacing OpenClaw's Discord gateway. Subscribes to ALL messages in 9 TokenClaw guild channels + operator DMs — no ping/mention required.
+
+**CLI**: `discord send|read|ask|declare|dm|subscribe|status|channels`
+**Management**: `discord-daemon start|stop|restart|status|logs`
+
+**Integration**:
+- Forwards incoming messages to Token API: `POST localhost:7777/api/discord/message`
+- Token API logs them to `events` table as `discord_message`
+- Persists outgoing messages to `~/.discord-cli/pending/` for crash recovery
+- Bot token in macOS Keychain (`discord-bot-token`)
+
+**Config**: `~/.discord-cli/config.json` (channel map, guild ID, ports)
+
 ### Deployment Scripts
 
 **Executor Fleet**:
