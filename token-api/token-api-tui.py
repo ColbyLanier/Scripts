@@ -2022,17 +2022,17 @@ def _line_graph(values: list, width: int = 42, height: int = 3,
     # Mode → background color mapping
     # Working=dark blue, Multi=dark green, Idle=dark orange, Break=dark red
     MODE_BG = {
-        "working": "#0a1428",
-        "work_silence": "#0a1428",
-        "work_music": "#0a1428",
-        "work_video": "#0a2814",
-        "work_scrolling": "#281414",
-        "work_gaming": "#281414",
-        "break": "#280a0a",
-        "idle": "#28200a",
-        "multitasking": "#0a2814",
-        "distracted": "#280a0a",
-        "sleeping": "#101010",
+        "working":      "#0d2244",   # dark blue
+        "work_silence": "#0d2244",
+        "work_music":   "#0d2244",
+        "work_video":   "#0d3820",   # dark teal-green
+        "work_scrolling":"#3a1a1a",  # dark crimson
+        "work_gaming":  "#3a1a1a",
+        "break":        "#3a0f0f",   # dark red
+        "idle":         "#3a2800",   # dark amber/orange
+        "multitasking": "#0d3820",   # dark green
+        "distracted":   "#3a0f0f",   # dark red
+        "sleeping":     "#111111",   # near-black
     }
 
     # Braille dot bit positions: (col, row) -> bit
@@ -2105,7 +2105,8 @@ def _line_graph(values: list, width: int = 42, height: int = 3,
     # Detect slopes — use ╱╲ wherever the vertical gap exceeds one cell height (4 dots).
     # Slash until proven otherwise: if a slash fits, it should be present.
     slope_overrides = {}
-    SLOPE_THRESHOLD = 4  # one braille cell height — if gap > this, use slash
+    SLOPE_THRESHOLD = 8  # 2 cell heights — gentler slopes stay as braille
+    MAX_SLASH_ROWS = 3   # cap per column to avoid solid walls
     for col in range(width):
         x0 = col * 2
         x1 = col * 2 + 1
@@ -2130,7 +2131,14 @@ def _line_graph(values: list, width: int = 42, height: int = 3,
             row_top = max(0, dot_y_top // 4)
             row_bot = min(height - 1, dot_y_bot // 4)
             slope_char = "╱" if delta > 0 else "╲"
-            for r in range(row_top, row_bot + 1):
+            span = list(range(row_top, row_bot + 1))
+            if len(span) > MAX_SLASH_ROWS:
+                # Keep top, middle, and bottom rows only
+                keep = {span[0], span[-1]}
+                mid = len(span) // 2
+                keep.add(span[mid])
+                span = [r for r in span if r in keep]
+            for r in span:
                 slope_overrides[(r, col)] = slope_char
 
     # Build Text rows with per-column styling
