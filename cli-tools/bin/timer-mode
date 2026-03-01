@@ -5,11 +5,13 @@
 """Switch timer mode from the command line.
 
 Usage:
-    timer-mode break          # Enter break mode (consumes accumulated break)
-    timer-mode pause          # Enter pause mode (no accumulation)
-    timer-mode resume         # Return to work_silence
-    timer-mode silence        # Alias for resume
-    timer-mode status         # Show current mode (same as timer-status)
+    timer-mode break          # Enter break mode (manual override, consumes break balance)
+    timer-mode pause          # Set productivity inactive (→ IDLE)
+    timer-mode resume         # Exit manual override, set productivity active
+    timer-mode work           # Alias for resume
+    timer-mode sleep          # Enter sleeping (manual override, neutral rate)
+    timer-mode silence        # Legacy alias for resume (v1 compat)
+    timer-mode status         # Show current mode + break balance
 """
 
 import sys
@@ -22,13 +24,28 @@ COMMANDS = {
     "break": ("POST", "/api/timer/break"),
     "pause": ("POST", "/api/timer/pause"),
     "resume": ("POST", "/api/timer/resume"),
-    "silence": ("POST", "/api/timer/resume"),
+    "work": ("POST", "/api/timer/resume"),
+    "sleep": ("POST", "/api/timer/sleep"),
+    "silence": ("POST", "/api/timer/resume"),  # v1 legacy alias
     "status": ("GET", "/api/timer"),
 }
 
 
 def color(text, code):
     return f"\033[{code}m{text}\033[0m"
+
+
+def fmt_seconds(s):
+    s = int(s)
+    if s < 0:
+        sign = "-"
+        s = -s
+    else:
+        sign = ""
+    h, m = divmod(s // 60, 60)
+    if h:
+        return f"{sign}{h}h {m:02d}m"
+    return f"{sign}{m}m"
 
 
 def api_call(method, path):
@@ -60,7 +77,7 @@ def main():
     cmd = args[0].lower()
     if cmd not in COMMANDS:
         print(f"Unknown command: {cmd}", file=sys.stderr)
-        print(f"Valid: {', '.join(COMMANDS.keys())}", file=sys.stderr)
+        print(f"Valid: {', '.join(k for k in COMMANDS if k != 'silence')}", file=sys.stderr)
         sys.exit(1)
 
     method, path = COMMANDS[cmd]
@@ -70,7 +87,9 @@ def main():
         if status == 200:
             mode = data.get("current_mode", "?")
             break_s = data.get("accumulated_break_seconds", 0)
-            print(f"Mode: {mode}  Break: {break_s}s  Lock: {data.get('manual_mode_lock', False)}")
+            manual = data.get("manual_mode_lock", False)
+            lock_str = f"  lock={color('yes', '33')}" if manual else ""
+            print(f"Mode: {color(mode, '32')}  Break: {fmt_seconds(break_s)}{lock_str}")
         else:
             print(color(f"Error: {data.get('error', 'unknown')}", "31"), file=sys.stderr)
             sys.exit(1)
@@ -85,7 +104,7 @@ def main():
             print(f"Already in {new_mode} (no change)")
 
         if "break_available_seconds" in data:
-            print(f"Break available: {data['break_available_seconds']}s")
+            print(f"Break available: {fmt_seconds(data['break_available_seconds'])}")
     elif status == 400:
         print(color(f"Blocked: {data.get('error', 'unknown')}", "33"), file=sys.stderr)
         sys.exit(1)
