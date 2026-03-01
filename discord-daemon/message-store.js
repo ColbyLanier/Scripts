@@ -31,12 +31,14 @@ export function createMessageStore(logger) {
     },
 
     // Load all pending messages (for crash recovery on startup)
+    // Returns objects with _filename so recovery can delete the right file
     loadPending() {
       try {
         const files = readdirSync(PENDING_DIR).filter(f => f.endsWith('.json'));
         return files.map(f => {
           try {
-            return JSON.parse(readFileSync(join(PENDING_DIR, f), 'utf-8'));
+            const data = JSON.parse(readFileSync(join(PENDING_DIR, f), 'utf-8'));
+            return { ...data, _filename: f };
           } catch {
             return null;
           }

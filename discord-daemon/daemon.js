@@ -89,18 +89,23 @@ async function main() {
   await discordClient.start();
 
   // Retry pending messages after connection
+  const SNOWFLAKE_RE = /^\d{17,19}$/;
   for (const msg of pending) {
+    const pendingFile = msg._filename ? join(BASE_DIR, 'pending', msg._filename) : null;
     try {
       const channelId = config.channels[msg.channel] || msg.channelId;
-      if (channelId && msg.content) {
+      if (channelId && msg.content && SNOWFLAKE_RE.test(channelId)) {
         await discordClient.sendMessage(channelId, msg.content);
         logger.info(`Recovered pending message to ${msg.channel}`);
+      } else if (channelId && !SNOWFLAKE_RE.test(channelId)) {
+        logger.warn(`Dropping stale pending message: invalid channel ID "${channelId}" (${msg.channel})`);
       }
       // Remove from pending regardless (stale messages shouldn't block forever)
-      const pendingFile = join(BASE_DIR, 'pending', `${msg.persisted_at?.replace(/[:.]/g, '-') || 'unknown'}.json`);
-      try { unlinkSync(pendingFile); } catch {}
+      if (pendingFile) { try { unlinkSync(pendingFile); } catch {} }
     } catch (err) {
       logger.error(`Failed to recover pending message: ${err.message}`);
+      // Still try to remove the file so it doesn't block future startups
+      if (pendingFile) { try { unlinkSync(pendingFile); } catch {} }
     }
   }
 
