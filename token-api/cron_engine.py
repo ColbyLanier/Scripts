@@ -434,7 +434,7 @@ class CronEngine:
         msg = f"⚔️ **IMPERIUM VICTORIOUS** — {job['name']}\n> {reason}"
         try:
             subprocess.run(
-                ["discord", "send", "operations", "--message", msg],
+                ["discord", "send", "operations", msg],
                 timeout=10,
                 env=_subprocess_env(),
             )

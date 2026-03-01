@@ -209,7 +209,7 @@ async def aggregate_guards_node(state: PostRunState) -> PostRunState:
     msg = "\n".join(lines)
     try:
         subprocess.run(
-            ["discord", "send", "operations", "--message", msg],
+            ["discord", "send", "operations", msg],
             timeout=10,
             env=_subprocess_env(),
         )
@@ -226,7 +226,7 @@ async def notify_victory_node(state: PostRunState) -> PostRunState:
     msg = f"⚔️ **IMPERIUM VICTORIOUS** — {job_name}\n> {reason}"
     try:
         subprocess.run(
-            ["discord", "send", "operations", "--message", msg],
+            ["discord", "send", "operations", msg],
             timeout=10,
             env=_subprocess_env(),
         )
