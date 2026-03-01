@@ -28,6 +28,7 @@
 #   discord ask approvals --question "Proceed?" --options "Yes" "No" --timeout 1h
 #   discord ask approvals --question "Deploy now?" --react --timeout 30m
 #   discord ask approvals --question "Vault next?" --react --blocking
+#   discord ask approvals --question "Proceed?" --react --no-wait  # fire-and-forget, poll later
 #   discord poll --message-id 1477xxx --channel approvals
 #   discord subscribe general claw-chat
 #   echo "multi-line" | discord send tasks
@@ -155,9 +156,9 @@ cmd_react() {
 cmd_ask() {
   local channel="${1:-}"
   shift || true
-  [[ -z "$channel" ]] && die "Usage: discord ask <channel> --question <text> [--options ...] [--title <t>] [--timeout <dur>] [--react [emoji...]] [--blocking]"
+  [[ -z "$channel" ]] && die "Usage: discord ask <channel> --question <text> [--options ...] [--title <t>] [--timeout <dur>] [--react [emoji...]] [--blocking] [--no-wait]"
 
-  local question="" title="" context_text="" timeout_str="1h" react_mode=false blocking=false
+  local question="" title="" context_text="" timeout_str="1h" react_mode=false blocking=false no_wait=false
   local -a options=()
   local -a react_emojis=()
 
@@ -167,6 +168,7 @@ cmd_ask() {
       --title)    title="$2"; shift 2 ;;
       --context)  context_text="$2"; shift 2 ;;
       --blocking) blocking=true; shift ;;
+      --no-wait)  no_wait=true; shift ;;
       --timeout)  timeout_str="$2"; shift 2 ;;
       --react)
         react_mode=true
@@ -243,6 +245,12 @@ cmd_ask() {
         '{channel: $ch, message_id: $mid, emoji: $e}')
       post "/react" "$react_data" >/dev/null 2>&1
     done
+  fi
+
+  # --no-wait: return immediately after sending (poll later with `discord poll`)
+  if $no_wait; then
+    jq -n --arg mid "$message_id" '{message_id: $mid, answered: false, sent: true}'
+    exit 0
   fi
 
   echo "Waiting for reply (timeout: $timeout_str)..." >&2
