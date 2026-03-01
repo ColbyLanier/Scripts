@@ -5,11 +5,13 @@
 """Quick timer status display.
 
 Usage:
-    timer-status              # One-line status
-    timer-status --layers     # One-line status + layer breakdown
-    timer-status --shifts     # One-line status + session mode distribution + sparkline
-    timer-status --watch      # Continuous monitoring (1s refresh)
-    timer-status --json       # Raw JSON from API
+    timer-status                      # One-line status
+    timer-status --layers             # One-line status + layer breakdown
+    timer-status --shifts             # One-line status + session mode distribution + sparkline
+    timer-status --sparkline          # One-line status + balance trajectory sparkline only
+    timer-status --width N            # Set sparkline width (default 50); use with --shifts or --sparkline
+    timer-status --watch              # Continuous monitoring (1s refresh)
+    timer-status --json               # Raw JSON from API
 """
 
 import sys
@@ -182,7 +184,7 @@ def sparkline(series, width=50):
     return "  " + "".join(bar_chars) + "  " + label
 
 
-def display_shifts(shifts):
+def display_shifts(shifts, width=50):
     """Print a compact session mode-distribution summary."""
     dist = shifts.get("mode_distribution", {})
     total_s = sum(dist.values()) or 1
@@ -234,7 +236,7 @@ def display_shifts(shifts):
     # Balance trajectory sparkline
     series = shifts.get("balance_series", [])
     if series:
-        print(sparkline(series))
+        print(sparkline(series, width=width))
 
 
 def main():
@@ -255,6 +257,17 @@ def main():
 
     show_layers = "--layers" in args
     show_shifts = "--shifts" in args
+    show_sparkline = "--sparkline" in args
+
+    # Parse --width N
+    spark_width = 50
+    if "--width" in args:
+        idx = args.index("--width")
+        if idx + 1 < len(args):
+            try:
+                spark_width = max(10, int(args[idx + 1]))
+            except ValueError:
+                pass
 
     if "--watch" in args:
         try:
@@ -263,10 +276,15 @@ def main():
                 data = get_timer()
                 if data:
                     display(data, show_layers=show_layers)
-                    if show_shifts:
+                    if show_shifts or show_sparkline:
                         shifts = get_shifts()
                         if shifts:
-                            display_shifts(shifts)
+                            if show_shifts:
+                                display_shifts(shifts, width=spark_width)
+                            elif show_sparkline:
+                                series = shifts.get("balance_series", [])
+                                if series:
+                                    print(sparkline(series, width=spark_width))
                 else:
                     print(color("Server unreachable", "31"))
                 time.sleep(1)
@@ -277,10 +295,17 @@ def main():
     data = get_timer()
     if data:
         display(data, show_layers=show_layers)
-        if show_shifts:
+        if show_shifts or show_sparkline:
             shifts = get_shifts()
             if shifts:
-                display_shifts(shifts)
+                if show_shifts:
+                    display_shifts(shifts, width=spark_width)
+                elif show_sparkline:
+                    series = shifts.get("balance_series", [])
+                    if series:
+                        print(sparkline(series, width=spark_width))
+                    else:
+                        print(color("  (no balance data)", "90"))
             else:
                 print(color("  (shifts unavailable)", "90"), file=sys.stderr)
     else:
