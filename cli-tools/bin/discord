@@ -271,17 +271,18 @@ cmd_ask() {
   if $timed_out; then
     jq -n --arg mid "$message_id" '{message_id: $mid, answered: false}'
   else
-    local emoji user_id content
-    emoji=$(echo "$wait_result"   | jq -r '.reply.emoji   // empty')
-    user_id=$(echo "$wait_result" | jq -r '.reply.user_id // empty')
-    content=$(echo "$wait_result" | jq -r '.reply.content // empty')
+    local emoji user_id content reply_message_id
+    emoji=$(echo "$wait_result"            | jq -r '.reply.emoji      // empty')
+    user_id=$(echo "$wait_result"          | jq -r '.reply.user_id    // empty')
+    content=$(echo "$wait_result"          | jq -r '.reply.content    // empty')
+    reply_message_id=$(echo "$wait_result" | jq -r '.reply.message_id // empty')
 
     if [[ -n "$emoji" ]]; then
-      jq -n --arg mid "$message_id" --arg e "$emoji" --arg uid "$user_id" \
-        '{message_id: $mid, answered: true, emoji: $e, user_id: $uid}'
+      jq -n --arg mid "$message_id" --arg e "$emoji" --arg uid "$user_id" --arg rmid "$reply_message_id" \
+        '{message_id: $mid, answered: true, emoji: $e, user_id: $uid, reply_message_id: $rmid}'
     else
-      jq -n --arg mid "$message_id" --arg c "$content" \
-        '{message_id: $mid, answered: true, content: $c}'
+      jq -n --arg mid "$message_id" --arg c "$content" --arg rmid "$reply_message_id" \
+        '{message_id: $mid, answered: true, content: $c, reply_message_id: $rmid}'
     fi
   fi
 }
