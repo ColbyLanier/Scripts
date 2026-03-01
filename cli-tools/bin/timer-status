@@ -7,6 +7,7 @@
 Usage:
     timer-status                      # One-line status
     timer-status --layers             # One-line status + layer breakdown
+    timer-status --balance            # Compact single-line: mode + colored balance only
     timer-status --shifts             # One-line status + session mode distribution + sparkline
     timer-status --sparkline          # One-line status + balance trajectory sparkline only
     timer-status --width N            # Set sparkline width (default 50); use with --shifts or --sparkline
@@ -81,6 +82,30 @@ def fmt_ms_hm(ms):
 def color(text, code):
     """ANSI color wrapper."""
     return f"\033[{code}m{text}\033[0m"
+
+
+def display_balance(data):
+    """Compact single-line: mode icon + name + colored break balance."""
+    mode = (data.get("current_mode") or "").lower()
+    icon = MODE_ICONS.get(mode, "\u2753")
+    mode_name = mode.replace("_", " ").title() if mode else "?"
+
+    if data.get("is_in_backlog"):
+        bal_s = -round(data.get("break_backlog_ms", 0) / 1000)
+    else:
+        bal_s = data.get("accumulated_break_seconds", 0)
+
+    abs_str = fmt_time(abs(bal_s))
+    bal_str = ("+" if bal_s >= 0 else "-") + abs_str
+
+    if bal_s > 1800:
+        bal_colored = color(bal_str, "32")   # green
+    elif bal_s > 0:
+        bal_colored = color(bal_str, "33")   # yellow
+    else:
+        bal_colored = color(bal_str, "31")   # red
+
+    print(f"{icon}  {mode_name}  {bal_colored}")
 
 
 def display(data, show_layers=False):
@@ -255,6 +280,7 @@ def main():
             sys.exit(1)
         return
 
+    show_balance = "--balance" in args
     show_layers = "--layers" in args
     show_shifts = "--shifts" in args
     show_sparkline = "--sparkline" in args
@@ -275,7 +301,10 @@ def main():
                 print("\033[2J\033[H", end="")  # clear screen
                 data = get_timer()
                 if data:
-                    display(data, show_layers=show_layers)
+                    if show_balance:
+                        display_balance(data)
+                    else:
+                        display(data, show_layers=show_layers)
                     if show_shifts or show_sparkline:
                         shifts = get_shifts()
                         if shifts:
@@ -294,7 +323,10 @@ def main():
 
     data = get_timer()
     if data:
-        display(data, show_layers=show_layers)
+        if show_balance:
+            display_balance(data)
+        else:
+            display(data, show_layers=show_layers)
         if show_shifts or show_sparkline:
             shifts = get_shifts()
             if shifts:
