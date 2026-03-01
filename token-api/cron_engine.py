@@ -138,6 +138,8 @@ class CronEngine:
             await db.execute("ALTER TABLE cron_jobs ADD COLUMN guards_count INTEGER DEFAULT 0")
         if "followup_delay_seconds" not in cron_jobs_cols:
             await db.execute("ALTER TABLE cron_jobs ADD COLUMN followup_delay_seconds INTEGER DEFAULT NULL")
+        if "notify_discord" not in cron_jobs_cols:
+            await db.execute("ALTER TABLE cron_jobs ADD COLUMN notify_discord INTEGER DEFAULT 0")
 
         cursor = await db.execute("PRAGMA table_info(cron_runs)")
         cron_runs_cols = {row[1] for row in await cursor.fetchall()}
@@ -145,6 +147,31 @@ class CronEngine:
             await db.execute("ALTER TABLE cron_runs ADD COLUMN victory_reason TEXT DEFAULT NULL")
 
         await db.commit()
+
+    # ── Startup Cleanup ────────────────────────────────────────
+
+    async def recover_orphaned_runs(self):
+        """Mark any 'running' records as 'orphaned' on startup.
+
+        These are runs whose process was lost when the server restarted.
+        Without this, stuck records accumulate and the FG detects false positives.
+        """
+        now = _now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM cron_runs WHERE status = 'running'"
+            )
+            count = (await cursor.fetchone())[0]
+            if count:
+                await db.execute("""
+                    UPDATE cron_runs
+                    SET status = 'orphaned',
+                        finished_at = ?,
+                        error_summary = 'Process lost on server restart — run never completed'
+                    WHERE status = 'running'
+                """, (now,))
+                await db.commit()
+                print(f"CronEngine: Orphaned {count} stale 'running' record(s) from previous session")
 
     # ── Load / Sync ────────────────────────────────────────────
 
@@ -172,8 +199,8 @@ class CronEngine:
                         command, timeout_seconds,
                         quiet_hours_start, quiet_hours_end,
                         max_runs_per_window, run_window_hours,
-                        session_type, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        session_type, notify_discord, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(name) DO UPDATE SET
                         description = excluded.description,
                         schedule_type = excluded.schedule_type,
@@ -186,6 +213,7 @@ class CronEngine:
                         max_runs_per_window = excluded.max_runs_per_window,
                         run_window_hours = excluded.run_window_hours,
                         session_type = excluded.session_type,
+                        notify_discord = excluded.notify_discord,
                         updated_at = excluded.updated_at
                 """, (
                     job_id, name,
@@ -200,6 +228,7 @@ class CronEngine:
                     job_def.get("max_runs_per_window"),
                     job_def.get("run_window_hours", 5),
                     job_def.get("session_type", "isolated"),
+                    1 if job_def.get("notify_discord") else 0,
                     _now_iso(), _now_iso(),
                 ))
             await db.commit()
@@ -316,7 +345,7 @@ class CronEngine:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute("""
                 SELECT COUNT(*) FROM cron_runs
-                WHERE job_id = ? AND started_at > ? AND status IN ('ok', 'error', 'timeout')
+                WHERE job_id = ? AND started_at > ? AND status IN ('ok', 'error', 'timeout', 'orphaned')
             """, (job["id"], cutoff))
             count = (await cursor.fetchone())[0]
 
@@ -397,6 +426,18 @@ class CronEngine:
                 print(f"CronEngine: DB update failed for '{job['name']}': {db_err}")
 
             print(f"CronEngine: '{job['name']}' finished: {status} ({duration:.1f}s)")
+
+            # Discord completion notification
+            if job.get("notify_discord"):
+                emoji = "✅" if status == "ok" else ("⏱️" if status == "timeout" else "❌")
+                msg = f"{emoji} **{job['name']}**: {status} ({duration:.0f}s)"
+                try:
+                    subprocess.run(
+                        ["discord", "send", "operations", msg],
+                        timeout=8, env=_subprocess_env(),
+                    )
+                except Exception as e:
+                    print(f"CronEngine: Discord notify failed for '{job['name']}': {e}")
 
             # Post-run: victory handling or follow-up scheduling
             if status == "ok":

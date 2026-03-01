@@ -8,7 +8,8 @@
     "timeout_seconds": 180,
     "max_runs_per_window": 8,
     "run_window_hours": 5,
-    "session_type": "isolated"
+    "session_type": "isolated",
+    "notify_discord": true
   },
   {
     "name": "mechanicus-vault",
@@ -19,12 +20,13 @@
     "timeout_seconds": 600,
     "max_runs_per_window": 4,
     "run_window_hours": 12,
-    "session_type": "isolated"
+    "session_type": "isolated",
+    "notify_discord": true
   },
   {
     "name": "mechanicus-token-api",
     "description": "Token API / Cron Engine domain worker. Endpoints, TUI, monitoring.",
-    "enabled": true,
+    "enabled": false,
     "schedule": { "type": "cron", "value": "0 */8 * * *", "tz": "America/Phoenix" },
     "command": "claude --model claude-sonnet-4-6 -p \"$(cat ~/.openclaw/workspace/memory/prompts/mechanicus-token-api.md)\" --dangerously-skip-permissions",
     "timeout_seconds": 600,
@@ -41,7 +43,8 @@
     "timeout_seconds": 600,
     "max_runs_per_window": 3,
     "run_window_hours": 12,
-    "session_type": "isolated"
+    "session_type": "isolated",
+    "notify_discord": true
   },
   {
     "name": "mechanicus-discord",
@@ -52,15 +55,16 @@
     "timeout_seconds": 600,
     "max_runs_per_window": 2,
     "run_window_hours": 12,
-    "session_type": "isolated"
+    "session_type": "isolated",
+    "notify_discord": true
   },
   {
     "name": "adeptus-custodes",
-    "description": "Morning briefing: reads overnight domain logs, posts to #interrogative via Custodes account, asks one question.",
+    "description": "Morning briefing: reads overnight domain logs + cron DB stats, posts full report to #operations and greeting to #interrogative.",
     "enabled": true,
-    "schedule": { "type": "cron", "value": "35 8 * * *", "tz": "America/Phoenix" },
-    "command": "claude --model claude-sonnet-4-6 -p 'You are the Adeptus Custodes. It is morning. Your Discord identity is Custodes — all messages go through the custodius account. Read these domain logs: ~/.openclaw/workspace/memory/logs/vault_log.md, ~/.openclaw/workspace/memory/logs/token_api_log.md, ~/.openclaw/workspace/memory/logs/cli_tools_log.md, ~/.openclaw/workspace/memory/logs/discord_log.md, ~/.openclaw/workspace/memory/logs/fabricator_log.md, and ~/.openclaw/workspace/memory/logs/security_log.md. Summarize what happened overnight in 3-5 bullet points. Post to Discord #interrogative (channel 1474963429902258176) via: discord send --channel 1474963429902258176 --message \"...\". Then ask me one question about what I want to focus on today.' --dangerously-skip-permissions -r custodes",
-    "timeout_seconds": 120,
+    "schedule": { "type": "cron", "value": "0 8 * * *", "tz": "America/Phoenix" },
+    "command": "claude --model claude-sonnet-4-6 -p \"$(cat ~/.openclaw/workspace/memory/prompts/adeptus-custodes.md)\" --dangerously-skip-permissions -r custodes",
+    "timeout_seconds": 180,
     "quiet_hours": [21, 8],
     "max_runs_per_window": 3,
     "run_window_hours": 12,

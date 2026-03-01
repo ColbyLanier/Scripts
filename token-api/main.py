@@ -1217,6 +1217,7 @@ async def lifespan(app: FastAPI):
     # Initialize cron engine
     global cron_engine
     cron_engine = CronEngine(scheduler, DB_PATH)
+    await cron_engine.recover_orphaned_runs()
     await cron_engine.load_from_config()
     print("Cron engine loaded")
     # Start TTS queue worker
