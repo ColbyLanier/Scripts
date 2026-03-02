@@ -10,7 +10,7 @@
 #   read <channel> [--limit N]        Read recent messages
 #   react <channel> <message_id> <emoji>          Add a reaction to a message
 #   ask <channel> [options]           Post question, wait up to --timeout (default 1h) for reply
-#   poll --message-id <id> --channel <ch>         Check if a message has a human reaction
+#   poll --message-id <id> --channel <ch>         Check if a message has a human reaction or reply (exit 0=answered, 1=not yet)
 #   declare <channel> [options]       Post formatted status
 #   dm <message>                      DM the operator
 #   subscribe [channels...]           Stream messages (SSE) from channels
@@ -323,7 +323,11 @@ cmd_poll() {
   [[ -z "$message_id" ]] && die "--message-id is required"
   [[ -z "$channel" ]] && die "--channel is required"
 
-  get "/poll?message_id=${message_id}&channel=${channel}"
+  local result
+  result=$(get "/poll?message_id=${message_id}&channel=${channel}")
+  echo "$result"
+  # Exit 0 if answered, 1 if not yet (follows grep/test conventions for boolean)
+  [[ "$(echo "$result" | jq -r '.answered // false')" == "true" ]] || exit 1
 }
 
 cmd_declare() {
