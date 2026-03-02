@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import re
+import signal
 import subprocess
 import uuid
 from datetime import datetime, timedelta
@@ -379,30 +380,51 @@ class CronEngine:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=_subprocess_env(CRON_JOB_NAME=job["name"], CRON_JOB_ID=job_id),
+                start_new_session=True,
             )
             self._running_jobs[job_id] = proc
 
+            # Start independent read tasks so data is accumulated regardless of
+            # whether proc.wait() times out. Unlike communicate(), these tasks
+            # are not cancelled when wait_for(proc.wait()) times out.
+            read_stdout = asyncio.create_task(proc.stdout.read())
+            read_stderr = asyncio.create_task(proc.stderr.read())
+
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(),
+                await asyncio.wait_for(
+                    proc.wait(),
                     timeout=job.get("timeout_seconds", 120),
                 )
                 exit_code = proc.returncode
+                stdout = await read_stdout
+                stderr = await read_stderr
                 output_summary = (stdout or b"").decode("utf-8", errors="replace")[-4000:]
                 error_summary = (stderr or b"").decode("utf-8", errors="replace")[-4000:]
                 status = "ok" if exit_code == 0 else "error"
             except asyncio.TimeoutError:
-                proc.kill()
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 await proc.wait()
+                # Pipes close after killpg; read tasks should complete promptly.
+                try:
+                    stdout = await asyncio.wait_for(read_stdout, timeout=5)
+                    stderr = await asyncio.wait_for(read_stderr, timeout=5)
+                except asyncio.TimeoutError:
+                    read_stdout.cancel()
+                    read_stderr.cancel()
+                    stdout, stderr = b"", b""
+                output_summary = (stdout or b"").decode("utf-8", errors="replace")[-4000:]
+                error_summary = (stderr or b"").decode("utf-8", errors="replace")[-2000:]
                 status = "timeout"
-                error_summary = f"Killed after {job.get('timeout_seconds', 120)}s timeout"
+                error_summary = f"Killed after {job.get('timeout_seconds', 120)}s timeout\n" + error_summary
 
         except Exception as e:
             status = "error"
             error_summary = str(e)[:4000]
 
         finally:
-            self._running_jobs.pop(job_id, None)
             duration = _time.monotonic() - start_time
             finished_at = _now_iso()
 
@@ -424,6 +446,9 @@ class CronEngine:
                     await db.commit()
             except Exception as db_err:
                 print(f"CronEngine: DB update failed for '{job['name']}': {db_err}")
+            finally:
+                # Pop AFTER DB write so is_running stays true until DB is consistent
+                self._running_jobs.pop(job_id, None)
 
             print(f"CronEngine: '{job['name']}' finished: {status} ({duration:.1f}s)")
 
@@ -433,7 +458,7 @@ class CronEngine:
                 msg = f"{emoji} **{job['name']}**: {status} ({duration:.0f}s)"
                 try:
                     subprocess.run(
-                        ["discord", "send", "operations", msg],
+                        ["discord", "send", "fleet", msg],
                         timeout=8, env=_subprocess_env(),
                     )
                 except Exception as e:
@@ -475,7 +500,7 @@ class CronEngine:
         msg = f"⚔️ **IMPERIUM VICTORIOUS** — {job['name']}\n> {reason}"
         try:
             subprocess.run(
-                ["discord", "send", "operations", msg],
+                ["discord", "send", "fleet", msg],
                 timeout=10,
                 env=_subprocess_env(),
             )

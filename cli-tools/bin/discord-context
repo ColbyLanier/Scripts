@@ -12,7 +12,7 @@ set -euo pipefail
 WORKSPACE="$HOME/.openclaw/workspace"
 OUTPUT="$WORKSPACE/context/discord/AGENTS.md"
 LIMIT=25
-CHANNELS=(general claw-chat tasks approvals alerts meta research operations)
+CHANNELS=(fleet forge approvals alerts briefing chat)
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -63,15 +63,12 @@ for CHANNEL in "${CHANNELS[@]}"; do
 
     # Resolve channel name to ID for openclaw
     case "$CHANNEL" in
-      general)       CID="1472713270916944020" ;;
-      claw-chat)     CID="1472722308199219352" ;;
-      tasks)         CID="1473154087490158656" ;;
+      fleet)         CID="1473184628155088918" ;;
+      forge)         CID="1477934034150490113" ;;
       approvals)     CID="1473154111301091469" ;;
       alerts)        CID="1473154160202612831" ;;
-      meta)          CID="1473154180200927264" ;;
-      research)      CID="1473154201331699874" ;;
-      operations)    CID="1473184628155088918" ;;
-      interrogative) CID="1474963429902258176" ;;
+      briefing)      CID="1474963429902258176" ;;
+      chat)          CID="1477934048037830687" ;;
       *) CID="$CHANNEL" ;;
     esac
 

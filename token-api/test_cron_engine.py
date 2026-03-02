@@ -414,6 +414,19 @@ class TestExecution:
         runs = run(engine.get_runs(created["id"]))
         assert runs[0]["status"] == "timeout"
         assert runs[0]["duration_seconds"] < 5
+        assert "Killed after" in runs[0]["error_summary"]
+
+    def test_timeout_stderr_collected(self, engine):
+        """Stderr buffered before kill should survive in error_summary."""
+        created = run(engine.create_job(create_job_dict(
+            name="exec-timeout-stderr",
+            command="echo pre_kill_stderr >&2; sleep 30",
+            timeout_seconds=2,
+        )))
+        run(engine._execute(created))
+        runs = run(engine.get_runs(created["id"]))
+        assert runs[0]["status"] == "timeout"
+        assert "pre_kill_stderr" in runs[0]["error_summary"]
 
     def test_stderr_captured(self, engine):
         created = run(engine.create_job(create_job_dict(

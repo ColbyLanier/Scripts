@@ -59,16 +59,28 @@
     "notify_discord": true
   },
   {
+    "name": "mechanicus-prospector",
+    "description": "Autonomy queue builder. Scouts codebases/vault for gaps, writes prescriptive proposal notes, asks Emperor to classify via #approvals. Fires when queue runs low.",
+    "enabled": true,
+    "schedule": { "type": "cron", "value": "0 */12 * * *", "tz": "America/Phoenix" },
+    "command": "claude --model claude-sonnet-4-6 -p \"$(cat ~/.openclaw/workspace/memory/prompts/mechanicus-prospector.md)\" --dangerously-skip-permissions",
+    "timeout_seconds": 600,
+    "max_runs_per_window": 2,
+    "run_window_hours": 24,
+    "session_type": "isolated",
+    "notify_discord": true
+  },
+  {
     "name": "adeptus-custodes",
     "description": "Morning briefing: reads overnight domain logs + cron DB stats, posts full report to #operations and greeting to #interrogative.",
     "enabled": true,
     "schedule": { "type": "cron", "value": "0 8 * * *", "tz": "America/Phoenix" },
-    "command": "claude --model claude-sonnet-4-6 -p \"$(cat ~/.openclaw/workspace/memory/prompts/adeptus-custodes.md)\" --dangerously-skip-permissions -r custodes",
+    "command": "claude --model claude-sonnet-4-6 -p \"$(cat ~/.openclaw/workspace/memory/prompts/adeptus-custodes.md)\" --dangerously-skip-permissions",
     "timeout_seconds": 180,
     "quiet_hours": [21, 8],
     "max_runs_per_window": 3,
     "run_window_hours": 12,
-    "session_type": "resume"
+    "session_type": "isolated"
   },
   {
     "name": "security-monitor",
