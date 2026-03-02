@@ -31,6 +31,7 @@ import os
 import re
 import argparse
 import json
+import sqlite3
 import subprocess
 import time
 import threading
@@ -59,6 +60,9 @@ load_dotenv(Path(__file__).parent / ".env")
 # API configuration — reads from env, defaults to localhost (Mac)
 API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
 SERVER_PORT = 7777
+
+# Database path (for direct queries like session doc lookup)
+DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
 
 # Configuration
 REFRESH_INTERVAL = 2  # seconds
@@ -1728,6 +1732,27 @@ def create_instance_details_panel(instance: dict, todos_data: dict, compact: boo
     else:  # silent
         lines.append(f"[cyan]Voice:[/cyan] [red]silent[/red]")
     lines.append(f"[cyan]Dir:[/cyan]   [dim]{working_dir_short}[/dim]")
+
+    # Session document display
+    session_doc_id = instance.get("session_doc_id")
+    if session_doc_id:
+        try:
+            with sqlite3.connect(DB_PATH) as doc_conn:
+                doc_cursor = doc_conn.execute(
+                    "SELECT title, file_path FROM session_documents WHERE id = ?",
+                    (session_doc_id,)
+                )
+                doc_row = doc_cursor.fetchone()
+            if doc_row:
+                doc_title = doc_row[0] or "untitled"
+                doc_path = doc_row[1]
+                short_path = doc_path.replace(str(Path.home()), "~")
+                if len(short_path) > 50:
+                    short_path = "..." + short_path[-47:]
+                lines.append(f"[cyan]Session:[/cyan] [bold]{doc_title}[/bold]  [dim]{short_path}[/dim]")
+        except Exception:
+            lines.append(f"[cyan]Session:[/cyan] [dim]doc #{session_doc_id}[/dim]")
+
     lines.append("")
 
     todos = todos_data.get("todos", [])
@@ -2523,7 +2548,7 @@ def create_status_bar(instances: list, selected_idx: int) -> Text:
         else:
             text.append_text(Text.from_markup(f"[yellow bold]{feedback_msg}[/yellow bold]"))
     else:
-        text.append_text(Text.from_markup("[dim]jk=nav r=rename s=stop m=mute M=global q=quit[/dim]"))
+        text.append_text(Text.from_markup("[dim]jk=nav r=rename s=stop m=mute n=note M=global q=quit[/dim]"))
 
     return text
 
@@ -2903,7 +2928,7 @@ def main():
         console.print(f"[yellow]Warning:[/yellow] {api_error_message}")
         console.print("[dim]TUI will retry API calls — data panels may be empty until server is reachable.[/dim]")
 
-    console.print("[dim]Controls: jk=nav, gG=top/btm, []=table, h/l=page, Enter=open, r=rename, f=filter, s=stop, d=del, R=restart, q=quit[/dim]\n")
+    console.print("[dim]Controls: jk=nav, gG=top/btm, []=table, h/l=page, Enter=open, r=rename, n=note, f=filter, s=stop, d=del, R=restart, q=quit[/dim]\n")
 
     # Record startup time for smart restart detection; clean stale signals
     tui_slot = "mobile" if layout_mode == "mobile" else "desktop"
@@ -3024,6 +3049,10 @@ def main():
                     elif key == 'm':
                         with action_lock:
                             action_queue.append('mute_toggle')
+                        update_flag.set()
+                    elif key == 'n':
+                        with action_lock:
+                            action_queue.append('session_note')
                         update_flag.set()
                     elif key == 'M':
                         with action_lock:
@@ -3172,6 +3201,62 @@ def main():
                                         console.print(f"[green]v[/green] Renamed to: {new_name}")
                                     else:
                                         console.print("[red]x[/red] Rename failed")
+                                else:
+                                    console.print("[dim]Cancelled[/dim]")
+                            except (KeyboardInterrupt, EOFError):
+                                console.print("[dim]Cancelled[/dim]")
+
+                            time.sleep(0.3)
+                            tty.setcbreak(sys.stdin.fileno())
+                            input_mode.clear()
+                            instances_cache = get_instances()
+                            _clamp_selection()
+                            live.start()
+                            _refresh(live)
+
+                    elif action == 'session_note' and displayed and table_mode == "instances":
+                        if 0 <= selected_index < len(displayed):
+                            instance = displayed[selected_index]
+                            instance_id = instance.get("id")
+                            session_doc_id = instance.get("session_doc_id")
+
+                            if not session_doc_id:
+                                input_mode.set()
+                                time.sleep(0.1)
+                                live.stop()
+                                console.print("[yellow]No session doc linked. Use instance-name --session to create one.[/yellow]")
+                                time.sleep(1.5)
+                                live.start()
+                                input_mode.clear()
+                                _refresh(live)
+                                continue
+
+                            input_mode.set()
+                            time.sleep(0.1)
+                            live.stop()
+
+                            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, original_terminal_settings)
+
+                            console.print(f"\n[yellow]Session note for:[/yellow] {format_instance_name(instance)}")
+                            try:
+                                note = Prompt.ask("Note")
+                                if note and note.strip():
+                                    try:
+                                        merge_body = json.dumps({"content": note.strip(), "source": "tui", "context": "Quick note from TUI"}).encode("utf-8")
+                                        req = urllib.request.Request(
+                                            f"{API_URL}/api/session-docs/{session_doc_id}/merge",
+                                            data=merge_body,
+                                            headers={"Content-Type": "application/json"},
+                                            method="POST"
+                                        )
+                                        with urllib.request.urlopen(req, timeout=30) as resp:
+                                            result = json.loads(resp.read().decode())
+                                        if result.get("status") == "merged":
+                                            console.print("[green]v[/green] Note merged into session doc")
+                                        else:
+                                            console.print(f"[red]x[/red] Unexpected response: {result}")
+                                    except Exception as e:
+                                        console.print(f"[red]x[/red] Merge request failed: {e}")
                                 else:
                                     console.print("[dim]Cancelled[/dim]")
                             except (KeyboardInterrupt, EOFError):
