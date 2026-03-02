@@ -240,7 +240,7 @@ export function createHttpServer(discordClient, messageStore, config, logger) {
         return json(res, { channels });
       }
 
-      // GET /poll — Check if a message has received a human (non-bot) reaction
+      // GET /poll — Check if a message has received a human reaction or text reply
       if (method === 'GET' && path === '/poll') {
         const query = parseQuery(req.url);
         if (!query.message_id) return json(res, { error: 'message_id required' }, 400);
@@ -249,8 +249,13 @@ export function createHttpServer(discordClient, messageStore, config, logger) {
         const channelId = resolveChannel(query.channel);
         if (!channelId) return json(res, { error: `Unknown channel: ${query.channel}` }, 400);
 
-        const result = await discordClient.getMessageReactions(channelId, query.message_id);
-        return json(res, result);
+        const reactionResult = await discordClient.getMessageReactions(channelId, query.message_id);
+        if (reactionResult) return json(res, reactionResult);
+
+        const replyResult = await discordClient.getMessageReplies(channelId, query.message_id);
+        if (replyResult) return json(res, replyResult);
+
+        return json(res, { answered: false });
       }
 
       // 404

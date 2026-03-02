@@ -249,11 +249,30 @@ export function createDiscordClient(config, logger) {
         const users = await reaction.users.fetch();
         for (const [userId, user] of users) {
           if (userId !== botId && !user.bot) {
-            return { answered: true, emoji: reaction.emoji.name, user_id: userId, username: user.username };
+            return { answered: true, type: 'reaction', emoji: reaction.emoji.name, user_id: userId, username: user.username };
           }
         }
       }
-      return { answered: false };
+      return null;
+    },
+
+    async getMessageReplies(channelId, messageId) {
+      const channel = await client.channels.fetch(channelId);
+      const messages = await channel.messages.fetch({ limit: 50, after: messageId });
+      const botId = client.user?.id;
+      for (const [, msg] of messages) {
+        if (msg.reference?.messageId === messageId && msg.author.id !== botId && !msg.author.bot) {
+          return {
+            answered: true,
+            type: 'reply',
+            content: msg.content,
+            user_id: msg.author.id,
+            username: msg.author.username,
+            reply_message_id: msg.id,
+          };
+        }
+      }
+      return null;
     },
 
     async sendDM(content) {
