@@ -8880,6 +8880,31 @@ async def unassign_doc_from_instance(instance_id: str):
     return {"instance_id": instance_id, "doc_id": old_doc_id, "unassigned": True}
 
 
+@app.get("/api/instances/{instance_id}/session-doc")
+async def get_instance_session_doc(instance_id: str):
+    """Get the session document linked to this instance."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT session_doc_id FROM claude_instances WHERE id = ?",
+            (instance_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(404, "Instance not found")
+        if not row[0]:
+            return {"session_doc_id": None}
+
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM session_documents WHERE id = ?",
+            (row[0],)
+        )
+        doc = await cursor.fetchone()
+        if not doc:
+            return {"session_doc_id": None}
+        return dict(doc)
+
+
 # ============ MiniMax Status Endpoint ============
 
 @app.get("/api/minimax/status")
