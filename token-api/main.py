@@ -33,6 +33,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import subprocess
 import tempfile
 import requests
+import httpx
 from pydantic import BaseModel, Field
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -7772,6 +7773,15 @@ async def handle_stop(payload: dict) -> dict:
         )
         await db.commit()
 
+    # Fire session doc swarm if instance has a linked doc
+    session_doc_id = instance.get("session_doc_id")
+    is_subagent_instance_quick = bool(instance.get("is_subagent"))
+    if session_doc_id and not is_subagent_instance_quick:
+        stop_context = payload.get("transcript_tail", "")[:2000] if payload.get("transcript_tail") else ""
+        asyncio.create_task(fire_session_doc_swarm(
+            session_doc_id, tab_name, context=stop_context
+        ))
+
     result = {
         "success": True,
         "action": "stop_processed",
@@ -8287,6 +8297,121 @@ class MiniMaxRateLimiter:
 
 minimax_limiter = MiniMaxRateLimiter()
 
+# ---- Minimax API Client ----
+_MINIMAX_BASE_URL = "https://api.minimax.io/anthropic"
+_MINIMAX_MODEL = "MiniMax-M2.5"
+_MINIMAX_AUTH_PROFILES = Path.home() / ".openclaw" / "agents" / "main" / "agent" / "auth-profiles.json"
+
+
+def _get_minimax_key() -> str:
+    """Read MiniMax API key from auth-profiles."""
+    try:
+        profiles = json.loads(_MINIMAX_AUTH_PROFILES.read_text())
+        return profiles["profiles"]["minimax:default"]["key"]
+    except Exception as e:
+        raise RuntimeError(f"Could not load MiniMax API key: {e}")
+
+
+async def minimax_chat(system_prompt: str, user_content: str, max_tokens: int = 1024) -> str:
+    """Send a chat message to Minimax and return the text response."""
+    if not await minimax_limiter.acquire():
+        logger.warning(f"MiniMax rate limited ({minimax_limiter.remaining} remaining)")
+        return ""
+    key = _get_minimax_key()
+    async with httpx.AsyncClient(timeout=90) as client:
+        resp = await client.post(
+            f"{_MINIMAX_BASE_URL}/v1/messages",
+            headers={
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": _MINIMAX_MODEL,
+                "max_tokens": max_tokens,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_content}],
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return "".join(
+            block["text"] for block in data.get("content", [])
+            if block.get("type") == "text"
+        )
+
+
+# ---- Session Document Swarm ----
+SESSION_SWARM_ROLES = {
+    "activity_scribe": {
+        "system": "You are an Activity Scribe. Given an agent's recent output, write a concise activity log entry. Format: ### YYYY-MM-DD HH:MM — <agent_name>\n<2-3 sentences of what was done>. Include specific file names, decisions made, and outcomes. Be factual, not flowery.",
+        "max_tokens": 512,
+    },
+    "plan_auditor": {
+        "system": "You are a Plan Auditor. Given a session document and recent activity, identify if any part of the Plan section needs updating based on what just happened. If no updates needed, respond with exactly: NO_UPDATE. Otherwise, describe the specific plan changes needed in 2-3 sentences.",
+        "max_tokens": 512,
+    },
+}
+
+
+async def fire_session_doc_swarm(session_doc_id: int, instance_tab_name: str, context: str = "") -> None:
+    """Fire Minimax agents to update session doc after a stop event."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT file_path FROM session_documents WHERE id = ?", (session_doc_id,))
+            row = await cursor.fetchone()
+            if not row:
+                return
+        fp = Path(row[0])
+        if not fp.exists():
+            return
+        doc_content = fp.read_text()
+
+        # Activity Scribe — summarize what happened
+        scribe_config = SESSION_SWARM_ROLES["activity_scribe"]
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        scribe_prompt = f"""Session document:
+{doc_content[:2000]}
+
+Recent agent activity context:
+{context[:2000]}
+
+Agent name: {instance_tab_name}
+Current time: {now}
+
+Write the activity log entry."""
+
+        scribe_result = await minimax_chat(scribe_config["system"], scribe_prompt, scribe_config["max_tokens"])
+
+        if scribe_result.strip():
+            await merge_into_session_doc(
+                session_doc_id,
+                SessionDocMergeRequest(content=scribe_result, source="minimax", context="Activity scribe update")
+            )
+
+        # Plan Auditor — check if plan needs updating
+        auditor_config = SESSION_SWARM_ROLES["plan_auditor"]
+        auditor_prompt = f"""Session document:
+{doc_content[:2000]}
+
+Recent activity just logged:
+{scribe_result[:500]}
+
+Does the Plan section need any updates based on this activity?"""
+
+        auditor_result = await minimax_chat(auditor_config["system"], auditor_prompt, auditor_config["max_tokens"])
+
+        if auditor_result.strip() and "NO_UPDATE" not in auditor_result:
+            await merge_into_session_doc(
+                session_doc_id,
+                SessionDocMergeRequest(content=f"Plan audit note: {auditor_result}", source="minimax", context="Plan auditor finding")
+            )
+
+        logger.info(f"Session swarm completed for doc {session_doc_id}")
+
+    except Exception as e:
+        logger.error(f"Session swarm failed for doc {session_doc_id}: {e}")
+
 
 def create_session_doc_file(file_path: Path, title: str, doc_id: int, project: str = None) -> None:
     """Create the markdown file for a session document."""
@@ -8555,6 +8680,81 @@ async def delete_session_doc(doc_id: int, hard: bool = False):
             await log_event("session_doc_archived", details={"doc_id": doc_id, "title": row[1]})
             logger.info(f"Archived session doc {doc_id}: {row[1]}")
             return {"id": doc_id, "archived": True}
+
+
+@app.post("/api/session-docs/{doc_id}/merge")
+async def merge_into_session_doc(doc_id: int, request: SessionDocMergeRequest):
+    """Intelligently merge content into a session document using LLM."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT file_path, title FROM session_documents WHERE id = ?", (doc_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(404, "Session document not found")
+
+    fp = Path(row[0])
+    if not fp.exists():
+        raise HTTPException(404, f"File not found: {fp}")
+
+    current_content = fp.read_text()
+    context_hint = f"\nContext: {request.context}" if request.context else ""
+
+    system_prompt = f"""You are a document editor for a session planning document. You will receive the current document and new content to merge in.
+
+Rules:
+- If the new content is an activity update or progress note, add it to the Activity Log section as a new entry with today's date and time.
+- If the new content contains architectural decisions or plan changes, update the Plan section.
+- If the new content is a quick note or thought, place it where it makes most sense.
+- Preserve ALL existing content. Do not remove or summarize existing entries.
+- Use markdown formatting. Activity log entries use ### headers with date and agent name.
+- Return the COMPLETE updated document, including frontmatter.
+- Do NOT add commentary or explanation outside the document."""
+
+    user_msg = f"""Current document:
+```markdown
+{current_content}
+```
+
+New content to merge ({request.source} source{context_hint}):
+```
+{request.content}
+```
+
+Return the complete updated document."""
+
+    try:
+        updated = await minimax_chat(system_prompt, user_msg, max_tokens=4096)
+
+        if not updated.strip():
+            raise HTTPException(500, "Merge LLM returned empty response (may be rate limited)")
+
+        # Strip markdown code fences if the LLM wrapped it
+        if updated.startswith("```"):
+            lines = updated.split("\n")
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            updated = "\n".join(lines)
+
+        fp.write_text(updated)
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE session_documents SET updated_at = ? WHERE id = ?",
+                (datetime.now().isoformat(), doc_id)
+            )
+            await db.commit()
+
+        await log_event("session_doc_merged", details={
+            "doc_id": doc_id, "source": request.source, "content_length": len(request.content)
+        })
+        return {"status": "merged", "doc_id": doc_id, "source": request.source}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Session doc merge failed for doc {doc_id}: {e}")
+        raise HTTPException(500, f"Merge failed: {e}")
 
 
 # ============ Instance-Doc Linking Endpoints ============
