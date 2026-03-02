@@ -520,6 +520,8 @@ async def init_db():
             await db.execute("ALTER TABLE claude_instances ADD COLUMN working_dir TEXT")
         if 'tts_mode' not in columns:
             await db.execute("ALTER TABLE claude_instances ADD COLUMN tts_mode TEXT DEFAULT 'verbose'")
+        if 'session_doc_id' not in columns:
+            await db.execute("ALTER TABLE claude_instances ADD COLUMN session_doc_id INTEGER")
 
         # Migration: Convert two-field status (status + is_processing) to single enum
         # Old: status='active' + is_processing=0/1 → New: status='processing'/'idle'/'stopped'
@@ -785,6 +787,19 @@ async def init_db():
                 model       TEXT DEFAULT 'MiniMax-M2.5',
                 duration_ms INTEGER,
                 created_at  TEXT NOT NULL
+            )
+        """)
+
+        # Create session_documents table (persistent Obsidian notes linked to instances)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS session_documents (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path   TEXT NOT NULL UNIQUE,
+                title       TEXT,
+                project     TEXT,
+                status      TEXT DEFAULT 'active',
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
