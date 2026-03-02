@@ -5862,7 +5862,10 @@ async def create_cron_job(request: Request):
     data = await request.json()
     if "name" not in data or "command" not in data or "schedule" not in data:
         raise HTTPException(status_code=400, detail="name, command, and schedule are required")
-    job = await cron_engine.create_job(data)
+    try:
+        job = await cron_engine.create_job(data)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     return job
 
 

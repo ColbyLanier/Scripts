@@ -308,6 +308,11 @@ class TestCRUD:
     def test_delete_nonexistent(self, engine):
         assert run(engine.delete_job("nonexistent")) is False
 
+    def test_create_duplicate_name_raises(self, engine):
+        run(engine.create_job(create_job_dict(name="crud-dup")))
+        with pytest.raises(ValueError, match="already exists"):
+            run(engine.create_job(create_job_dict(name="crud-dup")))
+
     def test_delete_cascades_runs(self, engine, db_path):
         created = run(engine.create_job(create_job_dict(name="crud-cascade")))
         job_id = created["id"]
@@ -580,6 +585,17 @@ def api_delete(path):
         return json.loads(resp.read().decode())
 
 
+def cleanup_job_by_name(name: str):
+    """Delete a job by name if it exists (for test pre-run cleanup)."""
+    try:
+        jobs = api_get("/api/cron/jobs")
+        for job in jobs.get("jobs", []):
+            if job["name"] == name:
+                api_delete(f"/api/cron/jobs/{job['id']}")
+    except Exception:
+        pass
+
+
 def api_available():
     try:
         api_get("/health")
@@ -740,6 +756,7 @@ class TestIntegrationQuietHours:
 
     def test_nighttime_blocked_during_day(self):
         """Job with quiet 8-22 should be skipped during daytime."""
+        cleanup_job_by_name("int-test-quiet-night")
         job = api_post("/api/cron/jobs", {
             "name": "int-test-quiet-night",
             "command": "echo should_not_fire",

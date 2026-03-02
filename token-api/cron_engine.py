@@ -10,6 +10,7 @@ import json
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import uuid
 from datetime import datetime, timedelta
@@ -563,32 +564,37 @@ class CronEngine:
         schedule = data["schedule"]
         quiet = data.get("quiet_hours")
 
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                INSERT INTO cron_jobs (
-                    id, name, description, enabled,
-                    schedule_type, schedule_value, timezone,
-                    command, timeout_seconds,
-                    quiet_hours_start, quiet_hours_end,
-                    max_runs_per_window, run_window_hours,
-                    session_type, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                job_id, data["name"],
-                data.get("description", ""),
-                1 if data.get("enabled", True) else 0,
-                schedule["type"], schedule["value"],
-                schedule.get("tz", "America/Phoenix"),
-                data["command"],
-                data.get("timeout_seconds", 120),
-                quiet[0] if quiet else None,
-                quiet[1] if quiet else None,
-                data.get("max_runs_per_window"),
-                data.get("run_window_hours", 5),
-                data.get("session_type", "isolated"),
-                now, now,
-            ))
-            await db.commit()
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("""
+                    INSERT INTO cron_jobs (
+                        id, name, description, enabled,
+                        schedule_type, schedule_value, timezone,
+                        command, timeout_seconds,
+                        quiet_hours_start, quiet_hours_end,
+                        max_runs_per_window, run_window_hours,
+                        session_type, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    job_id, data["name"],
+                    data.get("description", ""),
+                    1 if data.get("enabled", True) else 0,
+                    schedule["type"], schedule["value"],
+                    schedule.get("tz", "America/Phoenix"),
+                    data["command"],
+                    data.get("timeout_seconds", 120),
+                    quiet[0] if quiet else None,
+                    quiet[1] if quiet else None,
+                    data.get("max_runs_per_window"),
+                    data.get("run_window_hours", 5),
+                    data.get("session_type", "isolated"),
+                    now, now,
+                ))
+                await db.commit()
+        except sqlite3.IntegrityError as e:
+            if "UNIQUE constraint failed: cron_jobs.name" in str(e):
+                raise ValueError(f"A job named '{data['name']}' already exists")
+            raise
 
         job = await self.get_job(job_id)
         if data.get("enabled", True):
