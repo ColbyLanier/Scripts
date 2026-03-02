@@ -6,7 +6,7 @@
 # Usage: discord <command> [args...]
 #
 # Commands:
-#   send <channel> [--reply-to <id>] <message>   Post to a channel (or pipe from stdin)
+#   send <channel> [--bot <name>] [--reply-to <id>] <message>   Post to a channel (or pipe from stdin)
 #   read <channel> [--limit N]        Read recent messages
 #   react <channel> <message_id> <emoji>          Add a reaction to a message
 #   ask <channel> [options]           Post question, wait up to --timeout (default 1h) for reply
@@ -70,14 +70,15 @@ show_help() {
 cmd_send() {
   local channel="${1:-}"
   shift || true
-  [[ -z "$channel" ]] && die "Usage: discord send <channel> [--reply-to <id>] <message>"
+  [[ -z "$channel" ]] && die "Usage: discord send <channel> [--bot <name>] [--reply-to <id>] <message>"
 
-  local reply_to=""
+  local reply_to="" bot_name=""
   local -a message_parts=()
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --reply-to) reply_to="$2"; shift 2 ;;
+      --bot)      bot_name="$2"; shift 2 ;;
       *) message_parts+=("$1"); shift ;;
     esac
   done
@@ -93,17 +94,22 @@ cmd_send() {
   fi
 
   local json_data
-  if [[ -n "$reply_to" ]]; then
-    json_data=$(jq -n --arg ch "$channel" --arg msg "$message" --arg rt "$reply_to" \
-      '{channel: $ch, content: $msg, reply_to: $rt}')
-  else
-    json_data=$(jq -n --arg ch "$channel" --arg msg "$message" \
-      '{channel: $ch, content: $msg}')
-  fi
+  json_data=$(jq -n \
+    --arg ch "$channel" \
+    --arg msg "$message" \
+    --arg rt "$reply_to" \
+    --arg bot "$bot_name" \
+    '{channel: $ch, content: $msg}
+     | if $rt != "" then . + {reply_to: $rt} else . end
+     | if $bot != "" then . + {bot: $bot} else . end')
 
   result=$(post "/send" "$json_data")
-  echo "$result" | jq -r '.message_id // empty' 2>/dev/null && exit 0
-  echo "$result"
+  if message_id=$(echo "$result" | jq -re '.message_id' 2>/dev/null); then
+    echo "$message_id"
+  else
+    echo "$result" | jq -r '.error // "send failed"' >&2
+    exit 1
+  fi
 }
 
 cmd_read() {
@@ -150,15 +156,21 @@ cmd_react() {
   json_data=$(jq -n --arg ch "$channel" --arg mid "$message_id" --arg em "$emoji" \
     '{channel: $ch, message_id: $mid, emoji: $em}')
 
-  post "/react" "$json_data" | jq -r 'if .ok then "reacted" else "failed: \(.error // "unknown")" end' 2>/dev/null
+  result=$(post "/react" "$json_data")
+  if [[ "$(echo "$result" | jq -r '.ok // empty' 2>/dev/null)" == "true" ]]; then
+    echo "reacted"
+  else
+    echo "$result" | jq -r '"Error: \(.error // "react failed")"' >&2
+    exit 1
+  fi
 }
 
 cmd_ask() {
   local channel="${1:-}"
   shift || true
-  [[ -z "$channel" ]] && die "Usage: discord ask <channel> --question <text> [--options ...] [--title <t>] [--timeout <dur>] [--react [emoji...]] [--blocking] [--no-wait]"
+  [[ -z "$channel" ]] && die "Usage: discord ask <channel> --question <text> [--bot <name>] [--options ...] [--title <t>] [--timeout <dur>] [--react [emoji...]] [--blocking] [--no-wait]"
 
-  local question="" title="" context_text="" timeout_str="1h" react_mode=false blocking=false no_wait=false
+  local question="" title="" context_text="" timeout_str="1h" react_mode=false blocking=false no_wait=false bot_name=""
   local -a options=()
   local -a react_emojis=()
 
@@ -170,6 +182,7 @@ cmd_ask() {
       --blocking) blocking=true; shift ;;
       --no-wait)  no_wait=true; shift ;;
       --timeout)  timeout_str="$2"; shift 2 ;;
+      --bot)      bot_name="$2"; shift 2 ;;
       --react)
         react_mode=true
         shift
@@ -227,8 +240,9 @@ cmd_ask() {
   local formatted
   formatted=$(echo -e "$msg")
   local send_data
-  send_data=$(jq -n --arg ch "$channel" --arg content "$formatted" \
-    '{channel: $ch, content: $content}')
+  send_data=$(jq -n --arg ch "$channel" --arg content "$formatted" --arg bot "$bot_name" \
+    '{channel: $ch, content: $content}
+     | if $bot != "" then . + {bot: $bot} else . end')
 
   local send_result
   send_result=$(post "/send" "$send_data")
@@ -345,7 +359,13 @@ cmd_declare() {
   json_data=$(jq -n --arg ch "$channel" --arg content "$formatted" \
     '{channel: $ch, content: $content}')
 
-  post "/send" "$json_data" | jq -r '.message_id // empty' 2>/dev/null
+  result=$(post "/send" "$json_data")
+  if message_id=$(echo "$result" | jq -re '.message_id' 2>/dev/null); then
+    echo "$message_id"
+  else
+    echo "$result" | jq -r '.error // "declare failed"' >&2
+    exit 1
+  fi
 }
 
 cmd_dm() {
@@ -360,7 +380,13 @@ cmd_dm() {
 
   local json_data
   json_data=$(jq -n --arg msg "$message" '{content: $msg}')
-  post "/dm" "$json_data" | jq -r '.message_id // empty' 2>/dev/null
+  result=$(post "/dm" "$json_data")
+  if message_id=$(echo "$result" | jq -re '.message_id' 2>/dev/null); then
+    echo "$message_id"
+  else
+    echo "$result" | jq -r '.error // "DM failed"' >&2
+    exit 1
+  fi
 }
 
 cmd_subscribe() {
