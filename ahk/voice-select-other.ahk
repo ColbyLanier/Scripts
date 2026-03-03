@@ -12,4 +12,6 @@ Sleep(50)
 Send("{Up 1}")      ; Back up one to "Other"
 Sleep(50)
 Send("{Enter}")     ; Select "Other"
+Sleep(300)          ; Wait for text input to appear
+Send("^#{Space}")   ; Toggle Wispr Flow dictation on
 ExitApp
