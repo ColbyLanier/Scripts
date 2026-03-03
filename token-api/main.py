@@ -7994,8 +7994,26 @@ async def handle_pre_tool_use(payload: dict) -> dict:
         return {"success": True, "action": "allowed"}
 
     # Voice chat: when AskUserQuestion fires for a voice-chat-active instance,
-    # trigger AHK to switch audio input to the other participant.
+    # 1) TTS the question text so the user hears it spoken
+    # 2) trigger AHK to auto-select "Other" and start dictation
     if tool_name == "AskUserQuestion" and session_id and session_id in VOICE_CHAT_SESSIONS:
+        # Extract and speak question text
+        questions = tool_input.get("questions", [])
+        if questions:
+            tts_parts = []
+            for q in questions:
+                question_text = q.get("question", "")
+                if question_text:
+                    tts_parts.append(question_text)
+            if tts_parts:
+                tts_message = " ".join(tts_parts)
+                try:
+                    await queue_tts(session_id, tts_message)
+                    logger.info(f"PreToolUse: Voice chat TTS queued for {session_id[:12]}: {tts_message[:80]}")
+                except Exception as e:
+                    logger.warning(f"PreToolUse: Voice chat TTS failed for {session_id[:12]}: {e}")
+
+        # AHK trigger to auto-select "Other" input box
         host = DESKTOP_CONFIG["host"]
         port = DESKTOP_CONFIG["port"]
         try:
