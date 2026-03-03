@@ -2675,6 +2675,7 @@ DISCORD_CHECKIN_CHANNEL = "1472043387535495323"
 # Discord response routing
 DISCORD_DAEMON_URL = "http://127.0.0.1:7779"
 MECHANICUS_USER_ID = "1472042705788866611"
+MECHANICUS_ROLE_ID = "1477162726093492308"
 CUSTODES_USER_ID   = "1477159418498912357"
 OPERATOR_USER_ID   = "229461055628115968"
 CUSTODES_CHANNELS  = {"briefing", "chat"}  # Channels where replies route to Custodes
@@ -8234,8 +8235,9 @@ async def receive_discord_message(request: DiscordMessageRequest):
     if (request.author or {}).get("bot"):
         return {"received": True, "message_id": request.message_id}
 
-    # Trigger 1: @Mechanicus mention
-    if f"<@{MECHANICUS_USER_ID}>" in (request.content or ""):
+    # Trigger 1: @Mechanicus mention (user mention <@ID> or role mention <@&ID>)
+    content = request.content or ""
+    if f"<@{MECHANICUS_USER_ID}>" in content or f"<@&{MECHANICUS_ROLE_ID}>" in content:
         asyncio.create_task(_discord_respond(request, bot="mechanicus"))
         return {"received": True, "message_id": request.message_id}
 
