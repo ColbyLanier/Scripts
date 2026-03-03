@@ -2442,6 +2442,28 @@ async def get_instance_todos(instance_id: str):
         return {"todos": [], "progress": 0, "current_task": None, "total": 0, "completed": 0, "error": str(e)}
 
 
+@app.post("/api/instances/{instance_id}/voice-chat")
+async def toggle_voice_chat(instance_id: str, active: bool = True):
+    """Toggle voice chat mode for an instance."""
+    if active:
+        VOICE_CHAT_SESSIONS[instance_id] = {
+            "active": True,
+            "started_at": datetime.now().isoformat()
+        }
+        logger.info(f"Voice chat STARTED for {instance_id[:12]}")
+    else:
+        VOICE_CHAT_SESSIONS.pop(instance_id, None)
+        logger.info(f"Voice chat ENDED for {instance_id[:12]}")
+    return {"instance_id": instance_id, "voice_chat": active}
+
+
+@app.get("/api/instances/{instance_id}/voice-chat")
+async def get_voice_chat_status(instance_id: str):
+    """Check if instance is in voice chat mode."""
+    session = VOICE_CHAT_SESSIONS.get(instance_id)
+    return {"active": session is not None, "session": session}
+
+
 @app.get("/api/instances", response_model=List[dict])
 async def list_instances(status: Optional[str] = None, sort: Optional[str] = None):
     """List all instances, optionally filtered by status and sorted."""
@@ -2608,6 +2630,9 @@ DESKTOP_STATE = {
     "ahk_reachable": None,
     "ahk_last_heartbeat": None,
 }
+
+# Voice chat state — tracks which instances are in voice conversation mode
+VOICE_CHAT_SESSIONS = {}  # instance_id -> {"active": True, "started_at": str}
 
 # Valid desktop detection modes (replaces OBSIDIAN_CONFIG["mode_commands"].keys())
 VALID_DETECTION_MODES = ["silence", "music", "video", "scrolling", "gaming", "gym", "work_gym"]
@@ -7935,6 +7960,23 @@ async def handle_pre_tool_use(payload: dict) -> dict:
     if tool_name == "Task" and tool_input.get("run_in_background"):
         _pending_background_tasks[session_id] = _pending_background_tasks.get(session_id, 0) + 1
         logger.info(f"PreToolUse: Task background launched for {session_id[:12]} (pending: {_pending_background_tasks[session_id]})")
+        return {"success": True, "action": "allowed"}
+
+    # Voice chat: when AskUserQuestion fires for a voice-chat-active instance,
+    # trigger AHK to switch audio input to the other participant.
+    if tool_name == "AskUserQuestion" and session_id and session_id in VOICE_CHAT_SESSIONS:
+        host = DESKTOP_CONFIG["host"]
+        port = DESKTOP_CONFIG["port"]
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.post(
+                    f"http://{host}:{port}/ahk/execute",
+                    json={"script": "voice-select-other.ahk"},
+                )
+                logger.info(f"PreToolUse: Voice chat AHK trigger for {session_id[:12]} -> {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"PreToolUse: Voice chat AHK trigger failed for {session_id[:12]}: {e}")
+        # Don't block AskUserQuestion — just fire the AHK trigger
         return {"success": True, "action": "allowed"}
 
     # Only check Bash commands for blocking
