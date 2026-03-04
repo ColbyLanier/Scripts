@@ -8,6 +8,7 @@
 MINI_IP="100.95.109.23"
 
 # Source local .env file for optional overrides
+# Store secrets here (e.g. CLAUDE_CODE_OAUTH_TOKEN from `claude setup-token`)
 if [[ -f "$HOME/.env" ]]; then
     set -a
     source "$HOME/.env"
@@ -315,8 +316,13 @@ alias python="python3"
 
 # cdc - run claude on Mac (not installed on phone) with optional path/args
 # Uses zsh -il (interactive login) so Mac sources ~/.zprofile (PATH) + ~/.zshrc (aliases)
+# Forwards CLAUDE_CODE_OAUTH_TOKEN so long-lived auth works over SSH (no browser refresh needed)
 cdc() {
-    ssh -t mac "zsh -il -c 'cdc $*'"
+    if [[ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]]; then
+        ssh -t mac "CLAUDE_CODE_OAUTH_TOKEN='$CLAUDE_CODE_OAUTH_TOKEN' zsh -il -c 'cdc $*'"
+    else
+        ssh -t mac "zsh -il -c 'cdc $*'"
+    fi
 }
 
 # ====================================================

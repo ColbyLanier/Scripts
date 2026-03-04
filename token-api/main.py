@@ -4719,22 +4719,25 @@ async def get_timer_shifts():
     """Get today's timer shift analytics for TUI visualization."""
     from collections import defaultdict
 
+    # Only show shifts since 9 AM today (daily reset time)
+    from datetime import time as _time
+    now = datetime.now()
+    reset_today = datetime.combine(now.date(), _time(9, 0))
+    if now < reset_today:
+        reset_today -= timedelta(days=1)
+    cutoff = reset_today.isoformat()
+
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM timer_shifts ORDER BY id")
+        cursor = await db.execute(
+            "SELECT * FROM timer_shifts WHERE timestamp >= ? ORDER BY id",
+            (cutoff,),
+        )
         rows = await cursor.fetchall()
 
     if not rows:
         return {"total_shifts": 0, "balance_series": [], "mode_distribution": {},
                 "shifts_by_trigger": {}, "enforcement_count": 0, "twitter_time_mins": 0}
-
-    # Trim stale left tail: drop leading rows with pre-reset balance
-    # (first shift after daily wipe often carries yesterday's balance)
-    if len(rows) >= 2:
-        first_bal = rows[0]["break_balance_ms"] or 0
-        second_bal = rows[1]["break_balance_ms"] or 0
-        if first_bal > second_bal * 10 and first_bal > 300_000:  # >5min and 10x jump
-            rows = rows[1:]
 
     balance_series = []
     balance_timeline = []
