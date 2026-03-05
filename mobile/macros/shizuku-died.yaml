@@ -1,18 +1,17 @@
 # Shizuku Died Detector
 #
 # Event-driven: fires when Shizuku's foreground service notification is dismissed/removed
-# by the system (option=1). This happens immediately when Shizuku dies — no polling,
-# no shell, no permissions needed.
+# by the system (option=1). This happens immediately when Shizuku dies.
 #
-# Root cause (confirmed 2026-02-26): Shizuku requires wireless debugging to stay alive.
-# Disabling wireless debugging (or Android auto-disabling it on network/SSID change)
-# kills Shizuku immediately. Detection via notification dismiss is the cleanest approach.
+# POSTs to Mac token-api which runs `shizuku-connect start` to restart Shizuku
+# via persistent ADB connection over Tailscale (port 5555).
 #
 # Constraint: shizuku_dead == false suppresses repeat alerts during a single outage.
+# Reset by Shizuku Restored macro when Shizuku comes back.
 
 name: "Shizuku Died"
 category: "System"
-description: "Detects Shizuku death via notification dismiss event"
+description: "Detects Shizuku death via notification dismiss. POSTs to Mac for ADB restart."
 enabled: true
 
 global_variables:
@@ -40,7 +39,7 @@ actions:
 
   - type: notification
     title: "Shizuku Died"
-    text: "Enforcement offline — re-enable Wireless Debugging, then tap to restart Shizuku"
+    text: "Enforcement offline — Mac auto-restart triggered"
     channel_type: 1
 
   - type: vibrate
@@ -56,7 +55,3 @@ actions:
     body: '{"event": "shizuku_died", "time": "{system_time}"}'
     content_type: "application/json"
     block: false
-
-  - type: launch_app
-    app: "Shizuku"
-    package: "moe.shizuku.privileged.api"

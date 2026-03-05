@@ -1,6 +1,24 @@
-q# Mobile Development Tools
+# Mobile Development Tools
 
 Tools and configuration for phone automation via Termux and MacroDroid.
+
+## Design Rules
+
+**No hacky polls.** Never write ad-hoc polling loops (sleep+check in bash, retry loops).
+Use event-driven patterns: MacroDroid notification triggers, HTTP webhooks, LaunchAgent intervals.
+If polling is truly unavoidable, staple it to the existing single poll macro in MacroDroid.
+
+## Shizuku (ADB over Tailscale)
+
+Shizuku runs in "Connected to a computer" mode via ADB over Tailscale — NOT wireless debugging.
+
+| Component | Detail |
+|-----------|--------|
+| ADB target | `100.102.92.24:5555` (phone Tailscale IP) |
+| CLI | `shizuku-connect [status\|connect\|start\|bootstrap\|keepalive\|disconnect]` |
+| LaunchAgent | `ai.tokenclaw.shizuku-keepalive` (every 5 min) |
+| Recovery | MacroDroid "Shizuku Died" → POST to Mac → `shizuku-connect start` |
+| Bootstrap | `shizuku-connect bootstrap` (needs wireless debugging briefly, one-time per reboot) |
 
 ## Overview
 
