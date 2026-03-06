@@ -89,7 +89,7 @@ fastapi_logger.addHandler(buffer_handler)
 
 # Configuration
 DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
-DEFAULT_SESSIONS_DIR = Path.home() / "Token-ENV" / "Sessions"
+DEFAULT_SESSIONS_DIR = Path.home() / "Imperium-ENV" / "Terra" / "Sessions"
 SERVER_PORT = 7777  # Authoritative port for Token API
 CRASH_LOG_PATH = Path.home() / ".claude" / "token-api-crash.log"
 STASH_DIR = Path.home() / ".claude" / "stash"
@@ -2874,7 +2874,7 @@ async def trigger_checkin(checkin_type: str) -> dict:
     }
 
 
-DAILY_NOTE_DIR = Path.home() / "Token-ENV" / "Journal" / "Daily"
+DAILY_NOTE_DIR = Path.home() / "Imperium-ENV" / "Terra" / "Journal" / "Daily"
 
 
 def update_daily_note_frontmatter(checkin_type: str, data: dict) -> bool:
@@ -3298,7 +3298,7 @@ def _sync_generate_daily_analytics(date_str: str):
 
     Writes:
     1. Summary fields to the daily note's YAML front matter
-    2. Full JSON to Token-ENV/Journal/Daily/analytics/ for programmatic access
+    2. Full JSON to Imperium-ENV/Journal/Daily/analytics/ for programmatic access
     Then wipes timer_shifts table.
     """
     import sqlite3
@@ -3359,7 +3359,7 @@ def _sync_generate_daily_analytics(date_str: str):
         "balance_timeline": balance_timeline,
     }
 
-    # 1. Write full JSON to Token-ENV analytics dir
+    # 1. Write full JSON to Imperium-ENV analytics dir
     analytics_dir = OBSIDIAN_DAILY_PATH / "analytics"
     analytics_dir.mkdir(parents=True, exist_ok=True)
     out_path = analytics_dir / f"timer-{date_str}.json"
