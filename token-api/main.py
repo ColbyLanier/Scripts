@@ -475,8 +475,8 @@ class InboxNotifyRequest(BaseModel):
 
 
 class InboxCreateRequest(BaseModel):
-    """Create an aspirant note from external source (Discord, API)."""
-    title: str
+    """Create an aspirant note from external source (Discord, API, hotkey)."""
+    title: str = ""
     type: str = "capture"
     content: str = ""
     source: str = "discord"
@@ -8413,8 +8413,11 @@ async def inbox_create(request: InboxCreateRequest):
         source=request.source,
     ))
 
+    note_path = f"Terra/Inbox/{filename}"
+    obsidian_uri = f"obsidian://open?vault=Imperium-ENV&file={note_path.replace(' ', '%20')}"
+
     logger.info(f"Inbox: created '{filename}' from {request.source}")
-    return {"created": True, "path": f"Terra/Inbox/{filename}", "title": safe_title}
+    return {"created": True, "path": note_path, "title": safe_title, "obsidian_uri": obsidian_uri}
 
 
 # ============ Session Document Support ============
@@ -8827,6 +8830,18 @@ async def list_session_docs(status: Optional[str] = None, project: Optional[str]
             docs.append(doc)
 
     return {"docs": docs}
+
+
+@app.get("/api/session-docs/deployment-queue")
+async def get_deployment_queue():
+    """List session docs ready for Administratum processing."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM session_documents WHERE status = 'deployment' ORDER BY updated_at ASC"
+        )
+        rows = await cursor.fetchall()
+    return {"docs": [dict(r) for r in rows]}
 
 
 @app.get("/api/session-docs/{doc_id}")
@@ -9340,18 +9355,6 @@ async def deploy_session_doc(doc_id: int):
     await log_event("session_doc_deployed", details={"doc_id": doc_id, "title": row[2]})
     logger.info(f"Session doc {doc_id} ({row[2]}) moved to deployment")
     return {"id": doc_id, "status": "deployment"}
-
-
-@app.get("/api/session-docs/deployment-queue")
-async def get_deployment_queue():
-    """List session docs ready for Administratum processing."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM session_documents WHERE status = 'deployment' ORDER BY updated_at ASC"
-        )
-        rows = await cursor.fetchall()
-    return {"docs": [dict(r) for r in rows]}
 
 
 @app.post("/api/session-docs/{doc_id}/mark-processed")

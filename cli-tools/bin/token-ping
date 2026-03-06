@@ -117,6 +117,12 @@ def match_template(path, template):
     return True
 
 
+def prefer_static(matches):
+    """If both static and parameterized routes match, prefer static."""
+    static = [(t, m) for t, m in matches if '{' not in t]
+    return static if static else matches
+
+
 def resolve_endpoint(user_input, paths):
     """3-tier resolution: exact, prefix, suffix. Returns list of (template, methods_dict)."""
     # Normalize: ensure leading slash
@@ -129,7 +135,7 @@ def resolve_endpoint(user_input, paths):
         if inp == tmpl or match_template(inp, tmpl):
             matches.append((tmpl, methods))
     if matches:
-        return matches
+        return prefer_static(matches)
 
     # Tier 2: Prefix — try /api/ prefix
     prefixed = "/api" + inp if not inp.startswith("/api/") else inp
@@ -137,7 +143,7 @@ def resolve_endpoint(user_input, paths):
         if prefixed == tmpl or match_template(prefixed, tmpl):
             matches.append((tmpl, methods))
     if matches:
-        return matches
+        return prefer_static(matches)
 
     # Tier 3: Suffix — input matches the tail of a path
     inp_stripped = inp.strip("/")
@@ -167,7 +173,7 @@ def resolve_endpoint(user_input, paths):
             seen.add(tmpl)
             unique.append((tmpl, methods))
 
-    return unique
+    return prefer_static(unique)
 
 
 def select_method(methods_dict, has_body, has_params, override=None):
