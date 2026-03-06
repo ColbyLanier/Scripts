@@ -1,110 +1,37 @@
 # Shizuku Reliability Plan
 
-**Status**: Root cause confirmed — investigating network-change behavior
-**Last updated**: 2026-02-26
+**Status**: RESOLVED (2026-03-04) — ADB over Tailscale
+**Last updated**: 2026-03-05
 
 ---
 
-## What We Know
+## Resolution
 
-### The Problem
-Shizuku (ADB shell service) on Samsung S24+ with One UI 7/8 dies hours after being started, not just on reboot.
+Shizuku now runs in "Connected to a computer" mode via persistent ADB over Tailscale (port 5555), bypassing wireless debugging entirely. This solved the root cause: wireless debugging was unstable (Android auto-disables it on network/SSID changes, killing the ADB daemon and Shizuku with it).
 
-### Root Cause (Confirmed 2026-02-26)
-**Wireless debugging is required for Shizuku to stay alive.** Disabling wireless debugging kills Shizuku immediately (confirmed via direct test: enable Shizuku → disable wireless debugging → Shizuku stops within seconds).
+### How It Works
 
-The original theory ("Samsung's process killer runs independently of ADB") was wrong. The architecture is:
-- Shizuku's binder service depends on the ADB daemon staying active
-- Disabling wireless debugging kills the ADB daemon → Shizuku dies
-- Previously it was surviving network changes — this means either (a) wireless debugging wasn't auto-disabling on network change before, or (b) ADB was bound to a Tailscale IP (stable across network changes)
+| Component | Detail |
+|-----------|--------|
+| ADB target | `100.102.92.24:5555` (phone Tailscale IP, stable across networks) |
+| CLI | `shizuku-connect [status|connect|start|bootstrap|keepalive|disconnect]` |
+| LaunchAgent | `ai.tokenclaw.shizuku-keepalive` (every 5 min, reconnects + restarts if needed) |
+| Recovery | MacroDroid "Shizuku Died" macro POSTs to Mac token-api, which calls `shizuku-connect start` |
+| Bootstrap | `shizuku-connect bootstrap` (one-time per phone reboot, needs brief wireless debugging to set `adb tcpip 5555`) |
 
-### Open Question
-**Does a natural WiFi SSID change cause Android to auto-disable wireless debugging?**
-Test needed: Shizuku running → switch WiFi networks naturally (no explicit disable) → does Shizuku survive?
-- If yes → Samsung is NOT auto-disabling; something else changed recently
-- If no → Samsung auto-disables wireless debugging on network change → fix: bind ADB over Tailscale
+### What Changed
 
-### Why It Was Working Before
-Unknown. Possible causes:
-1. Previous Shizuku starts were via USB (not wireless) — USB Shizuku doesn't depend on wireless debugging
-2. Wireless debugging was bound to Tailscale IP (100.x.x.x, stable across WiFi changes)
-3. A One UI or Shizuku update changed the behavior
+- `main.py`: `attempt_shizuku_restart()` now calls `shizuku-connect start` instead of the old 4-step SSH+ADB flow
+- Removed `/phone/shizuku/config` endpoint (no wireless debug port to configure)
+- MacroDroid macros simplified: no app launch, just POST to Mac for ADB restart
+- Deleted `shizuku-death-logger.yaml` (superseded by Died/Restored macros)
 
-### Mitigation: Tailscale ADB Binding
-If Samsung auto-disables wireless debugging on WiFi change, the fix is to bind ADB to the Tailscale interface. The Tailscale IP (100.x.x.x) doesn't change when switching between home WiFi, campus WiFi, and mobile data. Starting Shizuku via `adb connect <tailscale-ip>:port` would make it survive all network changes.
+### Remaining Limitation
 
-**Requires investigation**: how to configure wireless debugging to bind to Tailscale IP specifically.
-
-### Device Context
-- **Device**: Samsung S24+ (US Snapdragon SM-S926U)
-- **Rooting**: Not possible — US Snapdragon has permanently locked bootloader
-- **One UI version**: TBD (check Settings > About)
-- **Wireless debugging**: Leaving ON (safe on Tailscale/home network)
+Phone reboot kills the TCP ADB listener, requiring `shizuku-connect bootstrap` (brief wireless debugging + pairing). This is rare enough to be acceptable.
 
 ---
 
-## Detection Infrastructure
+## Original Problem (Historical)
 
-### Shizuku Died / Shizuku Restored macros (current)
-- Triggers: MacroDroid notification trigger (option=1 = dismissed, option=0 = posted)
-- Fires when Shizuku's foreground service notification appears/disappears
-- Zero shell, zero permissions — purely event-driven
-- Logs to `/storage/emulated/0/MacroDroid/logs/shizuku.log`
-- Notifies + opens Shizuku on death (once per outage, no spam via `shizuku_dead` global)
-- Reports `shizuku_died` / `shizuku_restored` events to Token-API `/phone`
-- **shizuku-death-logger.yaml is superseded and should be deleted from MacroDroid**
-
-### To read logs
-```bash
-ssh-phone "cat /storage/emulated/0/MacroDroid/logs/shizuku.log"
-# or
-ssh-phone "tail -50 /storage/emulated/0/MacroDroid/logs/shizuku.log"
-```
-
-### What to look for
-- **SSID at death**: Home SSID = killed before network change (Samsung); different SSID = network change correlation
-- **Screen state at death**: `screen_off` trigger = Samsung kills on screen lock (known One UI 7+ behavior)
-- **Battery at death**: Low battery + Doze mode correlation
-- **Time pattern**: Does it die at a consistent interval? (suggests a timeout/background limit)
-
----
-
-## Mitigations Applied
-
-| Setting | Status | Effect |
-|---------|--------|--------|
-| Wireless debugging left ON | ✅ Done | Keeps ADB session available for restart |
-| Battery > Shizuku > Unrestricted | Do manually | Removes standard battery kill |
-| Device Care > Never sleeping apps > Shizuku | Do manually | Removes memory killer (partial) |
-| Developer Options > ADB auth timeout revocation | Disable | Prevents auth expiry (days-scale, not hours) |
-| Samsung verbose debug logs | Enabled | Will reveal what's killing the process |
-
----
-
-## Next Steps (Pending Log Data)
-
-1. **Collect 2-3 death events** via the Death Logger macro
-2. **Read the log**: `ssh-phone "cat /storage/emulated/0/MacroDroid/logs/shizuku.log"`
-3. **Check Samsung debug logs** for process kill reason around the death timestamp
-4. **Assess**:
-   - If `screen_off` → Samsung screen-lock kill → try Developer Options > USB config workaround (not available on One UI 7, available on 8)
-   - If consistent interval (e.g. 30min, 1hr) → likely a background execution limit
-   - If correlated with Doze → need to find Samsung-specific Doze exclusion
-
----
-
-## Shizuku Restart Flow (Manual, Current State)
-1. Death Logger notifies + opens Shizuku app
-2. Tap "Start" in Shizuku
-3. Confirm wireless debugging dialog (Android 14+ requires manual tap)
-4. Enforcement resumes
-
-**Total friction**: ~3 taps from notification
-
----
-
-## Future Options (If Logging Doesn't Lead to Fix)
-
-- **One UI 8 upgrade**: Reportedly adds "Debugging only" USB config option that prevents screen-lock kills — but One UI 8 also removes bootloader unlock permanently
-- **Shizuku via USB**: Tether to Mac/laptop, run `adb start-server` — more reliable but requires cable
-- **Accept the limitation**: Enforcement gaps when Shizuku is down; server tracks `shizuku_dead` state and adjusts behavior accordingly
+Shizuku died hours after being started. Root cause: wireless debugging dependency. Android auto-disabled wireless debugging on network changes, killing the ADB daemon and Shizuku. The ADB-over-Tailscale approach eliminates this dependency since the Tailscale IP is stable across all network transitions.

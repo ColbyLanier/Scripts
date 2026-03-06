@@ -466,10 +466,28 @@ class DiscordMessageRequest(BaseModel):
     embeds: Optional[int] = 0
 
 
+class InboxNotifyRequest(BaseModel):
+    """Gene-seed birth notification for a new inbox note."""
+    path: str
+    title: str
+    type: str = "capture"
+    source: str = "obsidian"
+
+
+class InboxCreateRequest(BaseModel):
+    """Create an aspirant note from external source (Discord, API)."""
+    title: str
+    type: str = "capture"
+    content: str = ""
+    source: str = "discord"
+    author: Optional[str] = None
+
+
 class SessionDocCreateRequest(BaseModel):
     title: str
     project: Optional[str] = None
     file_path: Optional[str] = None
+    primarch_name: Optional[str] = None
 
 
 class SessionDocUpdateRequest(BaseModel):
@@ -542,6 +560,12 @@ async def init_db():
             await db.execute("ALTER TABLE claude_instances ADD COLUMN tts_mode TEXT DEFAULT 'verbose'")
         if 'session_doc_id' not in columns:
             await db.execute("ALTER TABLE claude_instances ADD COLUMN session_doc_id INTEGER")
+
+        # Migration: add primarch_name to session_documents
+        cursor = await db.execute("PRAGMA table_info(session_documents)")
+        sd_columns = [col[1] for col in await cursor.fetchall()]
+        if 'primarch_name' not in sd_columns:
+            await db.execute("ALTER TABLE session_documents ADD COLUMN primarch_name TEXT")
 
         # Migration: Convert two-field status (status + is_processing) to single enum
         # Old: status='active' + is_processing=0/1 → New: status='processing'/'idle'/'stopped'
@@ -817,10 +841,27 @@ async def init_db():
                 file_path   TEXT NOT NULL UNIQUE,
                 title       TEXT,
                 project     TEXT,
+                primarch_name TEXT,
                 status      TEXT DEFAULT 'active',
                 created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
+        """)
+
+        # Create primarch_session_docs table (tracks primarch ↔ session doc links over time)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS primarch_session_docs (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                primarch_name TEXT NOT NULL,
+                session_doc_id INTEGER NOT NULL,
+                linked_at     TEXT NOT NULL DEFAULT (datetime('now')),
+                unlinked_at   TEXT,
+                FOREIGN KEY (session_doc_id) REFERENCES session_documents(id)
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_primarch_active
+              ON primarch_session_docs(primarch_name) WHERE unlinked_at IS NULL
         """)
 
         await db.commit()
@@ -2646,9 +2687,10 @@ def reset_idle_timer():
     now_ms = int(time.monotonic() * 1000)
     timer_engine.set_productivity(True, now_ms)
 
-# Paths for Obsidian vault (write-only consumer for daily notes)
-OBSIDIAN_VAULT_PATH = Path.home() / "Token-ENV"
-OBSIDIAN_DAILY_PATH = OBSIDIAN_VAULT_PATH / "Journal" / "Daily"
+# Paths for Obsidian vault
+OBSIDIAN_VAULT_PATH = Path.home() / "Imperium-ENV"
+OBSIDIAN_DAILY_PATH = OBSIDIAN_VAULT_PATH / "Terra" / "Journal" / "Daily"
+OBSIDIAN_INBOX_PATH = OBSIDIAN_VAULT_PATH / "Terra" / "Inbox"
 
 
 def _write_productivity_score(date_str: str, score: int):
@@ -7366,18 +7408,40 @@ async def handle_session_start(payload: dict) -> dict:
                 now
             )
         )
+        # Auto-link primarch instance to its active session doc
+        primarch_name = payload.get("env", {}).get("TOKEN_API_PRIMARCH", "")
+        session_doc_id = None
+        if primarch_name:
+            cursor = await db.execute(
+                "SELECT session_doc_id FROM primarch_session_docs WHERE primarch_name = ? AND unlinked_at IS NULL",
+                (primarch_name,)
+            )
+            link_row = await cursor.fetchone()
+            if link_row and link_row[0]:
+                session_doc_id = link_row[0]
+                await db.execute(
+                    "UPDATE claude_instances SET session_doc_id = ? WHERE id = ?",
+                    (session_doc_id, session_id)
+                )
+
         await db.commit()
 
-    logger.info(f"Hook: SessionStart registered {session_id[:12]}... ({working_dir}){' [subagent]' if is_subagent else ''}")
+        # Update frontmatter if we linked a session doc
+        if session_doc_id:
+            await _update_doc_agents_list(db, session_doc_id)
+
+    logger.info(f"Hook: SessionStart registered {session_id[:12]}... ({working_dir}){' [subagent]' if is_subagent else ''}{f' [primarch:{primarch_name}]' if primarch_name else ''}")
     await log_event("instance_registered", instance_id=session_id, device_id=device_id,
                     details={"tab_name": tab_name, "origin_type": origin_type, "source": "hook",
-                             "is_subagent": is_subagent, "spawner": spawner})
+                             "is_subagent": is_subagent, "spawner": spawner,
+                             "primarch": primarch_name or None})
 
     return {
         "success": True,
         "action": "registered",
         "instance_id": session_id,
-        "profile": profile["name"] if not is_subagent else None
+        "profile": profile["name"] if not is_subagent else None,
+        "session_doc_id": session_doc_id
     }
 
 
@@ -8175,8 +8239,9 @@ async def receive_discord_message(request: DiscordMessageRequest):
     if (request.author or {}).get("bot"):
         return {"received": True, "message_id": request.message_id}
 
-    # Trigger 1: @Mechanicus mention (user mention <@ID> or role mention <@&ID>)
     content = request.content or ""
+
+    # Trigger 1: @Mechanicus mention (user mention <@ID> or role mention <@&ID>)
     if f"<@{MECHANICUS_USER_ID}>" in content or f"<@&{MECHANICUS_ROLE_ID}>" in content:
         asyncio.create_task(_discord_respond(request, bot="mechanicus"))
         return {"received": True, "message_id": request.message_id}
@@ -8280,6 +8345,76 @@ Rules:
         if proc.returncode != 0:
             logger.warning(f"Discord responder exited {proc.returncode}: {stderr.decode()[:300]}")
     asyncio.create_task(_wait_and_log())
+
+
+# ============ Aspirant Pipeline (Inbox) ============
+
+
+@app.post("/api/inbox/notify")
+async def inbox_notify(request: InboxNotifyRequest):
+    """Gene-seed: receive birth notification for a new inbox note."""
+    await log_event("inbox_notify", device_id="obsidian", details={
+        "path": request.path,
+        "title": request.title,
+        "type": request.type,
+        "source": request.source,
+    })
+    logger.info(f"Inbox: new {request.type} note '{request.title}' from {request.source}")
+    # Future: dispatch MiniMax fleet (Stage 2: Implantation)
+    return {"received": True, "path": request.path, "type": request.type}
+
+
+@app.post("/api/inbox/create")
+async def inbox_create(request: InboxCreateRequest):
+    """Create a new aspirant note in Terra/Inbox/ from an external source."""
+    # Sanitize title for filename
+    safe_title = re.sub(r'[^\w\s-]', '', request.title).strip()
+    safe_title = re.sub(r'\s+', ' ', safe_title)
+    if not safe_title:
+        safe_title = f"Untitled {datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+    filename = f"{safe_title}.md"
+    filepath = OBSIDIAN_INBOX_PATH / filename
+
+    if filepath.exists():
+        raise HTTPException(status_code=409, detail=f"Note already exists: {filename}")
+
+    is_prescriptive = request.type == "prescriptive"
+    created_date = datetime.now().strftime("%Y-%m-%d")
+
+    frontmatter_lines = [
+        "---",
+        f'title: "{safe_title}"',
+        f"type: {request.type}",
+        f"prescriptive: {str(is_prescriptive).lower()}",
+        f"created: {created_date}",
+        "status: inbox",
+        "tags:",
+        f"  - type/{request.type}",
+        "  - inbox/aspirant",
+        f"source: {request.source}",
+    ]
+    if is_prescriptive:
+        frontmatter_lines += ["progress: 0", "completed: false"]
+    frontmatter_lines.append("---")
+
+    body = request.content or ""
+    if request.author:
+        body = f"*Captured from {request.author} via {request.source}*\n\n{body}"
+
+    content = "\n".join(frontmatter_lines) + "\n\n" + body + "\n"
+    filepath.write_text(content, encoding="utf-8")
+
+    # Self-notify (same pipeline as Templater-created notes)
+    await inbox_notify(InboxNotifyRequest(
+        path=f"Terra/Inbox/{filename}",
+        title=safe_title,
+        type=request.type,
+        source=request.source,
+    ))
+
+    logger.info(f"Inbox: created '{filename}' from {request.source}")
+    return {"created": True, "path": f"Terra/Inbox/{filename}", "title": safe_title}
 
 
 # ============ Session Document Support ============
@@ -8427,15 +8562,37 @@ Does the Plan section need any updates based on this activity?"""
         logger.error(f"Session swarm failed for doc {session_doc_id}: {e}")
 
 
-def create_session_doc_file(file_path: Path, title: str, doc_id: int, project: str = None) -> None:
+# Valid session doc status transitions (from → set of valid targets)
+# Any status can transition to 'archived' as an escape hatch
+VALID_STATUS_TRANSITIONS = {
+    "active": {"completed", "archived"},
+    "completed": {"deployment", "active", "archived"},
+    "deployment": {"processed", "archived"},
+    "processed": {"archived"},
+    "archived": set(),  # terminal
+}
+
+PRIMARCH_REGISTRY_PATH = Path.home() / ".claude" / "primarchs.json"
+
+
+def load_primarch_registry() -> dict:
+    """Load the primarch registry from disk."""
+    if not PRIMARCH_REGISTRY_PATH.exists():
+        return {"primarchs": {}}
+    return json.loads(PRIMARCH_REGISTRY_PATH.read_text())
+
+
+def create_session_doc_file(file_path: Path, title: str, doc_id: int, project: str = None, primarch_name: str = None) -> None:
     """Create the markdown file for a session document."""
     file_path.parent.mkdir(parents=True, exist_ok=True)
     today = datetime.now().strftime("%Y-%m-%d")
     project_line = f"\nproject: {project}" if project else ""
+    primarch_line = f"\nprimarch: {primarch_name}" if primarch_name else ""
     content = f"""---
 session_doc_id: {doc_id}
 created: {today}{project_line}
 agents: []
+instance_ids: []{primarch_line}
 status: active
 ---
 
@@ -8452,15 +8609,16 @@ _No plan defined yet._
 
 
 async def _update_doc_agents_list(db, doc_id: int) -> None:
-    """Update the agents list in a session doc's YAML frontmatter."""
+    """Update the agents list, instance_ids, and primarch in a session doc's YAML frontmatter."""
     cursor = await db.execute(
-        "SELECT tab_name FROM claude_instances WHERE session_doc_id = ? AND status IN ('processing', 'idle')",
+        "SELECT id, tab_name FROM claude_instances WHERE session_doc_id = ? AND status IN ('processing', 'idle')",
         (doc_id,)
     )
     rows = await cursor.fetchall()
-    agents = [r[0] for r in rows if r[0]]
+    agents = [r[1] for r in rows if r[1]]
+    instance_ids = [r[0] for r in rows if r[0]]
 
-    cursor = await db.execute("SELECT file_path FROM session_documents WHERE id = ?", (doc_id,))
+    cursor = await db.execute("SELECT file_path, primarch_name FROM session_documents WHERE id = ?", (doc_id,))
     doc_row = await cursor.fetchone()
     if not doc_row:
         return
@@ -8469,7 +8627,10 @@ async def _update_doc_agents_list(db, doc_id: int) -> None:
     if not fp.exists():
         return
 
+    primarch_name = doc_row[1]
+
     content = fp.read_text()
+    # Update agents list
     content = re.sub(
         r'^agents:.*$',
         f'agents: [{", ".join(agents)}]',
@@ -8477,11 +8638,60 @@ async def _update_doc_agents_list(db, doc_id: int) -> None:
         count=1,
         flags=re.MULTILINE
     )
+    # Update instance_ids
+    ids_str = ", ".join(instance_ids)
+    if re.search(r'^instance_ids:.*$', content, re.MULTILINE):
+        content = re.sub(
+            r'^instance_ids:.*$',
+            f'instance_ids: [{ids_str}]',
+            content,
+            count=1,
+            flags=re.MULTILINE
+        )
+    else:
+        # Insert after agents line
+        content = re.sub(
+            r'^(agents:.*$)',
+            f'\\1\ninstance_ids: [{ids_str}]',
+            content,
+            count=1,
+            flags=re.MULTILINE
+        )
+    # Update primarch
+    if primarch_name:
+        if re.search(r'^primarch:.*$', content, re.MULTILINE):
+            content = re.sub(
+                r'^primarch:.*$',
+                f'primarch: {primarch_name}',
+                content,
+                count=1,
+                flags=re.MULTILINE
+            )
+        else:
+            # Insert after instance_ids line
+            content = re.sub(
+                r'^(instance_ids:.*$)',
+                f'\\1\nprimarch: {primarch_name}',
+                content,
+                count=1,
+                flags=re.MULTILINE
+            )
+    else:
+        # Remove primarch line if no primarch
+        content = re.sub(r'^primarch:.*\n', '', content, count=1, flags=re.MULTILINE)
+
     fp.write_text(content)
 
 
 async def _handle_orphan_doc(doc_id: int) -> None:
-    """Handle cleanup when a doc loses all linked instances."""
+    """Handle cleanup when a doc loses all linked instances.
+
+    Lifecycle-aware:
+    - active + empty → delete
+    - active + has content → completed (enters deployment pipeline)
+    - completed / deployment → leave alone (Administratum handles)
+    - processed → archive
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT COUNT(*) FROM claude_instances WHERE session_doc_id = ?",
@@ -8491,12 +8701,31 @@ async def _handle_orphan_doc(doc_id: int) -> None:
         if count > 0:
             return
 
-        cursor = await db.execute("SELECT file_path, title FROM session_documents WHERE id = ?", (doc_id,))
+        cursor = await db.execute("SELECT file_path, title, status FROM session_documents WHERE id = ?", (doc_id,))
         row = await cursor.fetchone()
         if not row:
             return
 
         fp = Path(row[0])
+        status = row[2]
+        now = datetime.now().isoformat()
+
+        # completed / deployment docs are in the pipeline — don't touch them
+        if status in ("completed", "deployment"):
+            logger.info(f"Orphan cleanup: doc {doc_id} ({row[1]}) is {status}, leaving for Administratum")
+            return
+
+        # processed docs can be archived
+        if status == "processed":
+            await db.execute(
+                "UPDATE session_documents SET status = 'archived', updated_at = ? WHERE id = ?",
+                (now, doc_id)
+            )
+            await db.commit()
+            logger.info(f"Orphan cleanup: archived processed session doc {doc_id} ({row[1]})")
+            return
+
+        # active docs: check if empty
         if not fp.exists():
             return
 
@@ -8507,12 +8736,13 @@ async def _handle_orphan_doc(doc_id: int) -> None:
             await db.commit()
             logger.info(f"Orphan cleanup: deleted unedited session doc {doc_id} ({row[1]})")
         else:
+            # Has content — transition to completed (enters deployment pipeline)
             await db.execute(
-                "UPDATE session_documents SET status = 'archived', updated_at = ? WHERE id = ?",
-                (datetime.now().isoformat(), doc_id)
+                "UPDATE session_documents SET status = 'completed', updated_at = ? WHERE id = ?",
+                (now, doc_id)
             )
             await db.commit()
-            logger.info(f"Orphan cleanup: archived edited session doc {doc_id} ({row[1]})")
+            logger.info(f"Orphan cleanup: completed edited session doc {doc_id} ({row[1]}) — ready for deployment")
 
 
 # ============ Session Document Endpoints ============
@@ -8531,21 +8761,39 @@ async def create_session_doc(request: SessionDocCreateRequest):
     if fp.exists():
         raise HTTPException(status_code=409, detail=f"File already exists: {fp}")
 
+    now = datetime.now().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            """INSERT INTO session_documents (title, file_path, project, status, created_at, updated_at)
-               VALUES (?, ?, ?, 'active', ?, ?)""",
-            (request.title, str(fp), request.project, datetime.now().isoformat(), datetime.now().isoformat())
+            """INSERT INTO session_documents (title, file_path, project, primarch_name, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, 'active', ?, ?)""",
+            (request.title, str(fp), request.project, request.primarch_name, now, now)
         )
         doc_id = cursor.lastrowid
+
+        # Auto-link primarch if specified
+        if request.primarch_name:
+            # Unlink any existing active doc for this primarch
+            await db.execute(
+                "UPDATE primarch_session_docs SET unlinked_at = ? WHERE primarch_name = ? AND unlinked_at IS NULL",
+                (now, request.primarch_name)
+            )
+            await db.execute(
+                "INSERT INTO primarch_session_docs (primarch_name, session_doc_id, linked_at) VALUES (?, ?, ?)",
+                (request.primarch_name, doc_id, now)
+            )
+
         await db.commit()
 
-    create_session_doc_file(fp, request.title, doc_id, request.project)
+    create_session_doc_file(fp, request.title, doc_id, request.project, request.primarch_name)
 
-    await log_event("session_doc_created", details={"doc_id": doc_id, "title": request.title, "file_path": str(fp)})
+    await log_event("session_doc_created", details={
+        "doc_id": doc_id, "title": request.title, "file_path": str(fp),
+        "primarch_name": request.primarch_name
+    })
     logger.info(f"Created session doc {doc_id}: {request.title} -> {fp}")
 
-    return {"id": doc_id, "title": request.title, "file_path": str(fp), "status": "active"}
+    return {"id": doc_id, "title": request.title, "file_path": str(fp), "status": "active",
+            "primarch_name": request.primarch_name}
 
 
 @app.get("/api/session-docs")
@@ -8624,8 +8872,9 @@ async def get_session_doc_content(doc_id: int):
 async def update_session_doc(doc_id: int, request: SessionDocUpdateRequest):
     """Update session document metadata."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id FROM session_documents WHERE id = ?", (doc_id,))
-        if not await cursor.fetchone():
+        cursor = await db.execute("SELECT id, status FROM session_documents WHERE id = ?", (doc_id,))
+        row = await cursor.fetchone()
+        if not row:
             raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
 
         updates = []
@@ -8637,6 +8886,14 @@ async def update_session_doc(doc_id: int, request: SessionDocUpdateRequest):
             updates.append("project = ?")
             params.append(request.project)
         if request.status is not None:
+            current_status = row[1]
+            valid_targets = VALID_STATUS_TRANSITIONS.get(current_status, set())
+            # Any status can go to archived (escape hatch)
+            if request.status != "archived" and request.status not in valid_targets:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid status transition: {current_status} → {request.status}. Valid: {valid_targets | {'archived'}}"
+                )
             updates.append("status = ?")
             params.append(request.status)
 
@@ -8917,6 +9174,215 @@ async def get_instance_session_doc(instance_id: str):
         if not doc:
             return {"session_doc_id": None}
         return dict(doc)
+
+
+# ============ Primarch Endpoints ============
+
+@app.get("/api/primarchs")
+async def list_primarchs():
+    """List primarchs from registry with their active session doc from DB."""
+    registry = load_primarch_registry()
+    result = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        for name, data in registry.get("primarchs", {}).items():
+            # Get active doc link
+            cursor = await db.execute(
+                "SELECT session_doc_id FROM primarch_session_docs WHERE primarch_name = ? AND unlinked_at IS NULL",
+                (name,)
+            )
+            link_row = await cursor.fetchone()
+            active_doc = None
+            if link_row:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute("SELECT id, title, file_path, status FROM session_documents WHERE id = ?", (link_row[0],))
+                doc_row = await cursor.fetchone()
+                if doc_row:
+                    active_doc = dict(doc_row)
+                db.row_factory = None
+
+            result.append({
+                "name": name,
+                "title": data.get("title"),
+                "aliases": data.get("aliases", []),
+                "vault": data.get("vault"),
+                "role": data.get("role"),
+                "instance_name_prefix": data.get("instance_name_prefix"),
+                "active_doc": active_doc,
+            })
+    return {"primarchs": result}
+
+
+@app.get("/api/primarchs/{name}/active-doc")
+async def get_primarch_active_doc(name: str):
+    """Get the currently linked session doc for a primarch, or null."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT session_doc_id FROM primarch_session_docs WHERE primarch_name = ? AND unlinked_at IS NULL",
+            (name,)
+        )
+        link_row = await cursor.fetchone()
+        if not link_row:
+            return {"primarch": name, "doc_id": None, "doc": None}
+
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM session_documents WHERE id = ?", (link_row[0],))
+        doc_row = await cursor.fetchone()
+        if not doc_row:
+            return {"primarch": name, "doc_id": None, "doc": None}
+
+        return {"primarch": name, "doc_id": link_row[0], "doc": dict(doc_row)}
+
+
+class PrimarchLinkDocRequest(BaseModel):
+    title: Optional[str] = None
+
+
+@app.post("/api/primarchs/{name}/link-doc")
+async def link_primarch_doc(name: str, doc_id: Optional[int] = None, request: PrimarchLinkDocRequest = None):
+    """Link a primarch to a session doc. If doc_id query param given, link existing. If body has title, create new + link."""
+    now = datetime.now().isoformat()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        if doc_id:
+            # Link to existing doc
+            cursor = await db.execute("SELECT id FROM session_documents WHERE id = ?", (doc_id,))
+            if not await cursor.fetchone():
+                raise HTTPException(404, f"Session doc {doc_id} not found")
+            target_doc_id = doc_id
+            # Set primarch_name on the doc
+            await db.execute(
+                "UPDATE session_documents SET primarch_name = ?, updated_at = ? WHERE id = ?",
+                (name, now, doc_id)
+            )
+        elif request and request.title:
+            # Create new doc + link
+            today = datetime.now().strftime("%Y-%m-%d")
+            slug = request.title.lower().replace(" ", "-")[:50]
+            fp = DEFAULT_SESSIONS_DIR / f"{today}-{slug}.md"
+            if fp.exists():
+                raise HTTPException(409, f"File already exists: {fp}")
+            cursor = await db.execute(
+                """INSERT INTO session_documents (title, file_path, primarch_name, status, created_at, updated_at)
+                   VALUES (?, ?, ?, 'active', ?, ?)""",
+                (request.title, str(fp), name, now, now)
+            )
+            target_doc_id = cursor.lastrowid
+            create_session_doc_file(fp, request.title, target_doc_id, primarch_name=name)
+        else:
+            raise HTTPException(400, "Provide doc_id query param or {title} in body")
+
+        # Unlink previous active doc
+        await db.execute(
+            "UPDATE primarch_session_docs SET unlinked_at = ? WHERE primarch_name = ? AND unlinked_at IS NULL",
+            (now, name)
+        )
+        # Create new link
+        await db.execute(
+            "INSERT INTO primarch_session_docs (primarch_name, session_doc_id, linked_at) VALUES (?, ?, ?)",
+            (name, target_doc_id, now)
+        )
+        await db.commit()
+
+    await log_event("primarch_doc_linked", details={"primarch": name, "doc_id": target_doc_id})
+    logger.info(f"Primarch {name} linked to doc {target_doc_id}")
+    return {"primarch": name, "doc_id": target_doc_id, "linked": True}
+
+
+@app.delete("/api/primarchs/{name}/link-doc")
+async def unlink_primarch_doc(name: str):
+    """Unlink the current session doc from a primarch."""
+    now = datetime.now().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT session_doc_id FROM primarch_session_docs WHERE primarch_name = ? AND unlinked_at IS NULL",
+            (name,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return {"primarch": name, "unlinked": False, "reason": "No active doc linked"}
+
+        doc_id = row[0]
+        await db.execute(
+            "UPDATE primarch_session_docs SET unlinked_at = ? WHERE primarch_name = ? AND unlinked_at IS NULL",
+            (now, name)
+        )
+        await db.execute(
+            "UPDATE session_documents SET primarch_name = NULL, updated_at = ? WHERE id = ?",
+            (now, doc_id)
+        )
+        await db.commit()
+
+    await log_event("primarch_doc_unlinked", details={"primarch": name, "doc_id": doc_id})
+    logger.info(f"Primarch {name} unlinked from doc {doc_id}")
+    return {"primarch": name, "doc_id": doc_id, "unlinked": True}
+
+
+# ============ Deployment Lifecycle Endpoints ============
+
+@app.post("/api/session-docs/{doc_id}/deploy")
+async def deploy_session_doc(doc_id: int):
+    """Transition a completed session doc to deployment status."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT id, status, title FROM session_documents WHERE id = ?", (doc_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(404, f"Session doc {doc_id} not found")
+        if row[1] != "completed":
+            raise HTTPException(400, f"Can only deploy completed docs, current status: {row[1]}")
+
+        now = datetime.now().isoformat()
+        await db.execute(
+            "UPDATE session_documents SET status = 'deployment', updated_at = ? WHERE id = ?",
+            (now, doc_id)
+        )
+        await db.commit()
+
+    await log_event("session_doc_deployed", details={"doc_id": doc_id, "title": row[2]})
+    logger.info(f"Session doc {doc_id} ({row[2]}) moved to deployment")
+    return {"id": doc_id, "status": "deployment"}
+
+
+@app.get("/api/session-docs/deployment-queue")
+async def get_deployment_queue():
+    """List session docs ready for Administratum processing."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM session_documents WHERE status = 'deployment' ORDER BY updated_at ASC"
+        )
+        rows = await cursor.fetchall()
+    return {"docs": [dict(r) for r in rows]}
+
+
+@app.post("/api/session-docs/{doc_id}/mark-processed")
+async def mark_session_doc_processed(doc_id: int):
+    """Mark a deployment doc as processed by Administratum. Unlinks primarch if linked."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT id, status, title, primarch_name FROM session_documents WHERE id = ?", (doc_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(404, f"Session doc {doc_id} not found")
+        if row[1] != "deployment":
+            raise HTTPException(400, f"Can only mark deployment docs as processed, current status: {row[1]}")
+
+        now = datetime.now().isoformat()
+        await db.execute(
+            "UPDATE session_documents SET status = 'processed', primarch_name = NULL, updated_at = ? WHERE id = ?",
+            (now, doc_id)
+        )
+
+        # Unlink primarch if this was linked
+        if row[3]:
+            await db.execute(
+                "UPDATE primarch_session_docs SET unlinked_at = ? WHERE primarch_name = ? AND session_doc_id = ? AND unlinked_at IS NULL",
+                (now, row[3], doc_id)
+            )
+
+        await db.commit()
+
+    await log_event("session_doc_processed", details={"doc_id": doc_id, "title": row[2]})
+    logger.info(f"Session doc {doc_id} ({row[2]}) marked as processed")
+    return {"id": doc_id, "status": "processed"}
 
 
 # ============ MiniMax Status Endpoint ============

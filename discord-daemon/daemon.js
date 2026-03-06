@@ -8,6 +8,7 @@ import { createMessageStore } from './message-store.js';
 import { writeFileSync, unlinkSync, mkdirSync, appendFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { SlashCommandBuilder, Events } from 'discord.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BASE_DIR = join(__dirname, '..');
@@ -114,6 +115,80 @@ async function main() {
   for (const [name, client] of Object.entries(botClients)) {
     await client.start();
     logger.info(`Bot '${name}' connected`);
+  }
+
+  // Register slash commands on Custodes bot (/task, /note)
+  const custodes = botClients['custodes'];
+  if (custodes) {
+    try {
+      const commands = [
+        new SlashCommandBuilder()
+          .setName('task')
+          .setDescription('Create a new task in the vault')
+          .addStringOption(opt =>
+            opt.setName('title').setDescription('Task title').setRequired(true))
+          .addStringOption(opt =>
+            opt.setName('body').setDescription('Task details').setRequired(false)),
+        new SlashCommandBuilder()
+          .setName('note')
+          .setDescription('Create a new note in the vault')
+          .addStringOption(opt =>
+            opt.setName('title').setDescription('Note title').setRequired(true))
+          .addStringOption(opt =>
+            opt.setName('body').setDescription('Note details').setRequired(false)),
+      ];
+
+      const guild = await custodes.client.guilds.fetch(config.guild_id);
+      await guild.commands.set(commands.map(c => c.toJSON()));
+      logger.info('Custodes slash commands registered (guild-scoped): /task, /note');
+
+      // Handle interactions — deterministic, no AI
+      custodes.client.on(Events.InteractionCreate, async (interaction) => {
+        if (!interaction.isChatInputCommand()) return;
+
+        const { commandName } = interaction;
+        if (commandName !== 'task' && commandName !== 'note') return;
+
+        const title = interaction.options.getString('title');
+        const body = interaction.options.getString('body') || '';
+        const noteType = commandName === 'task' ? 'prescriptive' : 'descriptive';
+        const author = interaction.member?.displayName
+          || interaction.user?.displayName
+          || interaction.user?.username
+          || 'Discord';
+
+        await interaction.deferReply();
+
+        try {
+          const resp = await fetch(`http://127.0.0.1:${config.token_api_port}/api/inbox/create`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              title,
+              type: noteType,
+              content: body,
+              source: 'discord',
+              author,
+            }),
+          });
+
+          if (!resp.ok) {
+            const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+            await interaction.editReply(`Failed: ${err.detail || resp.statusText}`);
+            return;
+          }
+
+          const result = await resp.json();
+          await interaction.editReply(`Created ${noteType} note: **${result.title}**`);
+          logger.info(`Slash command /${commandName}: created '${result.title}' by ${author}`);
+        } catch (err) {
+          logger.error(`Slash command /${commandName} failed: ${err.message}`);
+          await interaction.editReply(`Failed to create note: ${err.message}`);
+        }
+      });
+    } catch (err) {
+      logger.warn(`Failed to register Custodes slash commands: ${err.message}`);
+    }
   }
 
   // Retry pending messages after connection

@@ -32,10 +32,9 @@ Options:
 
 Instance Resolution (in order):
   1. --id flag if provided
-  2. TOKEN_API_INSTANCE_ID env var (set by SessionStart hook)
-  3. PID-based lookup via ~/.claude/session-pids/<claude-pid>
-  4. PID field match in API instances list
-  5. CWD match (processing instances preferred over idle)
+  2. PID-based lookup via ~/.claude/session-pids/<claude-pid>
+  3. PID field match in API instances list
+  4. CWD match (processing instances preferred over idle)
 
 Examples:
   instance-name "auth-refactor"
@@ -108,11 +107,9 @@ _find_claude_pid() {
     return 1
 }
 
-# Resolve instance ID (priority: --id > env var > pid-cache > pid-api > cwd)
+# Resolve instance ID (priority: --id > pid-cache > pid-api > cwd)
 if [[ -n "$EXPLICIT_ID" ]]; then
     INSTANCE_ID="$EXPLICIT_ID"
-elif [[ -n "${TOKEN_API_INSTANCE_ID:-}" ]]; then
-    INSTANCE_ID="$TOKEN_API_INSTANCE_ID"
 else
     INSTANCE_ID=""
 
