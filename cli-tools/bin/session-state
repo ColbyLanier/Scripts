@@ -4,10 +4,11 @@
 # AUDIENCE: agent
 #
 # Usage:
-#   session-state get <agent-name> [key]          # Read state (whole JSON or one key)
-#   session-state set <agent-name> <key> <value>  # Set a key in agent's state JSON
-#   session-state clear <agent-name>              # Clear all state for agent
-#   session-state list                             # List all agents with state files
+#   session-state get <agent-name> [key]               # Read state (whole JSON or one key)
+#   session-state set <agent-name> <key> <value>       # Set a key (stored as string)
+#   session-state set <agent-name> <key> --json <val>  # Set as native JSON (number/bool/object)
+#   session-state clear <agent-name>                   # Clear all state for agent
+#   session-state list                                 # List all agents with state files
 #
 # State stored in: ~/.openclaw/workspace/memory/session-states/<agent-name>.json
 
@@ -20,6 +21,7 @@ usage() {
   echo "Usage:"
   echo "  session-state get <agent-name> [key]"
   echo "  session-state set <agent-name> <key> <value>"
+  echo "  session-state set <agent-name> <key> --json <value>  (native JSON type)"
   echo "  session-state clear <agent-name>"
   echo "  session-state list"
   exit 1
@@ -52,6 +54,17 @@ case "$CMD" in
     ;;
 
   set)
+    # Parse optional --json flag (can appear at any position after agent/key)
+    AS_JSON=0
+    REMAINING=()
+    for a in "$@"; do
+      if [[ "$a" == "--json" ]]; then
+        AS_JSON=1
+      else
+        REMAINING+=("$a")
+      fi
+    done
+    set -- "${REMAINING[@]}"
     [[ $# -lt 3 ]] && { echo "Error: set requires <agent-name> <key> <value>"; usage; }
     AGENT="$1"
     KEY="$2"
@@ -61,7 +74,15 @@ case "$CMD" in
       echo "{}" > "$FILE"
     fi
     TMP=$(mktemp)
-    jq --arg k "$KEY" --arg v "$VALUE" '.[$k] = $v' "$FILE" > "$TMP"
+    if [[ "$AS_JSON" -eq 1 ]]; then
+      if ! jq --arg k "$KEY" --argjson v "$VALUE" '.[$k] = $v' "$FILE" > "$TMP" 2>/dev/null; then
+        echo "Error: invalid JSON value: $VALUE" >&2
+        rm -f "$TMP"
+        exit 1
+      fi
+    else
+      jq --arg k "$KEY" --arg v "$VALUE" '.[$k] = $v' "$FILE" > "$TMP"
+    fi
     mv "$TMP" "$FILE"
     echo "Set $AGENT.$KEY = $VALUE"
     ;;
