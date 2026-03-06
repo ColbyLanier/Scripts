@@ -10,6 +10,7 @@ Usage:
     token-status --json       # JSON output
 """
 
+import re
 import sys
 import json
 import urllib.request
@@ -78,7 +79,7 @@ def display_status(json_output=False):
         print()
         for inst in active:
             name = inst.get("tab_name") or inst.get("working_dir", "?").split("/")[-1]
-            if name.startswith("Claude ") and len(name) == 11:  # "Claude HH:MM"
+            if re.match(r'^Claude \d{2}:\d{2}$', name):
                 wd = inst.get("working_dir", "")
                 name = "/".join(wd.split("/")[-2:]) if wd else name
             device = inst.get("device_id", "?")
