@@ -3,10 +3,11 @@
 All time values are integer milliseconds. Time source is injected via
 now_mono_ms parameters for deterministic testing.
 
-State model: three independent layers compose into 6 effective modes.
+State model: three mode layers compose into 6 effective modes, plus focus overlay.
   Activity:     working | distraction   (from AHK/phone detection)
   Productivity: active | inactive       (from Claude instances / work actions)
   Manual:       None | BREAK | SLEEPING (user-initiated overrides)
+  Focus:        on | off                (user toggle, auto-off on distraction)
 """
 
 from __future__ import annotations
@@ -62,6 +63,10 @@ IDLE_TIMEOUT_FROM_MULTITASKING_MS = 120_000    # 2 minutes
 DISTRACTION_TIMEOUT_MS = 600_000               # 10 minutes (scrolling/gaming only)
 GYM_BOUNTY_MS = 1_800_000                      # 30 minutes
 
+# Focus layer — indexes backward from cutoff hour at 1:1
+FOCUS_CUTOFF_BASE_HOUR = 21                      # 9 PM
+FOCUS_CUTOFF_FLOOR_HOUR = 18                     # 6 PM (minimum, prevents gaming)
+
 MAX_IDLE_MS = 10 * 60 * 1000                   # 10 min gap detection
 MANUAL_LOCK_DURATION_MS = 20 * 60 * 1000       # 20 minutes
 DEFAULT_BREAK_BUFFER_MS = 5 * 60 * 1000        # 5 min starting break on reset
@@ -104,6 +109,10 @@ class TimerEngine:
             "idle_timeout_ms": IDLE_TIMEOUT_FROM_WORKING_MS,
             "idle_timeout_exempt": False,
         }
+
+        # Focus layer (independent, parallel to other layers)
+        self._focus_active: bool = False
+        self._total_focus_time_ms: int = 0
 
         # Counters
         self._total_work_time_ms: int = 0
@@ -208,6 +217,29 @@ class TimerEngine:
         return self._productivity_active
 
     @property
+    def focus_active(self) -> bool:
+        return self._focus_active
+
+    @property
+    def total_focus_time_ms(self) -> int:
+        return self._total_focus_time_ms
+
+    @property
+    def focus_cutoff_hour(self) -> float:
+        """Derive end-of-day cutoff: base (21:00) minus focus hours, floored at 18:00."""
+        focus_hours = self._total_focus_time_ms / (1000 * 60 * 60)
+        cutoff = FOCUS_CUTOFF_BASE_HOUR - focus_hours
+        return max(FOCUS_CUTOFF_FLOOR_HOUR, cutoff)
+
+    @property
+    def focus_cutoff_time(self) -> str:
+        """Human-readable cutoff time string like '20:30' or '9:00 PM'."""
+        h = self.focus_cutoff_hour
+        hour = int(h)
+        minute = int((h - hour) * 60)
+        return f"{hour}:{minute:02d}"
+
+    @property
     def manual_mode(self) -> TimerMode | None:
         return self._manual_mode
 
@@ -241,6 +273,10 @@ class TimerEngine:
         """Update the activity layer. Called by AHK/phone detection."""
         old_mode = self.effective_mode
         result = self._advance(now_mono_ms)
+
+        # Auto-exit focus on any distraction
+        if activity == Activity.DISTRACTION and self._focus_active:
+            self._focus_active = False
 
         sub = self._activity_substate
         if activity == Activity.DISTRACTION:
@@ -357,6 +393,24 @@ class TimerEngine:
         self._apply_break_delta(GYM_BOUNTY_MS, result)
         return result
 
+    # ---- Focus layer ----
+
+    def enter_focus(self, now_mono_ms: int) -> tuple[bool, TickResult]:
+        """Toggle focus ON. Returns (changed, result)."""
+        if self._focus_active:
+            return False, TickResult()
+        result = self._advance(now_mono_ms)
+        self._focus_active = True
+        return True, result
+
+    def exit_focus(self, now_mono_ms: int) -> tuple[bool, TickResult]:
+        """Toggle focus OFF. Returns (changed, result)."""
+        if not self._focus_active:
+            return False, TickResult()
+        result = self._advance(now_mono_ms)
+        self._focus_active = False
+        return True, result
+
     # ---- Tick ----
 
     def tick(self, now_mono_ms: int, today_date: str, current_hour: int | None = None) -> TickResult:
@@ -411,6 +465,9 @@ class TimerEngine:
             "activity": self._activity.value,
             "productivity_active": self._productivity_active,
             "manual_mode": self._manual_mode.value if self._manual_mode else None,
+            # Focus layer
+            "focus_active": self._focus_active,
+            "total_focus_time_ms": self._total_focus_time_ms,
             # Manual substate
             "manual_trigger": manual_trigger,
             "manual_mode_lock": self.manual_mode_lock,
@@ -443,6 +500,10 @@ class TimerEngine:
             "backlogSeconds": round(abs(min(0, self._break_balance_ms)) / 1000),
             "workTimeSeconds": round(self._total_work_time_ms / 1000),
             "breakUsedSeconds": round(self._total_break_time_ms / 1000),
+            "focusActive": self._focus_active,
+            "focusTimeSeconds": round(self._total_focus_time_ms / 1000),
+            "focusCutoffHour": self.focus_cutoff_hour,
+            "focusCutoffTime": self.focus_cutoff_time,
         }
 
     def from_dict(self, data: dict, now_mono_ms: int) -> None:
@@ -460,6 +521,10 @@ class TimerEngine:
         self._productivity_active = data.get("productivity_active", True)
         manual = data.get("manual_mode")
         self._manual_mode = TimerMode(manual) if manual else None
+
+        # Focus layer
+        self._focus_active = data.get("focus_active", False)
+        self._total_focus_time_ms = int(data.get("total_focus_time_ms", 0))
 
         self._total_work_time_ms = int(data.get("total_work_time_ms", 0))
         self._total_break_time_ms = int(data.get("total_break_time_ms", 0))
@@ -662,6 +727,10 @@ class TimerEngine:
 
         # SLEEPING: no accumulation
 
+        # Focus layer: accumulate independently when active
+        if self._focus_active:
+            self._total_focus_time_ms += elapsed_ms
+
         self._last_tick_ms = now_mono_ms
         return result
 
@@ -699,6 +768,8 @@ class TimerEngine:
             "idle_timeout_ms": IDLE_TIMEOUT_FROM_WORKING_MS,
             "idle_timeout_exempt": self._productivity_substate.get("idle_timeout_exempt", False),
         }
+        self._focus_active = False
+        self._total_focus_time_ms = 0
         self._total_work_time_ms = 0
         self._total_break_time_ms = 0
         self._break_balance_ms = DEFAULT_BREAK_BUFFER_MS if with_buffer else 0

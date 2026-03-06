@@ -864,6 +864,33 @@ async def init_db():
               ON primarch_session_docs(primarch_name) WHERE unlinked_at IS NULL
         """)
 
+        # Create primarchs table (registry of primarch identities)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS primarchs (
+                name            TEXT PRIMARY KEY,
+                title           TEXT NOT NULL,
+                aliases         TEXT NOT NULL DEFAULT '[]',
+                vault           TEXT NOT NULL,
+                role            TEXT NOT NULL,
+                instance_name_prefix TEXT NOT NULL,
+                vault_note_path TEXT,
+                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Seed primarchs (INSERT OR IGNORE so existing data isn't overwritten)
+        primarch_seed = [
+            ("vulkan", "Vulkan, The Promethean", '["v"]', "Imperium-ENV", "Infrastructure architect and system designer. Forges artifacts meant to outlast their maker. Primarch of the Vault Mind system.", "vulkan", "Personas/Vulkan.md"),
+            ("fabricator-general", "The Fabricator-General", '["fg", "fabricator"]', "Imperium-ENV", "Fleet orchestrator for the Mechanicus swarm. Reads state, detects stuck jobs, dispatches workers. The operational backbone of overnight automation.", "fabricator-general", "Personas/Fabricator-General.md"),
+            ("mechanicus", "Adeptus Mechanicus", '["mech", "mars"]', "Imperium-ENV", "Tech-priest worker. Builds, fixes, and maintains agent infrastructure. Takes assignments from Mars/Tasks/.", "mechanicus", "Personas/Mechanicus.md"),
+            ("administratum", "The Administratum", '["admin"]', "Imperium-ENV", "Background processor. Promotes completed session doc content into vault notes, then archives. The bridge between working memory and institutional memory.", "administratum", "Personas/Administratum.md"),
+        ]
+        for p in primarch_seed:
+            await db.execute("""
+                INSERT OR IGNORE INTO primarchs (name, title, aliases, vault, role, instance_name_prefix, vault_note_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, p)
+
         await db.commit()
         print(f"Database initialized at {DB_PATH}")
 
@@ -4115,11 +4142,23 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
         now_ms = int(time.monotonic() * 1000)
         old_timer_mode = timer_engine.current_mode.value
 
+        was_focused = timer_engine.focus_active
         if detected_mode in ("video", "scrolling", "gaming"):
             is_sg = detected_mode in ("scrolling", "gaming")
             result = timer_engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=is_sg, now_mono_ms=now_ms)
         else:
             result = timer_engine.set_activity(Activity.WORKING, is_scrolling_gaming=False, now_mono_ms=now_ms)
+
+        # Log focus auto-exit on distraction
+        if was_focused and not timer_engine.focus_active:
+            focus_min = round(timer_engine.total_focus_time_ms / 60000)
+            await log_event("focus_toggle", details={
+                "action": "off", "trigger": "distraction", "detected_mode": detected_mode,
+                "total_focus_time_ms": timer_engine.total_focus_time_ms,
+                "focus_cutoff_time": timer_engine.focus_cutoff_time,
+            })
+            loop = asyncio.get_event_loop()
+            loop.run_in_executor(None, speak_tts, f"Focus broken by {detected_mode}. {focus_min} minutes earned.")
 
         timer_updated = TimerEvent.MODE_CHANGED in result.events
         if timer_updated:
@@ -4357,10 +4396,21 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
         now_ms = int(time.monotonic() * 1000)
         # Phone distractions → set activity to DISTRACTION
+        was_focused = timer_engine.focus_active
         is_sg = distraction_mode in ("scrolling", "gaming")
         result = timer_engine.set_activity(Activity.DISTRACTION, is_scrolling_gaming=is_sg, now_mono_ms=now_ms)
         updated = TimerEvent.MODE_CHANGED in result.events
         print(f"    Phone open -> {distraction_mode} (activity=DISTRACTION, sg={is_sg}) | timer={updated}")
+        # Log focus auto-exit on phone distraction
+        if was_focused and not timer_engine.focus_active:
+            focus_min = round(timer_engine.total_focus_time_ms / 60000)
+            asyncio.ensure_future(log_event("focus_toggle", details={
+                "action": "off", "trigger": "phone_distraction", "app": app_name,
+                "total_focus_time_ms": timer_engine.total_focus_time_ms,
+                "focus_cutoff_time": timer_engine.focus_cutoff_time,
+            }))
+            loop = asyncio.get_event_loop()
+            loop.run_in_executor(None, speak_tts, f"Focus broken by phone. {focus_min} minutes earned.")
         # Track Twitter open time for 7-minute enforcement
         if app_name in ("twitter", "x", "com.twitter.android"):
             if PHONE_STATE["twitter_open_since"] is None and not PHONE_STATE.get("twitter_zapped"):
@@ -4673,6 +4723,11 @@ async def get_timer_state():
         "daily_start_date": timer_engine.daily_start_date,
         "manual_mode_lock": timer_engine.manual_mode_lock,
         "manual_trigger": timer_engine.manual_trigger,
+        "focus_active": timer_engine.focus_active,
+        "total_focus_time": format_timer_time(timer_engine.total_focus_time_ms),
+        "total_focus_time_ms": timer_engine.total_focus_time_ms,
+        "focus_cutoff_time": timer_engine.focus_cutoff_time,
+        "focus_cutoff_hour": timer_engine.focus_cutoff_hour,
         "desktop_mode": DESKTOP_STATE.get("current_mode", "silence"),
         "work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
         "location_zone": DESKTOP_STATE.get("location_zone"),
@@ -4834,6 +4889,43 @@ async def resume_work_mode():
         _session_start_ms = now_ms
         await log_event("timer_mode_change", details={"new_mode": new_mode, "source": "api"})
     return {"status": timer_engine.current_mode.value, "changed": changed}
+
+
+@app.post("/api/timer/focus")
+async def toggle_focus_mode():
+    """Toggle focus layer on/off. Auto-exits on distraction detection."""
+    now_ms = int(time.monotonic() * 1000)
+    if timer_engine.focus_active:
+        changed, tick_result = timer_engine.exit_focus(now_ms)
+        focus_on = False
+    else:
+        changed, tick_result = timer_engine.enter_focus(now_ms)
+        focus_on = True
+
+    if changed:
+        action = "on" if focus_on else "off"
+        await log_event("focus_toggle", details={
+            "action": action,
+            "total_focus_time_ms": timer_engine.total_focus_time_ms,
+            "focus_cutoff_time": timer_engine.focus_cutoff_time,
+        })
+        # TTS announcement
+        focus_min = round(timer_engine.total_focus_time_ms / 60000)
+        if focus_on:
+            msg = "Focus mode on."
+        else:
+            msg = f"Focus mode off. {focus_min} minutes today. Cutoff at {timer_engine.focus_cutoff_time}."
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, speak_tts, msg)
+
+    return {
+        "focus_active": timer_engine.focus_active,
+        "changed": changed,
+        "total_focus_time": format_timer_time(timer_engine.total_focus_time_ms),
+        "total_focus_time_ms": timer_engine.total_focus_time_ms,
+        "focus_cutoff_time": timer_engine.focus_cutoff_time,
+        "focus_cutoff_hour": timer_engine.focus_cutoff_hour,
+    }
 
 
 @app.post("/api/timer/daily-reset")
@@ -8575,14 +8667,41 @@ VALID_STATUS_TRANSITIONS = {
     "archived": set(),  # terminal
 }
 
-PRIMARCH_REGISTRY_PATH = Path.home() / ".claude" / "primarchs.json"
+async def get_primarch_from_db(db, name: str) -> Optional[dict]:
+    """Get a single primarch from the DB by name or alias."""
+    db.row_factory = aiosqlite.Row
+    cursor = await db.execute("SELECT * FROM primarchs WHERE name = ?", (name,))
+    row = await cursor.fetchone()
+    if row:
+        result = dict(row)
+        result["aliases"] = json.loads(result["aliases"])
+        db.row_factory = None
+        return result
+    # Check aliases
+    cursor = await db.execute("SELECT * FROM primarchs")
+    rows = await cursor.fetchall()
+    db.row_factory = None
+    for r in rows:
+        r = dict(r)
+        aliases = json.loads(r["aliases"])
+        if name in aliases:
+            r["aliases"] = aliases
+            return r
+    return None
 
 
-def load_primarch_registry() -> dict:
-    """Load the primarch registry from disk."""
-    if not PRIMARCH_REGISTRY_PATH.exists():
-        return {"primarchs": {}}
-    return json.loads(PRIMARCH_REGISTRY_PATH.read_text())
+async def get_all_primarchs_from_db(db) -> list:
+    """Get all primarchs from the DB."""
+    db.row_factory = aiosqlite.Row
+    cursor = await db.execute("SELECT * FROM primarchs ORDER BY name")
+    rows = await cursor.fetchall()
+    db.row_factory = None
+    result = []
+    for r in rows:
+        r = dict(r)
+        r["aliases"] = json.loads(r["aliases"])
+        result.append(r)
+    return result
 
 
 def create_session_doc_file(file_path: Path, title: str, doc_id: int, project: str = None, primarch_name: str = None) -> None:
@@ -9195,15 +9314,15 @@ async def get_instance_session_doc(instance_id: str):
 
 @app.get("/api/primarchs")
 async def list_primarchs():
-    """List primarchs from registry with their active session doc from DB."""
-    registry = load_primarch_registry()
+    """List all primarchs from DB with their active session doc."""
     result = []
     async with aiosqlite.connect(DB_PATH) as db:
-        for name, data in registry.get("primarchs", {}).items():
+        primarchs = await get_all_primarchs_from_db(db)
+        for p in primarchs:
             # Get active doc link
             cursor = await db.execute(
                 "SELECT session_doc_id FROM primarch_session_docs WHERE primarch_name = ? AND unlinked_at IS NULL",
-                (name,)
+                (p["name"],)
             )
             link_row = await cursor.fetchone()
             active_doc = None
@@ -9216,21 +9335,50 @@ async def list_primarchs():
                 db.row_factory = None
 
             result.append({
-                "name": name,
-                "title": data.get("title"),
-                "aliases": data.get("aliases", []),
-                "vault": data.get("vault"),
-                "role": data.get("role"),
-                "instance_name_prefix": data.get("instance_name_prefix"),
+                "name": p["name"],
+                "title": p["title"],
+                "aliases": p["aliases"],
+                "vault": p["vault"],
+                "role": p["role"],
+                "instance_name_prefix": p["instance_name_prefix"],
+                "vault_note_path": p.get("vault_note_path"),
                 "active_doc": active_doc,
             })
     return {"primarchs": result}
+
+
+@app.get("/api/primarchs/{name}")
+async def get_primarch(name: str):
+    """Get a single primarch by name or alias."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        p = await get_primarch_from_db(db, name)
+        if not p:
+            raise HTTPException(404, f"Unknown primarch: {name}")
+        # Get active doc
+        cursor = await db.execute(
+            "SELECT session_doc_id FROM primarch_session_docs WHERE primarch_name = ? AND unlinked_at IS NULL",
+            (p["name"],)
+        )
+        link_row = await cursor.fetchone()
+        active_doc = None
+        if link_row:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT id, title, file_path, status FROM session_documents WHERE id = ?", (link_row[0],))
+            doc_row = await cursor.fetchone()
+            if doc_row:
+                active_doc = dict(doc_row)
+            db.row_factory = None
+        return {**p, "active_doc": active_doc}
 
 
 @app.get("/api/primarchs/{name}/active-doc")
 async def get_primarch_active_doc(name: str):
     """Get the currently linked session doc for a primarch, or null."""
     async with aiosqlite.connect(DB_PATH) as db:
+        # Resolve alias to canonical name
+        p = await get_primarch_from_db(db, name)
+        if p:
+            name = p["name"]
         cursor = await db.execute(
             "SELECT session_doc_id FROM primarch_session_docs WHERE primarch_name = ? AND unlinked_at IS NULL",
             (name,)

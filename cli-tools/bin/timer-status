@@ -156,7 +156,14 @@ def display(data, show_layers=False):
     elif wm == "gym":
         wm_str = color("  GYM", "35")
 
-    print(f"{icon}  {mode_name}  Break: {break_colored}  Work: {work_str}{activity_detail}{lock}{backlog}{wm_str}")
+    # Focus indicator
+    focus_str = ""
+    if data.get("focus_active"):
+        focus_time = data.get("total_focus_time", "0h 0m")
+        cutoff = data.get("focus_cutoff_time", "21:00")
+        focus_str = color(f"  Focus: {focus_time} (off@{cutoff})", "35")
+
+    print(f"{icon}  {mode_name}  Break: {break_colored}  Work: {work_str}{activity_detail}{lock}{backlog}{wm_str}{focus_str}")
 
     if show_layers:
         activity = data.get("activity", "?")
@@ -164,7 +171,9 @@ def display(data, show_layers=False):
         prod_str = color("active", "32") if prod_active else color("inactive", "90")
         manual_str = manual if manual else color("—", "90")
         dm_str = desktop_mode or color("—", "90")
-        print(f"  Activity: {activity}  Desktop: {dm_str}  Productivity: {prod_str}  Manual: {manual_str}")
+        focus_on = data.get("focus_active", False)
+        focus_layer = color("on", "35") if focus_on else color("off", "90")
+        print(f"  Activity: {activity}  Desktop: {dm_str}  Productivity: {prod_str}  Manual: {manual_str}  Focus: {focus_layer}")
 
 
 def sparkline(series, width=50):

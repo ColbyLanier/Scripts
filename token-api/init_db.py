@@ -211,6 +211,33 @@ def init_database():
         )
     """)
 
+    # Create primarchs table (registry of primarch identities)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS primarchs (
+            name            TEXT PRIMARY KEY,
+            title           TEXT NOT NULL,
+            aliases         TEXT NOT NULL DEFAULT '[]',
+            vault           TEXT NOT NULL,
+            role            TEXT NOT NULL,
+            instance_name_prefix TEXT NOT NULL,
+            vault_note_path TEXT,
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Seed primarchs
+    primarch_seed = [
+        ("vulkan", "Vulkan, The Promethean", '["v"]', "Imperium-ENV", "Infrastructure architect and system designer. Forges artifacts meant to outlast their maker. Primarch of the Vault Mind system.", "vulkan", "Personas/Vulkan.md"),
+        ("fabricator-general", "The Fabricator-General", '["fg", "fabricator"]', "Imperium-ENV", "Fleet orchestrator for the Mechanicus swarm. Reads state, detects stuck jobs, dispatches workers. The operational backbone of overnight automation.", "fabricator-general", "Personas/Fabricator-General.md"),
+        ("mechanicus", "Adeptus Mechanicus", '["mech", "mars"]', "Imperium-ENV", "Tech-priest worker. Builds, fixes, and maintains agent infrastructure. Takes assignments from Mars/Tasks/.", "mechanicus", "Personas/Mechanicus.md"),
+        ("administratum", "The Administratum", '["admin"]', "Imperium-ENV", "Background processor. Promotes completed session doc content into vault notes, then archives. The bridge between working memory and institutional memory.", "administratum", "Personas/Administratum.md"),
+    ]
+    for p in primarch_seed:
+        cursor.execute("""
+            INSERT OR IGNORE INTO primarchs (name, title, aliases, vault, role, instance_name_prefix, vault_note_path)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, p)
+
     # Seed devices
     cursor.execute("""
         INSERT OR IGNORE INTO devices (id, name, type, tailscale_ip, notification_method, tts_engine)
