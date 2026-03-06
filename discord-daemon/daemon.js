@@ -138,6 +138,8 @@ async function main() {
             opt.setName('body').setDescription('Note details').setRequired(false)),
       ];
 
+      // Clear any stale global commands, register guild-scoped only
+      await custodes.client.application.commands.set([]);
       const guild = await custodes.client.guilds.fetch(config.guild_id);
       await guild.commands.set(commands.map(c => c.toJSON()));
       logger.info('Custodes slash commands registered (guild-scoped): /task, /note');
