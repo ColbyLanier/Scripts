@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # research — fetch URL as clean Markdown
 # Usage: research <url> [--save path="Terra/Inbox/filename.md"]
+#        research --batch <file>     # file with one URL per line
+#        research url1 url2 url3     # multiple URLs, separated by ---
 #
 # Pipeline: defuddle (npx) → curl fallback → fail
 # Output: clean Markdown to stdout (or saved to Obsidian vault)
@@ -18,11 +20,13 @@ usage() {
     echo "  --save path=\"...\"  Save output to Obsidian vault (Token-ENV by default)" >&2
     echo "  --vault <name>     Obsidian vault name (default: Token-ENV)" >&2
     echo "  --json             Output raw Defuddle JSON (includes title, description, etc.)" >&2
+    echo "  --batch <file>     Read URLs from file (one per line), output with --- separators" >&2
     echo "  -h, --help         Show this help" >&2
     exit 1
 }
 
-URL=""
+URLS=()
+BATCH_FILE=""
 SAVE_PATH=""
 VAULT="Token-ENV"
 OUTPUT_JSON=false
@@ -56,24 +60,36 @@ while [[ $# -gt 0 ]]; do
             fi
             shift
             ;;
+        --batch)
+            BATCH_FILE="${2:-}"
+            shift 2
+            ;;
         http://*|https://*)
-            URL="$1"
+            URLS+=("$1")
             shift
             ;;
         *)
-            # Try treating it as a URL if no URL set yet
-            if [[ -z "$URL" ]]; then
-                URL="$1"
-            else
-                echo "Unknown argument: $1" >&2
-                usage
-            fi
+            # Try treating it as a URL
+            URLS+=("$1")
             shift
             ;;
     esac
 done
 
-if [[ -z "$URL" ]]; then
+# Load URLs from batch file if specified
+if [[ -n "$BATCH_FILE" ]]; then
+    if [[ ! -f "$BATCH_FILE" ]]; then
+        echo "Error: batch file not found: $BATCH_FILE" >&2
+        exit 1
+    fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip blank lines and comments
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        URLS+=("$line")
+    done < "$BATCH_FILE"
+fi
+
+if [[ ${#URLS[@]} -eq 0 ]]; then
     echo "Error: URL required" >&2
     usage
 fi
@@ -119,37 +135,61 @@ fetch_curl() {
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-CONTENT=""
-METHOD=""
+BATCH_MODE=$([[ ${#URLS[@]} -gt 1 ]] && echo true || echo false)
+FIRST=true
+EXIT_CODE=0
 
-# Try Defuddle first (npx --yes auto-installs on first use; skip version precheck)
-CONTENT=$(fetch_defuddle "$URL" 2>/dev/null || true)
-if [[ -n "$CONTENT" ]]; then
-    METHOD="defuddle"
-fi
+for URL in "${URLS[@]}"; do
+    CONTENT=""
+    METHOD=""
 
-# Fall back to curl
-if [[ -z "$CONTENT" ]]; then
-    echo "# [defuddle failed, using curl fallback for: $URL]" >&2
-    CONTENT=$(fetch_curl "$URL" 2>/dev/null || true)
-    METHOD="curl"
-fi
+    # Separator between results in batch mode
+    if $BATCH_MODE && ! $FIRST; then
+        echo ""
+        echo "---"
+        echo ""
+    fi
+    FIRST=false
 
-if [[ -z "$CONTENT" ]]; then
-    echo "Error: Failed to fetch content from: $URL" >&2
-    exit 1
-fi
+    if $BATCH_MODE; then
+        echo "<!-- source: $URL -->" >&2
+    fi
 
-# ── Output ───────────────────────────────────────────────────────────────────
+    # Try Defuddle first (npx --yes auto-installs on first use; skip version precheck)
+    CONTENT=$(fetch_defuddle "$URL" 2>/dev/null || true)
+    if [[ -n "$CONTENT" ]]; then
+        METHOD="defuddle"
+    fi
 
-if [[ -n "$SAVE_PATH" ]]; then
-    # Save to Obsidian vault
-    PREAMBLE="---\nsource: ${URL}\nfetched: $(date -u +%Y-%m-%dT%H:%M:%SZ)\nmethod: ${METHOD}\n---\n\n"
-    FULL_CONTENT="${PREAMBLE}${CONTENT}"
-    obsidian vault="$VAULT" create path="$SAVE_PATH" content="$FULL_CONTENT" 2>/dev/null \
-        || obsidian vault="$VAULT" append path="$SAVE_PATH" content="$FULL_CONTENT" 2>/dev/null \
-        || { echo "Error: Failed to save to Obsidian vault '$VAULT' at '$SAVE_PATH'" >&2; exit 1; }
-    echo "Saved to $VAULT: $SAVE_PATH (via $METHOD)" >&2
-else
-    echo "$CONTENT"
-fi
+    # Fall back to curl
+    if [[ -z "$CONTENT" ]]; then
+        echo "# [defuddle failed, using curl fallback for: $URL]" >&2
+        CONTENT=$(fetch_curl "$URL" 2>/dev/null || true)
+        METHOD="curl"
+    fi
+
+    if [[ -z "$CONTENT" ]]; then
+        echo "Error: Failed to fetch content from: $URL" >&2
+        EXIT_CODE=1
+        continue
+    fi
+
+    # ── Output ───────────────────────────────────────────────────────────────
+
+    if [[ -n "$SAVE_PATH" && ! $BATCH_MODE ]]; then
+        # Save to Obsidian vault (single URL only)
+        PREAMBLE="---\nsource: ${URL}\nfetched: $(date -u +%Y-%m-%dT%H:%M:%SZ)\nmethod: ${METHOD}\n---\n\n"
+        FULL_CONTENT="${PREAMBLE}${CONTENT}"
+        obsidian vault="$VAULT" create path="$SAVE_PATH" content="$FULL_CONTENT" 2>/dev/null \
+            || obsidian vault="$VAULT" append path="$SAVE_PATH" content="$FULL_CONTENT" 2>/dev/null \
+            || { echo "Error: Failed to save to Obsidian vault '$VAULT' at '$SAVE_PATH'" >&2; EXIT_CODE=1; continue; }
+        echo "Saved to $VAULT: $SAVE_PATH (via $METHOD)" >&2
+    elif [[ -n "$SAVE_PATH" ]] && $BATCH_MODE; then
+        echo "Warning: --save ignored in batch mode (use stdout redirect instead)" >&2
+        echo "$CONTENT"
+    else
+        echo "$CONTENT"
+    fi
+done
+
+exit $EXIT_CODE
