@@ -86,8 +86,12 @@ fetch_defuddle() {
     if $OUTPUT_JSON; then
         flags="--json"
     fi
-    # npx defuddle uses `parse` subcommand
-    npx --yes defuddle parse "$flags" "$url" 2>/dev/null
+    # Use global defuddle if available, fall back to npx
+    if command -v defuddle &>/dev/null; then
+        defuddle parse "$flags" "$url" 2>/dev/null
+    else
+        npx --yes defuddle parse "$flags" "$url" 2>/dev/null
+    fi
 }
 
 # ── curl fallback ────────────────────────────────────────────────────────────
