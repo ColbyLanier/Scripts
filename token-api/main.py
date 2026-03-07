@@ -9817,6 +9817,86 @@ async def mark_habit_today(habit_id: str, body: dict = None):
     return {"habit_id": habit_id, "date": today, "action": action, "notes": notes}
 
 
+@app.get("/api/state")
+async def get_state():
+    """
+    Pre-digested state snapshot for MiniMax heartbeat / Custodes agent.
+
+    Aggregates timer, work mode, location, instances, and habits into a
+    single call so agents don't need to hit 4 separate endpoints.
+    """
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    current_hour = now.hour
+
+    # Location: None means outside all known zones
+    location_zone = DESKTOP_STATE.get("location_zone")
+    location = location_zone if location_zone else "unknown"
+
+    # Timer
+    break_balance_ms = timer_engine.break_balance_ms
+    break_remaining_min = round(max(0, break_balance_ms) / 60000, 1)
+    work_earned_min = round(timer_engine.total_work_time_ms / 60000, 1)
+    timer_mode = timer_engine.current_mode.value
+
+    # Instances
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM claude_instances WHERE status = 'active'"
+        )
+        row = await cursor.fetchone()
+        active_count = row[0] if row else 0
+
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM claude_instances WHERE status = 'active' AND is_processing = 1"
+        )
+        row = await cursor.fetchone()
+        processing_count = row[0] if row else 0
+
+        # Habits
+        cursor = await db.execute("""
+            SELECT h.window_start_hour, h.window_end_hour,
+                   hc.completed_at
+            FROM habits h
+            LEFT JOIN habit_completions hc ON hc.habit_id = h.id AND hc.date = ?
+            WHERE h.active = 1
+        """, (today,))
+        habit_rows = await cursor.fetchall()
+
+    total_habits = len(habit_rows)
+    completed_habits = sum(1 for r in habit_rows if r[2] is not None)
+
+    # Pending-window: habit window includes current hour, not yet completed
+    pending_windows = set()
+    for start_hour, end_hour, completed_at in habit_rows:
+        if completed_at is None and start_hour is not None and end_hour is not None:
+            if start_hour <= current_hour < end_hour:
+                if start_hour < 12:
+                    pending_windows.add("morning")
+                elif start_hour < 17:
+                    pending_windows.add("afternoon")
+                else:
+                    pending_windows.add("evening")
+
+    return {
+        "location": location,
+        "work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
+        "break_time_remaining_min": break_remaining_min,
+        "break_in_backlog": break_balance_ms < 0,
+        "work_time_earned_min": work_earned_min,
+        "timer_mode": timer_mode,
+        "active_instances": active_count,
+        "is_processing": processing_count > 0,
+        "processing_count": processing_count,
+        "current_time": now.isoformat(),
+        "habits_today": {
+            "completed": completed_habits,
+            "total": total_habits,
+            "pending_window": sorted(pending_windows),
+        },
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT)
