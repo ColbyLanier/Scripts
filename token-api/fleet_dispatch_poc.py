@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fleet Dispatch POC — Phase 4: cost tracking + backpressure."""
+"""Fleet Dispatch POC — Phase 5: dispatch validation + retry stubs."""
 
 import subprocess, time, json, datetime, os, sys, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,6 +18,15 @@ FALLBACK_TASKS = [
 ]
 
 
+def _normalize_queue_item(item) -> str:
+    """Convert a queue item (str or dict) to a guardsman-compatible string."""
+    if isinstance(item, str):
+        return item
+    desc = item.get("description") or item.get("task") or str(item)
+    desc = desc.replace('"', "'")[:100]
+    return f'echo "{desc}" | output is non-empty and describes a real task or question'
+
+
 def pull_tasks():
     """Pull tasks from fleet state autonomy_queue; fall back to Mars/Tasks scan, then hardcoded probes."""
     tasks = []
@@ -25,8 +34,8 @@ def pull_tasks():
         with urllib.request.urlopen(f"{BASE}/api/fleet/state", timeout=5) as resp:
             state = json.loads(resp.read())
         q = state.get("autonomy_queue", {})
-        tasks = [(t, "completable") for t in q.get("completable", [])]
-        tasks += [(t, "researchable") for t in q.get("researchable", [])]
+        tasks = [(_normalize_queue_item(t), "completable") for t in q.get("completable", [])]
+        tasks += [(_normalize_queue_item(t), "researchable") for t in q.get("researchable", [])]
     except Exception as e:
         print(f"Warning: fleet state unavailable: {e}")
     if len(tasks) < 3:
@@ -101,7 +110,7 @@ def log_parallel_results(results: list, wall_clock: float, seq_estimate: float) 
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M MST")
     speedup = round(seq_estimate / wall_clock, 2) if wall_clock > 0 else 0
     lines = [
-        f"\n## {now} — Fleet Dispatch POC Phase 4 (Queue N={N})\n",
+        f"\n## {now} — Fleet Dispatch POC Phase 5 (Queue N={N})\n",
         f"**Wall-clock**: {wall_clock}s | **Sequential estimate**: {seq_estimate}s | **Speedup**: {speedup}x\n",
     ]
     for i, r in enumerate(results, 1):
@@ -119,18 +128,30 @@ def log_parallel_results(results: list, wall_clock: float, seq_estimate: float) 
 
 
 def write_results_to_state(results: list, wall_clock: float) -> None:
-    """Append dispatch summary to fleet state notes (read-then-patch to preserve existing)."""
+    """Write dispatch_results to fleet state + append summary note."""
     ok = sum(1 for r in results if r["returncode"] == 0)
     summary = (
-        f"Phase 4 dispatch: {len(results)} tasks, {ok} OK, "
+        f"Phase 5 dispatch: {len(results)} tasks, {ok} OK, "
         f"wall-clock {wall_clock:.1f}s"
     )
+    dispatch_results = {
+        "last_run": datetime.datetime.utcnow().isoformat() + "Z",
+        "count": len(results),
+        "ok": ok,
+        "wall_clock_sec": wall_clock,
+        "results": [
+            {"task": r["task"][:120], "category": r["category"],
+             "returncode": r["returncode"], "elapsed_sec": r["elapsed_sec"],
+             "output": (r["output"] or r["stderr"])[:200]}
+            for r in results[:10]
+        ],
+    }
     try:
         with urllib.request.urlopen(f"{BASE}/api/fleet/state", timeout=5) as resp:
             state = json.loads(resp.read())
         notes = state.get("notes", [])
         notes.append(summary)
-        payload = json.dumps({"notes": notes}).encode()
+        payload = json.dumps({"notes": notes, "dispatch_results": dispatch_results}).encode()
         req = urllib.request.Request(
             f"{BASE}/api/fleet/state", data=payload,
             headers={"Content-Type": "application/json"}, method="PATCH",
@@ -194,8 +215,24 @@ def check_backpressure() -> tuple:
     return True, f"ok (${spend:.2f} spent, {running} running, {depth} queued)"
 
 
+def write_retry_queue(failed: list) -> None:
+    """Write failed tasks to dispatch_retry_queue in fleet state (stub — not re-dispatched yet)."""
+    if not failed:
+        return
+    try:
+        payload = json.dumps({"dispatch_retry_queue": failed}).encode()
+        req = urllib.request.Request(
+            f"{BASE}/api/fleet/state", data=payload,
+            headers={"Content-Type": "application/json"}, method="PATCH",
+        )
+        urllib.request.urlopen(req, timeout=5)
+        print(f"[retry] {len(failed)} failed tasks queued for retry")
+    except Exception as e:
+        print(f"Warning: could not write retry queue: {e}")
+
+
 def run_parallel():
-    print(f"Fleet Dispatch POC — Phase 4 (queue N={N})")
+    print(f"Fleet Dispatch POC — Phase 5 (queue N={N})")
     should_dispatch, reason = check_backpressure()
     print(f"[backpressure] {reason}")
     if not should_dispatch:
@@ -219,6 +256,8 @@ def run_parallel():
         print(f"  [{i}] RC={r['returncode']} elapsed={r['elapsed_sec']}s — {out}")
     speedup = log_parallel_results(results, wall_clock, seq_estimate)
     write_results_to_state(results, wall_clock)
+    failed = [r for r in results if r["returncode"] != 0]
+    write_retry_queue(failed)
     new_total = update_daily_spend(0.0)  # guardsman is free
     print(f"[cost] Daily spend: ${new_total:.2f} / ${DAILY_BUDGET_USD:.2f}")
     print(f"\nWall-clock: {wall_clock}s | Sequential estimate: {seq_estimate}s | Speedup: {speedup}x")
