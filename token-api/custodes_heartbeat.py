@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Custodes Phase 3 — MiniMax heartbeat with session context.
+"""Custodes Phase 4 — MiniMax heartbeat with session context + break monitoring.
 Polls Token-API state, evaluates via guardsman whether the state is interesting.
 INTERESTING: reads active session doc, generates contextual observation, posts to #briefing.
 ROUTINE: appends quietly to daily note.
+BREAK NUDGE: independently fires when break balance is deeply negative or manual BREAK too long.
 """
 import datetime
 import json
@@ -146,15 +147,31 @@ def build_comment(metrics: dict) -> str:
     return f"{active} instance(s) active in {mode} mode."
 
 
-def send_discord(message: str):
+def send_discord(message: str, channel: str = BRIEFING_CHANNEL):
     result = subprocess.run(
-        ["discord", "send", BRIEFING_CHANNEL, "--bot", "custodes", message],
+        ["discord", "send", channel, "--bot", "custodes", message],
         capture_output=True, text=True, timeout=15
     )
     if result.returncode == 0:
-        print("  Posted to #briefing via custodes bot")
+        print(f"  Posted to #{channel} via custodes bot")
     else:
         print(f"  Discord send failed: {result.stderr.strip()}")
+
+
+def check_break_nudge(metrics: dict) -> str | None:
+    """Return a nudge message if break situation warrants it, else None."""
+    mode = metrics.get("effective_mode", "WORKING")
+    break_min = metrics.get("break_minutes", 0)
+
+    # Deep debt: more than 60 min in the red — always nudge regardless of mode
+    if break_min < -60:
+        return f"Break balance is {break_min:.0f} min — significant debt. Consider wrapping up soon."
+
+    # Manual BREAK with meaningful debt — prompt to resume or keep resting
+    if mode == "BREAK" and break_min < -30:
+        return f"In BREAK mode with {break_min:.0f} min balance. Still recovering or time to resume?"
+
+    return None
 
 
 def log_to_daily_note(summary: str):
@@ -189,11 +206,17 @@ def main():
     )
     print(f"State: {summary}")
 
-    # 2. Evaluate
+    # 2. Break nudge — unconditional, fires independently of INTERESTING evaluation
+    nudge = check_break_nudge(metrics)
+    if nudge:
+        print(f"  Break nudge: {nudge}")
+        send_discord(f"Custodes: {nudge}", channel="fleet")
+
+    # 3. Evaluate
     is_interesting = evaluate_with_guardsman(metrics)
     print(f"Decision: {'INTERESTING' if is_interesting else 'ROUTINE'}")
 
-    # 3. Act
+    # 4. Act
     if is_interesting:
         session_doc = get_active_session_doc()
         session_ctx = get_session_context(session_doc)
