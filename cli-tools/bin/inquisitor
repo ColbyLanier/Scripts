@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Inquisitor Launcher — Spawn a task-scoped Inquisitor Claude session
+# TAGS: inquisitor, persona, execution
+# AUDIENCE: user
+#
+# Usage: inquisitor "task description"
+# Born with a command. Dies with a report.
+
+set -euo pipefail
+
+[[ "${1:-}" == "--help" || "${1:-}" == "-h" || $# -eq 0 ]] && {
+    echo "Usage: inquisitor \"task description\""
+    echo ""
+    echo "Spawns a task-scoped Inquisitor. Born with a command, dies with a report."
+    echo ""
+    echo "Examples:"
+    echo "  inquisitor \"audit the cron fleet for stuck jobs\""
+    echo "  inquisitor \"find and fix the TUI subagent display bug\""
+    exit 0
+}
+
+TASK="$*"
+PERSONA_FILE="${HOME}/Imperium-ENV/Personas/Inquisition.md"
+
+# Load persona body (strip YAML frontmatter)
+PERSONA=""
+if [[ -f "$PERSONA_FILE" ]]; then
+    PERSONA=$(python3 -c "
+content = open('$PERSONA_FILE').read()
+parts = content.split('---', 2)
+print(parts[2].strip() if len(parts) >= 3 else content)
+" 2>/dev/null) || true
+fi
+
+SYSTEM_PROMPT="${PERSONA:-You are an Inquisitor — the Emperor's execution arm. Born with a command. Die with a report. Validate all sub-agent output aggressively. No untested code. No frankenmerge. Report with metrics: agents dispatched, discarded, integrated.}"
+
+exec claude --dangerously-skip-permissions --append-system-prompt "$SYSTEM_PROMPT" -p "$TASK"
