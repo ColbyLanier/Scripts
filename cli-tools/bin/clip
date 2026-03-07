@@ -107,7 +107,11 @@ make_slug() {
 }
 
 if [[ -z "$SAVE_PATH" ]]; then
-    if [[ -n "$TITLE" ]]; then
+    if [[ "$CLIP_TYPE" == "github" ]]; then
+        # Use owner/repo from URL (cleaner than title which includes tagline)
+        REPO_SLUG_FOR_PATH=$(echo "$URL" | sed 's|https\?://github\.com/||; s|/tree/.*||; s|/$||')
+        SLUG=$(make_slug "$(echo "$REPO_SLUG_FOR_PATH" | tr '/' '-')")
+    elif [[ -n "$TITLE" ]]; then
         SLUG=$(make_slug "$TITLE")
     else
         # Derive from URL

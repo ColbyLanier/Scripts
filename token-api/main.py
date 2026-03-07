@@ -8466,16 +8466,23 @@ async def _discord_clip(url: str, message: DiscordMessageRequest):
             logger.warning(f"Discord clip failed (rc={proc.returncode}): {stderr_text[:300]}")
             reply_content = f"Clip failed for <{url}>: `{stderr_text.strip()[-200:]}`"
         else:
-            # Parse "Saved to Imperium-ENV: Terra/Inbox/slug.md" from stderr
+            # Parse "Saved to Imperium-ENV: Terra/Inbox/slug.md" and "Title: ..." from stderr
             saved_path = None
+            note_title = None
             for line in stderr_text.splitlines():
                 if line.startswith("Saved to "):
                     parts = line.split(": ", 1)
                     if len(parts) == 2:
                         saved_path = parts[1].strip()
-                    break
-            reply_content = f"Clipped: `{saved_path}`" if saved_path else f"Clipped: `{url}`"
-            logger.info(f"Discord clip saved: {saved_path}")
+                elif line.startswith("Title: "):
+                    note_title = line[7:].strip()
+            if note_title and saved_path:
+                reply_content = f"Clipped **{note_title}** → `{saved_path}`"
+            elif saved_path:
+                reply_content = f"Clipped: `{saved_path}`"
+            else:
+                reply_content = f"Clipped: `{url}`"
+            logger.info(f"Discord clip saved: {saved_path} ({note_title})")
 
     except asyncio.TimeoutError:
         logger.warning(f"Discord clip timed out: {url}")
