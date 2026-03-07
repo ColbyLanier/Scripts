@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Custodes Phase 4 — MiniMax heartbeat with session context + break monitoring.
+"""Custodes Phase 6 — Per-instance session doc topics in heartbeat.
 Polls Token-API state, evaluates via guardsman whether the state is interesting.
-INTERESTING: reads active session doc, generates contextual observation, posts to #briefing.
+INTERESTING: reads session docs for up to 2 processing instances, enriches observation
+  with "Active work: <topic> (<project>), ..." suffix. Posts to #briefing.
 ROUTINE: appends quietly to daily note.
 BREAK NUDGE: independently fires when break balance is deeply negative or manual BREAK too long.
 """
@@ -100,6 +101,31 @@ def get_session_context(file_path: str | None) -> str | None:
         return body[-500:] if len(body) > 500 else body or None
     except OSError:
         return None
+
+
+def extract_session_topic(instance: dict) -> str:
+    """Return short topic string for an instance: session doc title, or tab_name fallback.
+
+    Queries session_documents table directly — no file I/O needed since title is stored in DB.
+    Falls back gracefully to tab_name if no doc linked or query fails.
+    """
+    tab_name = instance.get("tab_name") or instance.get("id", "unknown")[:8]
+    doc_id = instance.get("session_doc_id")
+    if not doc_id:
+        return tab_name
+    try:
+        result = subprocess.run(
+            ["agents-db", "--json", "query",
+             f"SELECT title FROM session_documents WHERE id={int(doc_id)}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        rows = json.loads(result.stdout)
+        title = rows[0].get("title") if rows else None
+        if title:
+            return title
+    except Exception:
+        pass
+    return tab_name
 
 
 def generate_observation(summary: str, session_ctx: str | None) -> str:
@@ -258,7 +284,27 @@ def main():
             print("  No linked session doc found")
         observation = generate_observation(summary, session_ctx)
         print(f"  Observation: {observation}")
-        send_discord(f"Custodes observes: {observation}")
+
+        # Build "Active work: <topic> (<project>), ..." from processing instances (up to 2)
+        processing = [
+            i for i in instances
+            if i.get("is_processing") == 1 and not i.get("is_subagent")
+        ][:2]
+        active_work_suffix = ""
+        if processing:
+            parts = []
+            for inst in processing:
+                topic = extract_session_topic(inst)
+                working_dir = inst.get("working_dir", "")
+                project = os.path.basename(working_dir.rstrip("/")) if working_dir else ""
+                if project and project != topic:
+                    parts.append(f"{topic} ({project})")
+                else:
+                    parts.append(topic)
+            active_work_suffix = f" Active work: {', '.join(parts)}."
+            print(f"  Active work: {active_work_suffix.strip()}")
+
+        send_discord(f"Custodes observes: {observation}{active_work_suffix}")
     else:
         log_to_daily_note(summary)
 
