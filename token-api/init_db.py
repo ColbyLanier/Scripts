@@ -231,6 +231,8 @@ def init_database():
         ("fabricator-general", "The Fabricator-General", '["fg", "fabricator"]', "Imperium-ENV", "Fleet orchestrator for the Mechanicus swarm. Reads state, detects stuck jobs, dispatches workers. The operational backbone of overnight automation.", "fabricator-general", "Personas/Fabricator-General.md"),
         ("mechanicus", "Adeptus Mechanicus", '["mech", "mars"]', "Imperium-ENV", "Tech-priest worker. Builds, fixes, and maintains agent infrastructure. Takes assignments from Mars/Tasks/.", "mechanicus", "Personas/Mechanicus.md"),
         ("administratum", "The Administratum", '["admin"]', "Imperium-ENV", "Background processor. Promotes completed session doc content into vault notes, then archives. The bridge between working memory and institutional memory.", "administratum", "Personas/Administratum.md"),
+        ("guilliman", "Guilliman, The Codifier", '["g", "guilliman", "ultramar"]', "Imperium-ENV", "Documentation Primarch. Takes raw knowledge and produces clean, cross-linked vault notes. Owns Terra/Ultramar/. Decides what is worth codifying and how to structure it.", "guilliman", "Personas/Guilliman.md"),
+        ("sanguinius", "Sanguinius, The Angel", '["sang", "sanguinius", "angel"]', "Imperium-ENV", "Prose stylist. Makes in-place edits to existing notes in Terra/Ultramar/ — elevates readability without changing meaning. Post-Guilliman polish pass.", "sanguinius", "Personas/Sanguinius.md"),
     ]
     for p in primarch_seed:
         cursor.execute("""
