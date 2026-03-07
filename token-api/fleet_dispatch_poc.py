@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Fleet Dispatch POC — Phase 2: parallel N=5 servitor dispatch via ThreadPoolExecutor."""
+"""Fleet Dispatch POC — Phase 3: autonomy queue integration, N=10 concurrent servitor dispatch."""
 
 import subprocess, time, json, datetime, os, sys, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BASE = "http://localhost:7777"
 LOG_PATH = os.path.expanduser("~/Imperium-ENV/Mars/Logs/fleet_dispatch_log.md")
-N = 5
+N = 10
 
 FALLBACK_TASKS = [
     ("python3 --version | Python version is 3.x", "fallback"),
@@ -18,7 +18,7 @@ FALLBACK_TASKS = [
 
 
 def pull_tasks():
-    """Pull up to N tasks from autonomy queue, pad with fallbacks."""
+    """Pull tasks from fleet state autonomy_queue; fall back to Mars/Tasks scan, then hardcoded probes."""
     tasks = []
     try:
         with urllib.request.urlopen(f"{BASE}/api/fleet/state", timeout=5) as resp:
@@ -28,11 +28,49 @@ def pull_tasks():
         tasks += [(t, "researchable") for t in q.get("researchable", [])]
     except Exception as e:
         print(f"Warning: fleet state unavailable: {e}")
+    if len(tasks) < 3:
+        mars_tasks = _scan_mars_tasks(N - len(tasks))
+        print(f"Queue sparse ({len(tasks)} items) — fabricated {len(mars_tasks)} from Mars/Tasks")
+        tasks += mars_tasks
     for fb in FALLBACK_TASKS:
         if len(tasks) >= N:
             break
         tasks.append(fb)
     return tasks[:N]
+
+
+def _scan_mars_tasks(limit: int) -> list:
+    """Scan Mars/Tasks for autonomy: researchable files, fabricate guardsman tasks."""
+    import glob as _glob
+    tasks_dir = os.path.expanduser("~/Imperium-ENV/Mars/Tasks")
+    assertions = [
+        "task file has a title and autonomy frontmatter",
+        "this task file exists and has actionable content",
+        "file describes a concrete deliverable or subtask list",
+        "task has clear scope with open tasks or subtasks listed",
+        "task file is a valid Markdown note with frontmatter",
+        "file references at least one tool, API, or system component",
+        "task file has at least 5 lines of content",
+        "task is non-empty and plausibly scoped for an agent",
+        "file contains at least one section header or bullet list",
+        "task describes a software or infrastructure concern",
+    ]
+    results = []
+    phrase_idx = 0
+    for path in sorted(_glob.glob(os.path.join(tasks_dir, "*.md"))):
+        if len(results) >= limit:
+            break
+        try:
+            with open(path) as f:
+                content = f.read(500)
+        except OSError:
+            continue
+        if "autonomy: researchable" not in content:
+            continue
+        assertion = assertions[phrase_idx % len(assertions)]
+        phrase_idx += 1
+        results.append((f'cat "{path}" | {assertion}', "researchable"))
+    return results
 
 
 def dispatch_one(task: str, category: str) -> dict:
@@ -62,7 +100,7 @@ def log_parallel_results(results: list, wall_clock: float, seq_estimate: float) 
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M MST")
     speedup = round(seq_estimate / wall_clock, 2) if wall_clock > 0 else 0
     lines = [
-        f"\n## {now} — Fleet Dispatch POC Phase 2 (Parallel N={N})\n",
+        f"\n## {now} — Fleet Dispatch POC Phase 3 (Queue N={N})\n",
         f"**Wall-clock**: {wall_clock}s | **Sequential estimate**: {seq_estimate}s | **Speedup**: {speedup}x\n",
     ]
     for i, r in enumerate(results, 1):
@@ -79,8 +117,31 @@ def log_parallel_results(results: list, wall_clock: float, seq_estimate: float) 
     return speedup
 
 
+def write_results_to_state(results: list, wall_clock: float) -> None:
+    """Append dispatch summary to fleet state notes (read-then-patch to preserve existing)."""
+    ok = sum(1 for r in results if r["returncode"] == 0)
+    summary = (
+        f"Phase 3 dispatch: {len(results)} tasks, {ok} OK, "
+        f"wall-clock {wall_clock:.1f}s"
+    )
+    try:
+        with urllib.request.urlopen(f"{BASE}/api/fleet/state", timeout=5) as resp:
+            state = json.loads(resp.read())
+        notes = state.get("notes", [])
+        notes.append(summary)
+        payload = json.dumps({"notes": notes}).encode()
+        req = urllib.request.Request(
+            f"{BASE}/api/fleet/state", data=payload,
+            headers={"Content-Type": "application/json"}, method="PATCH",
+        )
+        urllib.request.urlopen(req)
+        print(f"Written to fleet state: {summary}")
+    except Exception as e:
+        print(f"Warning: could not write to fleet state: {e}")
+
+
 def run_parallel():
-    print(f"Fleet Dispatch POC — Phase 2 (parallel N={N})")
+    print(f"Fleet Dispatch POC — Phase 3 (queue N={N})")
     tasks = pull_tasks()
     print(f"Dispatching {len(tasks)} tasks concurrently...")
     for i, (t, cat) in enumerate(tasks, 1):
@@ -92,6 +153,7 @@ def run_parallel():
         out = (r["output"] or r["stderr"])[:100]
         print(f"  [{i}] RC={r['returncode']} elapsed={r['elapsed_sec']}s — {out}")
     speedup = log_parallel_results(results, wall_clock, seq_estimate)
+    write_results_to_state(results, wall_clock)
     print(f"\nWall-clock: {wall_clock}s | Sequential estimate: {seq_estimate}s | Speedup: {speedup}x")
     print(f"SUMMARY: wall={wall_clock}s seq={seq_estimate}s speedup={speedup}x")
 
@@ -118,7 +180,7 @@ def run_single():
 
 
 if __name__ == "__main__":
-    if "--parallel" in sys.argv:
+    if "--parallel" in sys.argv or "--queue" in sys.argv:
         run_parallel()
     else:
         run_single()
