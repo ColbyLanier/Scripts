@@ -44,6 +44,7 @@ def extract_metrics(timer: dict, instances: list) -> dict:
         "break_minutes": break_minutes,
         "active_count": active_count,
         "processing_count": processing_count,
+        "manual_mode": (timer.get("manual_mode") or "").upper(),
     }
 
 
@@ -331,6 +332,87 @@ def check_break_nudge(metrics: dict) -> str | None:
     return None
 
 
+BREAK_START_FLAG = "/tmp/custodes_break_start_{date}.txt"
+BREAK_OBS_FLAG = "/tmp/custodes_break_obs_{date}.txt"
+
+
+def check_break_observation(metrics: dict) -> str | None:
+    """Post to daily thread when Emperor is in manual BREAK for >15 minutes.
+
+    Uses a two-flag pattern:
+    - break_start flag: records when manual BREAK was first detected
+    - break_obs flag: debounce — prevents re-fire within 45 min of last post
+
+    Clears break_start flag when break ends (auto-reset on next entry).
+    """
+    import time as _time
+
+    today = datetime.date.today().isoformat().replace("-", "")
+    mode = metrics.get("effective_mode", "")
+    manual_mode = metrics.get("manual_mode", "")
+
+    start_flag = Path(BREAK_START_FLAG.format(date=today))
+    obs_flag = Path(BREAK_OBS_FLAG.format(date=today))
+
+    in_manual_break = mode == "BREAK" and manual_mode == "BREAK"
+
+    if not in_manual_break:
+        # Break ended — clear start flag so next break detects fresh
+        start_flag.unlink(missing_ok=True)
+        return None
+
+    now = _time.time()
+
+    # Record break start if this is the first time we see manual BREAK
+    if not start_flag.exists():
+        try:
+            start_flag.write_text(str(now))
+        except Exception:
+            pass
+        return None  # Just entered break — wait for duration threshold
+
+    # Check elapsed time since break started
+    try:
+        break_started_at = float(start_flag.read_text().strip())
+    except Exception:
+        # Corrupt flag — reset
+        try:
+            start_flag.write_text(str(now))
+        except Exception:
+            pass
+        return None
+
+    elapsed_min = (now - break_started_at) / 60
+    if elapsed_min < 15:
+        return None
+
+    # 45-minute debounce — don't re-fire within same break window
+    if obs_flag.exists():
+        try:
+            if now - obs_flag.stat().st_mtime < 2700:  # 45 min
+                return None
+        except Exception:
+            pass
+
+    # Build message with session context
+    file_path, title = get_recent_session_doc()
+    ctx = get_session_context(file_path) if file_path else None
+
+    if title:
+        excerpt = (ctx[:120].replace("\n", " ").strip() + "…") if ctx else ""
+        msg = f"You're on break. Last active: *{title}*" + (f" — {excerpt}" if excerpt else ".")
+    else:
+        msg = f"You're on break (manual BREAK, {int(elapsed_min)}m)."
+
+    # Write debounce flag
+    try:
+        obs_flag.write_text(datetime.datetime.now().isoformat())
+    except Exception:
+        pass
+
+    return msg
+
+
 def check_instance_zero(metrics: dict) -> tuple[str | None, str | None]:
     """Return (message, channel) if instance count crossed zero boundary, else (None, None)."""
     FLAG = Path("/tmp/custodes-zero-sent")
@@ -395,6 +477,12 @@ def main():
     if habit_reminder:
         print(f"  Habit reminder: {habit_reminder}")
         send_discord_thread(f"Custodes: {habit_reminder}")
+
+    # 3b. Break mode observation — fires to daily thread when in manual BREAK >15 min
+    break_obs = check_break_observation(metrics)
+    if break_obs:
+        print(f"  Break observation: {break_obs}")
+        send_discord_thread(f"Custodes: {break_obs}")
 
     # 4. Instance-zero check — deduped via flag file, routes to #fleet
     zero_msg, zero_ch = check_instance_zero(metrics)
