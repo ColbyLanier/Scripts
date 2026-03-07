@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fleet Dispatch POC — Phase 3: autonomy queue integration, N=10 concurrent servitor dispatch."""
+"""Fleet Dispatch POC — Phase 4: cost tracking + backpressure."""
 
 import subprocess, time, json, datetime, os, sys, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 BASE = "http://localhost:7777"
 LOG_PATH = os.path.expanduser("~/Imperium-ENV/Mars/Logs/fleet_dispatch_log.md")
 N = 10
+DAILY_BUDGET_USD = 2.00
 
 FALLBACK_TASKS = [
     ("python3 --version | Python version is 3.x", "fallback"),
@@ -100,7 +101,7 @@ def log_parallel_results(results: list, wall_clock: float, seq_estimate: float) 
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M MST")
     speedup = round(seq_estimate / wall_clock, 2) if wall_clock > 0 else 0
     lines = [
-        f"\n## {now} — Fleet Dispatch POC Phase 3 (Queue N={N})\n",
+        f"\n## {now} — Fleet Dispatch POC Phase 4 (Queue N={N})\n",
         f"**Wall-clock**: {wall_clock}s | **Sequential estimate**: {seq_estimate}s | **Speedup**: {speedup}x\n",
     ]
     for i, r in enumerate(results, 1):
@@ -121,7 +122,7 @@ def write_results_to_state(results: list, wall_clock: float) -> None:
     """Append dispatch summary to fleet state notes (read-then-patch to preserve existing)."""
     ok = sum(1 for r in results if r["returncode"] == 0)
     summary = (
-        f"Phase 3 dispatch: {len(results)} tasks, {ok} OK, "
+        f"Phase 4 dispatch: {len(results)} tasks, {ok} OK, "
         f"wall-clock {wall_clock:.1f}s"
     )
     try:
@@ -140,13 +141,77 @@ def write_results_to_state(results: list, wall_clock: float) -> None:
         print(f"Warning: could not write to fleet state: {e}")
 
 
+def get_daily_spend() -> float:
+    """Read today's accumulated dispatch spend from fleet state."""
+    try:
+        with urllib.request.urlopen(f"{BASE}/api/fleet/state", timeout=5) as resp:
+            state = json.loads(resp.read())
+        return float(state.get("daily_dispatch_spend_usd", 0.0))
+    except Exception:
+        return 0.0
+
+def update_daily_spend(delta_usd: float) -> float:
+    """Add delta to today's spend in fleet state. Returns new total."""
+    current = get_daily_spend()
+    new_total = current + delta_usd
+    try:
+        payload = json.dumps({"daily_dispatch_spend_usd": new_total}).encode()
+        req = urllib.request.Request(
+            f"{BASE}/api/fleet/state", data=payload,
+            headers={"Content-Type": "application/json"}, method="PATCH",
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        print(f"Warning: could not update spend: {e}")
+    return new_total
+
+
+def check_backpressure() -> tuple:
+    """Returns (should_dispatch, reason) — checks budget, running jobs, queue depth."""
+    spend = get_daily_spend()
+    if spend >= DAILY_BUDGET_USD:
+        return False, f"daily budget exhausted (${spend:.2f} >= ${DAILY_BUDGET_USD:.2f})"
+    running = 0
+    try:
+        with urllib.request.urlopen(f"{BASE}/api/cron/jobs", timeout=5) as resp:
+            jobs = json.loads(resp.read())
+            if isinstance(jobs, dict):
+                jobs = jobs.get("jobs", [])
+            running = sum(1 for j in jobs if j.get("is_running"))
+        if running >= 3:
+            return False, f"fleet saturated ({running} jobs running)"
+    except Exception as e:
+        print(f"Warning: could not check running jobs: {e}")
+    depth = -1
+    try:
+        with urllib.request.urlopen(f"{BASE}/api/fleet/state", timeout=5) as resp:
+            q = json.loads(resp.read()).get("autonomy_queue", {})
+        depth = len(q.get("completable", [])) + len(q.get("researchable", []))
+        if depth == 0:
+            return False, "autonomy queue empty"
+    except Exception as e:
+        print(f"Warning: could not check queue depth: {e}")
+    return True, f"ok (${spend:.2f} spent, {running} running, {depth} queued)"
+
+
 def run_parallel():
-    print(f"Fleet Dispatch POC — Phase 3 (queue N={N})")
+    print(f"Fleet Dispatch POC — Phase 4 (queue N={N})")
+    should_dispatch, reason = check_backpressure()
+    print(f"[backpressure] {reason}")
+    if not should_dispatch:
+        print("[dispatch] Skipping — backpressure active.")
+        sys.exit(0)
+
     tasks = pull_tasks()
-    print(f"Dispatching {len(tasks)} tasks concurrently...")
-    for i, (t, cat) in enumerate(tasks, 1):
+    if not tasks:
+        print("[dispatch] Queue empty, nothing to dispatch.")
+        sys.exit(0)
+
+    n = min(len(tasks), N)
+    print(f"[dispatch] Dispatching {n} tasks...")
+    for i, (t, cat) in enumerate(tasks[:n], 1):
         print(f"  [{i}] ({cat}) {t[:80]}")
-    results, wall_clock = dispatch_parallel(tasks)
+    results, wall_clock = dispatch_parallel(tasks[:n])
     seq_estimate = round(sum(r["elapsed_sec"] for r in results), 2)
     print("\nResults:")
     for i, r in enumerate(results, 1):
@@ -154,6 +219,8 @@ def run_parallel():
         print(f"  [{i}] RC={r['returncode']} elapsed={r['elapsed_sec']}s — {out}")
     speedup = log_parallel_results(results, wall_clock, seq_estimate)
     write_results_to_state(results, wall_clock)
+    new_total = update_daily_spend(0.0)  # guardsman is free
+    print(f"[cost] Daily spend: ${new_total:.2f} / ${DAILY_BUDGET_USD:.2f}")
     print(f"\nWall-clock: {wall_clock}s | Sequential estimate: {seq_estimate}s | Speedup: {speedup}x")
     print(f"SUMMARY: wall={wall_clock}s seq={seq_estimate}s speedup={speedup}x")
 
