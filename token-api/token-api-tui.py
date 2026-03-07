@@ -1882,24 +1882,56 @@ def get_cached_heartbeat_status() -> dict:
     return _heartbeat_cache
 
 
+def _get_instance_counts() -> tuple[int, int]:
+    """Return (manual_count, cron_count) of active instances."""
+    try:
+        req = urllib.request.Request(f"{API_URL}/api/instances")
+        with urllib.request.urlopen(req, timeout=3) as response:
+            data = json.loads(response.read().decode())
+            instances = data if isinstance(data, list) else data.get("instances", [])
+            alive = [i for i in instances if i.get("status") in ("active", "processing", "idle") and not i.get("is_subagent")]
+            cron = sum(1 for i in alive if i.get("origin_type") == "cron")
+            return len(alive) - cron, cron
+    except Exception:
+        return -1, -1
+
+
+# Cache instance counts (refresh every 10 seconds)
+_instance_counts_cache: tuple[int, int] = (0, 0)
+_instance_counts_cache_time: float = 0
+
+
+def get_cached_instance_counts() -> tuple[int, int]:
+    global _instance_counts_cache, _instance_counts_cache_time
+    now = time.time()
+    if now - _instance_counts_cache_time > 10:
+        _instance_counts_cache = _get_instance_counts()
+        _instance_counts_cache_time = now
+    return _instance_counts_cache
+
+
 def create_monitor_panel(max_lines: int = 8) -> Panel:
-    """Create the unified monitor panel — compact header + cron job list."""
+    """Create the unified monitor panel — Emperor/Mechanicus partition + cron job list."""
     status = get_cached_heartbeat_status()
     jobs = get_cached_cron_jobs()
     content = Text()
 
-    # Header line: GW status + watchdog + active cron count
-    oc = status.get("openclaw_status")
-    if oc:
-        oc_status = oc.get("status", "?")
-        silent = oc.get("silent", False)
-        content.append("GW:", style="white")
-        if oc_status == "ok-token":
-            content.append("ok", style="green" if not silent else "dim")
-        else:
-            content.append(oc_status, style="yellow")
+    # Header line: Emperor instances | Mechanicus workers | watchdog
+    manual, cron = get_cached_instance_counts()
+    content.append("Emperor:", style="white")
+    if manual > 0:
+        content.append(f"{manual}", style="green bold")
+    elif manual == 0:
+        content.append("0", style="dim")
     else:
-        content.append("GW:", style="white")
+        content.append("?", style="dim")
+
+    content.append(" | Mechanicus:", style="white")
+    if cron > 0:
+        content.append(f"{cron}", style="cyan bold")
+    elif cron == 0:
+        content.append("0", style="dim")
+    else:
         content.append("?", style="dim")
 
     wdog = status["watchdog_status"]
