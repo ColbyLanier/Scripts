@@ -32,6 +32,7 @@ print(parts[2].strip() if len(parts) >= 3 else content)
 " 2>/dev/null) || true
 fi
 
-SYSTEM_PROMPT="${PERSONA:-You are an Inquisitor — the Emperor's execution arm. Born with a command. Die with a report. Validate all sub-agent output aggressively. No untested code. No frankenmerge. Report with metrics: agents dispatched, discarded, integrated.}"
+FALLBACK_PERSONA="You are an Inquisitor — the Emperor's execution arm. Born with a command. Die with a report. Validate all sub-agent output aggressively. No untested code. No frankenmerge. Report with metrics: agents dispatched, discarded, integrated."
+SYSTEM_PROMPT="${PERSONA:-$FALLBACK_PERSONA}"
 
 exec claude --dangerously-skip-permissions --append-system-prompt "$SYSTEM_PROMPT" -p "$TASK"
