@@ -442,11 +442,18 @@ def append_to_session_doc(file_path, blurb):
 # ---------------------------------------------------------------------------
 
 def main():
-    if len(sys.argv) < 2:
+    if len(sys.argv) >= 2:
+        session_id = sys.argv[1].strip()
+    else:
+        try:
+            data = json.load(sys.stdin)
+            session_id = data.get("session_id", "").strip()
+        except Exception:
+            session_id = ""
+
+    if not session_id:
         print(f"Usage: {sys.argv[0]} <session-id>", file=sys.stderr)
         sys.exit(1)
-
-    session_id = sys.argv[1].strip()
 
     # Find JSONL file
     pattern = str(Path.home() / ".claude" / "projects" / "*" / f"{session_id}.jsonl")
