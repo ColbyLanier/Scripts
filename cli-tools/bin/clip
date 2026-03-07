@@ -109,7 +109,7 @@ make_slug() {
 if [[ -z "$SAVE_PATH" ]]; then
     if [[ "$CLIP_TYPE" == "github" ]]; then
         # Use owner/repo from URL (cleaner than title which includes tagline)
-        REPO_SLUG_FOR_PATH=$(echo "$URL" | sed 's|https\?://github\.com/||; s|/tree/.*||; s|/$||')
+        REPO_SLUG_FOR_PATH=$(echo "$URL" | sed -E 's|https?://github\.com/||; s|/tree/.*||; s|/$||')
         SLUG=$(make_slug "$(echo "$REPO_SLUG_FOR_PATH" | tr '/' '-')")
     elif [[ -n "$TITLE" ]]; then
         SLUG=$(make_slug "$TITLE")
@@ -126,7 +126,7 @@ NOTE_TITLE="${TITLE:-$(basename "$SAVE_PATH" .md)}"
 
 if [[ "$CLIP_TYPE" == "github" ]]; then
     # Extract repo slug from URL (owner/repo)
-    REPO_SLUG=$(echo "$URL" | sed 's|https\?://github\.com/||; s|/tree/.*||; s|/$||')
+    REPO_SLUG=$(echo "$URL" | sed -E 's|https?://github\.com/||; s|/tree/.*||; s|/$||')
     LANGUAGE=$(extract_field "language")
 
     NOTE=$(cat <<EOF
