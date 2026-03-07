@@ -236,6 +236,60 @@ def send_discord_thread(message: str):
     send_discord(message)
 
 
+def check_morning_habits() -> str | None:
+    """After 10am Phoenix time: remind if morning habits appear unchecked in daily note.
+    Returns a reminder message, or None if not applicable / already reminded today.
+    Phoenix is MST = UTC-7 (no DST).
+    """
+    phoenix_now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(hours=7)
+
+    # Only check between 10am and 2pm Phoenix time
+    if not (10 <= phoenix_now.hour < 14):
+        return None
+
+    # Only remind once per day
+    today = datetime.date.today().isoformat()
+    flag_file = Path(f"/tmp/custodes_habit_reminded_{today.replace('-', '')}.txt")
+    if flag_file.exists():
+        return None
+
+    # Read today's daily note
+    note_path = Path(os.path.expanduser(f"~/Token-ENV/Journal/Daily/{today}.md"))
+    if not note_path.exists():
+        return None
+
+    content = note_path.read_text()
+
+    # Only check if YAML frontmatter exists — conservative, skip if no structure
+    if not content.startswith("---"):
+        return None
+
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        return None
+    frontmatter = parts[1]
+
+    # Morning habit fields: teeth_brush_morning and breakfast are the core AM indicators
+    has_unchecked = (
+        "teeth_brush_morning: false" in frontmatter
+        or "breakfast: false" in frontmatter
+    )
+    has_checked = (
+        "teeth_brush_morning: true" in frontmatter
+        or "breakfast: true" in frontmatter
+        or "movement: true" in frontmatter
+    )
+
+    if has_unchecked and not has_checked:
+        flag_file.touch()
+        return (
+            f"It's {phoenix_now.strftime('%H:%M')} — morning habits in today's note "
+            f"still unchecked. Worth a quick review before the day gets away."
+        )
+
+    return None
+
+
 def check_break_nudge(metrics: dict) -> str | None:
     """Return a nudge message if break situation warrants it, else None."""
     mode = metrics.get("effective_mode", "WORKING")
@@ -311,7 +365,13 @@ def main():
         print(f"  Break nudge: {nudge}")
         send_discord(f"Custodes: {nudge}", channel="fleet")
 
-    # 3. Instance-zero check — deduped via flag file, routes to #fleet
+    # 3. Morning habit check — fires to daily thread if habits look unchecked (10am–2pm only)
+    habit_reminder = check_morning_habits()
+    if habit_reminder:
+        print(f"  Habit reminder: {habit_reminder}")
+        send_discord_thread(f"Custodes: {habit_reminder}")
+
+    # 4. Instance-zero check — deduped via flag file, routes to #fleet
     zero_msg, zero_ch = check_instance_zero(metrics)
     if zero_msg:
         print(f"  Instance zero: {zero_msg}")
@@ -321,11 +381,11 @@ def main():
             print("Done.")
             return
 
-    # 4. Evaluate
+    # 5. Evaluate
     is_interesting = evaluate_with_guardsman(metrics)
     print(f"Decision: {'INTERESTING' if is_interesting else 'ROUTINE'}")
 
-    # 5. Act
+    # 6. Act
     if is_interesting:
         session_doc = get_active_session_doc()
         session_ctx = get_session_context(session_doc)
