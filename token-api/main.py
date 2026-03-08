@@ -2815,6 +2815,7 @@ DISCORD_DAEMON_URL = "http://127.0.0.1:7779"
 MECHANICUS_USER_ID = "1472042705788866611"
 MECHANICUS_ROLE_ID = "1477162726093492308"
 CUSTODES_USER_ID   = "1477159418498912357"
+INQUISITION_USER_ID = "1477164289742864479"
 OPERATOR_USER_ID   = "229461055628115968"
 CUSTODES_CHANNELS  = {"briefing", "chat"}  # Channels where replies route to Custodes
 
@@ -8494,6 +8495,11 @@ async def receive_discord_message(request: DiscordMessageRequest):
         asyncio.create_task(_discord_respond(request, bot="custodes"))
         return {"received": True, "message_id": request.message_id}
 
+    # Trigger 1.6: @Inquisition mention in any channel
+    if f"<@{INQUISITION_USER_ID}>" in content:
+        asyncio.create_task(_discord_respond(request, bot="inquisition"))
+        return {"received": True, "message_id": request.message_id}
+
     # Trigger 2: Reply in a Custodes-owned channel
     if request.is_reply and request.channel_name in CUSTODES_CHANNELS:
         asyncio.create_task(_discord_respond(request, bot="custodes"))
@@ -8595,7 +8601,12 @@ async def _discord_respond(message: DiscordMessageRequest, bot: str):
         return
     _discord_respond_cooldowns[channel] = now
 
-    persona = "Fabricator General (Adeptus Mechanicus)" if bot == "mechanicus" else "Adeptus Custodes"
+    if bot == "mechanicus":
+        persona = "Fabricator General (Adeptus Mechanicus)"
+    elif bot == "inquisition":
+        persona = "Inquisitor (Inquisition)"
+    else:
+        persona = "Adeptus Custodes"
 
     # Fetch recent channel context from daemon (sync urllib in executor to stay async)
     context_str = ""
