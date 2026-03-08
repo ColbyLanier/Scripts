@@ -8932,15 +8932,58 @@ async def run_implantation(note_path: str, title: str, note_type: str, source: s
             except Exception as e:
                 logger.warning(f"Implantation: consolidation failed for '{title}': {e}")
 
-        # Build Research section
-        if consolidated and consolidated.strip():
-            sections.append(f"### Research\n\n{consolidated.strip()}")
-        elif researcher_outputs:
-            # Fallback: use first few researcher outputs directly
-            fallback_research = "\n\n".join(researcher_outputs[:3])
-            sections.append(f"### Research\n\n{fallback_research[:3000]}")
-
         logger.info(f"Implantation: consolidation complete for '{title}'")
+
+        # --- Phase 1d: Inquisition Oversight ---
+        # Sonnet reviews the MiniMax consolidated output for hallucinations,
+        # off-topic content, and ensures system-context grounding.
+        inquisition_reviewed = None
+        review_input = consolidated if consolidated else "\n\n".join(researcher_outputs[:3])
+        if review_input and review_input.strip():
+            inquisition_prompt = (
+                f"{CODEX_CONTEXT}\n\n"
+                f"You are an Inquisitor reviewing research produced by Imperial Guard (MiniMax) servitors. "
+                f"The Guard is cheap and fast but UNTRUSTED — they hallucinate URLs, produce off-topic content, "
+                f"and fail to ground research in our system's context.\n\n"
+                f"The note being researched is titled: \"{title}\"\n"
+                f"Note type: {note_type}\n"
+                f"Original note content: a note about this topic in our Imperium system.\n\n"
+                f"Existing vault knowledge:\n{vault_context_str[:1500] if vault_context_str else 'No existing vault notes on this topic.'}\n\n"
+                f"Here is the Guard's consolidated research output:\n\n---\n{review_input}\n---\n\n"
+                f"Your task:\n"
+                f"1. REMOVE any fabricated/hallucinated URLs (fake protocols like imperium://, made-up domains). Keep only real, verifiable URLs.\n"
+                f"2. REMOVE content that is clearly off-topic or not relevant to the note's actual subject.\n"
+                f"3. GRADE the relevance: is this research actually useful for understanding or acting on this note? If the Guard researched the wrong thing entirely, say so.\n"
+                f"4. REWRITE the research brief with only verified, relevant content. Add a one-line Inquisition verdict at the end.\n\n"
+                f"Output the cleaned research in markdown. Be ruthless — better to have 2 solid paragraphs than 6 paragraphs of noise."
+            )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "claude", "--model", "claude-sonnet-4-6", "-p",
+                    "--no-session-persistence", "--dangerously-skip-permissions",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    stdin=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(input=inquisition_prompt.encode("utf-8")),
+                    timeout=90,
+                )
+                inquisition_reviewed = stdout.decode("utf-8", errors="replace").strip()
+                logger.info(f"Implantation: Inquisition review complete for '{title}'")
+            except asyncio.TimeoutError:
+                logger.warning(f"Implantation: Inquisition review timed out for '{title}', using raw consolidation")
+            except Exception as e:
+                logger.warning(f"Implantation: Inquisition review failed for '{title}': {e}")
+
+        # Build Research section (prefer Inquisition-reviewed, fallback to raw consolidation)
+        if inquisition_reviewed and inquisition_reviewed.strip():
+            sections.append(f"### Research\n\n{inquisition_reviewed.strip()}")
+        elif consolidated and consolidated.strip():
+            sections.append(f"### Research\n\n*\u26a0\ufe0f Inquisition review unavailable — unreviewed Guard output:*\n\n{consolidated.strip()}")
+        elif researcher_outputs:
+            fallback_research = "\n\n".join(researcher_outputs[:3])
+            sections.append(f"### Research\n\n*\u26a0\ufe0f Unreviewed Guard output (no consolidation):*\n\n{fallback_research[:3000]}")
 
         # --- Append to note ---
         if not sections:
@@ -9084,11 +9127,11 @@ async def run_trials(note_path: str, title: str, note_type: str) -> None:
             logger.error(f"Trials: append command failed for '{title}': {e}")
             return
 
-        # Update status to trials_complete
+        # Update status to trials_active (trials are ongoing until Emperor responds)
         try:
             proc = await asyncio.create_subprocess_exec(
                 OBSIDIAN_CLI, "vault=Imperium-ENV", "property:set",
-                f'path={note_path}', 'property=status', 'value=trials_complete',
+                f'path={note_path}', 'property=status', 'value=trials_active',
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -9096,14 +9139,14 @@ async def run_trials(note_path: str, title: str, note_type: str) -> None:
         except Exception as e:
             logger.warning(f"Trials: property:set failed for '{title}': {e}")
 
-        logger.info(f"Trials complete for '{title}' ({note_path})")
+        logger.info(f"Trials initiated for '{title}' ({note_path}) — awaiting Emperor response")
 
-        # Dual-ship to Discord
+        # Dual-ship to Discord for Emperor review
         try:
-            # Build a simplified Discord message
             discord_message = (
-                f"**Trials Complete: {title}**\n"
-                f"Type: `{note_type}` | Path: `{note_path}`\n\n"
+                f"**⚔️ Trials Initiated: {title}**\n"
+                f"Type: `{note_type}` | Path: `{note_path}`\n"
+                f"Status: `trials_active` — awaiting Emperor review\n\n"
                 f"{trials_output[:1800]}"
             )
             discord_proc = await asyncio.create_subprocess_exec(
@@ -9116,7 +9159,7 @@ async def run_trials(note_path: str, title: str, note_type: str) -> None:
         except Exception as e:
             logger.warning(f"Trials: Discord notification failed for '{title}': {e}")
 
-        await log_event("trials_complete", device_id="sonnet", details={
+        await log_event("trials_initiated", device_id="sonnet", details={
             "path": note_path,
             "title": title,
             "type": note_type,
