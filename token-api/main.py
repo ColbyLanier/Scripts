@@ -8702,8 +8702,13 @@ async def inbox_notify(request: InboxNotifyRequest):
         "source": request.source,
     })
     logger.info(f"Inbox: new {request.type} note '{request.title}' from {request.source}")
-    # Future: dispatch MiniMax fleet (Stage 2: Implantation)
-    return {"received": True, "path": request.path, "type": request.type}
+    asyncio.create_task(run_implantation(
+        note_path=request.path,
+        title=request.title,
+        note_type=request.type,
+        source=request.source,
+    ))
+    return {"received": True, "path": request.path, "type": request.type, "implantation": "dispatched"}
 
 
 @app.post("/api/inbox/create")
@@ -8762,6 +8767,181 @@ async def inbox_create(request: InboxCreateRequest):
     return {"created": True, "path": note_path, "title": safe_title, "obsidian_uri": obsidian_uri}
 
 
+# ---- Stage 2: Implantation ----
+
+OBSIDIAN_CLI = str(Path.home() / "Scripts" / "cli-tools" / "bin" / "obsidian")
+WEB_SEARCH_CLI = str(Path.home() / "Scripts" / "cli-tools" / "bin" / "web-search")
+
+
+async def run_implantation(note_path: str, title: str, note_type: str, source: str) -> None:
+    """Stage 2: Implantation — async enrichment of an inbox note with vault matches and web research."""
+    try:
+        # Budget check — preserve MiniMax quota for higher-priority work
+        if minimax_limiter.remaining < 10:
+            logger.warning(f"Implantation skipped for '{title}': MiniMax budget low ({minimax_limiter.remaining} remaining)")
+            return
+
+        sections = []
+
+        # --- Similar note search ---
+        vault_synthesis = None
+        raw_vault_lines = []
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                OBSIDIAN_CLI, "vault=Imperium-ENV", "search:context", f'query={title}',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            vault_output = stdout.decode("utf-8", errors="replace").strip()
+
+            if vault_output:
+                # Filter to Terra/Ultramar/ paths only
+                for line in vault_output.splitlines():
+                    if line.startswith("Terra/Ultramar/"):
+                        raw_vault_lines.append(line)
+
+                if raw_vault_lines:
+                    vault_context = "\n".join(raw_vault_lines[:50])  # cap context size
+                    vault_synthesis = await minimax_chat(
+                        system_prompt=IMPLANTATION_ROLES["vault_relevance"]["system"],
+                        user_content=f"New note title: {title}\nNote type: {note_type}\n\nVault search results:\n{vault_context}",
+                        max_tokens=IMPLANTATION_ROLES["vault_relevance"]["max_tokens"],
+                    )
+        except asyncio.TimeoutError:
+            logger.warning(f"Implantation: vault search timed out for '{title}'")
+        except Exception as e:
+            logger.warning(f"Implantation: vault search failed for '{title}': {e}")
+
+        # Build Similar Notes section
+        if vault_synthesis and vault_synthesis.strip() and vault_synthesis.strip() != "NO_MATCHES":
+            sections.append(f"### Similar Notes\n\n{vault_synthesis.strip()}")
+        elif raw_vault_lines:
+            # Fallback: raw wikilinks from matched files
+            seen_files = []
+            for line in raw_vault_lines:
+                fname = line.split(":")[0] if ":" in line else line
+                if fname not in seen_files:
+                    seen_files.append(fname)
+                note_name = fname.replace("Terra/Ultramar/", "").replace(".md", "")
+                if f"[[{note_name}]]" not in "\n".join(sections):
+                    pass  # will be added below
+            fallback_links = []
+            seen = set()
+            for line in raw_vault_lines:
+                fname = line.split(":")[0] if ":" in line else line
+                if fname not in seen:
+                    seen.add(fname)
+                    note_name = fname.replace("Terra/Ultramar/", "").replace(".md", "")
+                    fallback_links.append(f"- [[{note_name}]]")
+            if fallback_links:
+                sections.append(f"### Similar Notes\n\n{chr(10).join(fallback_links[:5])}")
+
+        # --- Web research ---
+        web_synthesis = None
+        raw_web_output = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                WEB_SEARCH_CLI, "--count", "5", title,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            raw_web_output = stdout.decode("utf-8", errors="replace").strip()
+
+            if raw_web_output:
+                web_synthesis = await minimax_chat(
+                    system_prompt=IMPLANTATION_ROLES["web_researcher"]["system"],
+                    user_content=f"Topic: {title}\n\nWeb search results:\n{raw_web_output}",
+                    max_tokens=IMPLANTATION_ROLES["web_researcher"]["max_tokens"],
+                )
+        except asyncio.TimeoutError:
+            logger.warning(f"Implantation: web search timed out for '{title}'")
+        except Exception as e:
+            logger.warning(f"Implantation: web search failed for '{title}': {e}")
+
+        # Build Research section
+        if web_synthesis and web_synthesis.strip():
+            sections.append(f"### Research\n\n{web_synthesis.strip()}")
+        elif raw_web_output:
+            # Fallback: raw web search output
+            sections.append(f"### Research\n\n{raw_web_output[:2000]}")
+
+        # --- Append to note ---
+        if not sections:
+            logger.info(f"Implantation: no enrichment content for '{title}', skipping append")
+            return
+
+        implant_content = f"## Implantation\n\n" + "\n\n".join(sections)
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                OBSIDIAN_CLI, "vault=Imperium-ENV", "append",
+                f'path={note_path}', f'content={implant_content}',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+            if proc.returncode != 0:
+                logger.error(f"Implantation: append failed for '{title}': {stderr.decode()}")
+                return
+        except Exception as e:
+            logger.error(f"Implantation: append command failed for '{title}': {e}")
+            return
+
+        # Update status to implanted
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                OBSIDIAN_CLI, "vault=Imperium-ENV", "property:set",
+                f'path={note_path}', 'property=status', 'value=implanted',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=15)
+        except Exception as e:
+            logger.warning(f"Implantation: property:set failed for '{title}': {e}")
+
+        await log_event("implantation_complete", device_id="minimax", details={
+            "path": note_path,
+            "title": title,
+            "type": note_type,
+            "source": source,
+            "has_vault_matches": bool(vault_synthesis or raw_vault_lines),
+            "has_web_research": bool(web_synthesis or raw_web_output),
+        })
+        logger.info(f"Implantation complete for '{title}' ({note_path})")
+
+    except Exception as e:
+        logger.error(f"Implantation failed for '{title}': {e}", exc_info=True)
+
+
+class InboxImplantRequest(BaseModel):
+    """Manual trigger for implantation on an existing inbox note."""
+    path: str
+
+
+@app.post("/api/inbox/implant")
+async def inbox_implant(request: InboxImplantRequest):
+    """Manually trigger implantation on an existing inbox note."""
+    # Extract title from filename
+    filename = request.path.rsplit("/", 1)[-1] if "/" in request.path else request.path
+    title = filename.replace(".md", "")
+
+    # Verify note exists
+    full_path = OBSIDIAN_VAULT_PATH / request.path
+    if not full_path.exists():
+        raise HTTPException(status_code=404, detail=f"Note not found: {request.path}")
+
+    asyncio.create_task(run_implantation(
+        note_path=request.path,
+        title=title,
+        note_type="capture",
+        source="manual",
+    ))
+
+    return {"dispatched": True, "path": request.path, "title": title}
+
+
 # ============ Session Document Support ============
 
 class MiniMaxRateLimiter:
@@ -8790,6 +8970,18 @@ class MiniMaxRateLimiter:
         return max(0, self.max_calls - len(self.calls))
 
 minimax_limiter = MiniMaxRateLimiter()
+
+# ---- Implantation Roles ----
+IMPLANTATION_ROLES = {
+    "vault_relevance": {
+        "system": "You are a vault librarian. Given search results from an Obsidian vault and a new note's title and content, identify the 3-5 most relevant existing notes. For each, write one sentence explaining the connection. If none are relevant, respond with exactly: NO_MATCHES. Format as a markdown list with wikilinks: - [[Note Name]] — connection explanation",
+        "max_tokens": 512,
+    },
+    "web_researcher": {
+        "system": "You are a research assistant. Given web search results about a topic, write a concise 2-4 paragraph research brief. Include key facts, recent developments, and actionable insights. Cite sources with markdown links. Be factual and dense — no filler.",
+        "max_tokens": 1024,
+    },
+}
 
 # ---- Minimax API Client ----
 _MINIMAX_BASE_URL = "https://api.minimax.io/anthropic"
