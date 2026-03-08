@@ -611,7 +611,7 @@ class CronEngine:
         job["is_running"] = job_id in self._running_jobs
         return job
 
-    VALID_COMMANDERS = {"mechanicus", "custodes", "alpharius"}
+    VALID_COMMANDERS = {"mechanicus", "custodes", "alpharius", "dorn", "emperor"}
 
     async def create_job(self, data: dict) -> dict:
         """Create a new cron job."""
