@@ -888,6 +888,7 @@ async def init_db():
             ("sanguinius", "Sanguinius, The Angel", '["sang", "sanguinius", "angel"]', "Imperium-ENV", "Prose stylist. Makes in-place edits to existing notes in Terra/Ultramar/ — elevates readability without changing meaning. Post-Guilliman polish pass.", "sanguinius", "Personas/Sanguinius.md"),
             ("alpharius", "Alpharius, The Unknowable Twin", '["alpharius", "alpha", "hydra"]', "Imperium-ENV", "Deep reserve watchdog. Monitors fleet health, alerts on catastrophic failure. Reports through Mechanicus channels. I am Alpharius.", "alpharius", "Personas/Alpharius.md"),
             ("dorn", "Dorn, The Imperial Fist", '["dorn", "fortify", "audit"]', "Imperium-ENV", "Security Primarch. Defensive auditor and hardening reviewer. Reviews code, infrastructure, and configurations for vulnerabilities. Does not build — inspects what others build before it ships.", "dorn", "Personas/Dorn.md"),
+            ("corax", "Corax, The Raven Lord", '["corax", "raven", "monitor", "codax"]', "Imperium-ENV", "Observability Primarch. Long-term monitoring, anomaly detection, pattern recognition across the entire system. Independent observer — not part of the Mechanicus command chain. Read-only. Silent by default, speaks when something is wrong.", "corax", "Personas/Corax.md"),
         ]
         for p in primarch_seed:
             await db.execute("""
@@ -6107,8 +6108,10 @@ async def get_cron_job(job_id: str):
 async def create_cron_job(request: Request):
     """Create a new cron job."""
     data = await request.json()
-    if "name" not in data or "command" not in data or "schedule" not in data:
-        raise HTTPException(status_code=400, detail="name, command, and schedule are required")
+    has_command = "command" in data
+    has_structured = "model" in data and "prompt_path" in data
+    if "name" not in data or "schedule" not in data or not (has_command or has_structured):
+        raise HTTPException(status_code=400, detail="name, schedule, and either command or (model + prompt_path) required")
     try:
         job = await cron_engine.create_job(data)
     except ValueError as e:

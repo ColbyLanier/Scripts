@@ -30,6 +30,14 @@ except ImportError:
 
 VICTORY_RE = re.compile(r'##IMPERIUM_VICTORIOUS:\s*(.+?)##', re.DOTALL)
 
+# Parse model and prompt_path from legacy monolithic command strings
+_CMD_PARSE_RE = re.compile(
+    r'claude\s+--model\s+(\S+)\s+-p\s+"\$\(cat\s+([^)]+)\)"\s+--dangerously-skip-permissions'
+)
+
+# Default prompt directory (migrated from ~/.openclaw/workspace/memory/prompts/)
+_PROMPTS_DIR = str(Path.home() / ".claude" / "prompts")
+
 # Ensure critical paths are available to subprocess shells.
 # LaunchAgent environments have a minimal PATH; this guarantees
 # claude, openclaw, and homebrew tools are reachable.
@@ -141,6 +149,10 @@ class CronEngine:
             await db.execute("ALTER TABLE cron_jobs ADD COLUMN notify_discord INTEGER DEFAULT 0")
         if "commander" not in cron_jobs_cols:
             await db.execute("ALTER TABLE cron_jobs ADD COLUMN commander TEXT DEFAULT 'mechanicus'")
+        if "model" not in cron_jobs_cols:
+            await db.execute("ALTER TABLE cron_jobs ADD COLUMN model TEXT DEFAULT NULL")
+        if "prompt_path" not in cron_jobs_cols:
+            await db.execute("ALTER TABLE cron_jobs ADD COLUMN prompt_path TEXT DEFAULT NULL")
 
         cursor = await db.execute("PRAGMA table_info(cron_runs)")
         cron_runs_cols = {row[1] for row in await cursor.fetchall()}
@@ -148,6 +160,29 @@ class CronEngine:
             await db.execute("ALTER TABLE cron_runs ADD COLUMN victory_reason TEXT DEFAULT NULL")
 
         await db.commit()
+
+        # One-time data migration: extract model/prompt_path from command strings
+        cursor = await db.execute(
+            "SELECT id, command FROM cron_jobs WHERE model IS NULL AND command LIKE 'claude %'"
+        )
+        rows = await cursor.fetchall()
+        for row_id, cmd in rows:
+            m = _CMD_PARSE_RE.match(cmd)
+            if m:
+                model = m.group(1)
+                prompt = m.group(2).strip()
+                # Rewrite legacy openclaw path to canonical ~/.claude/prompts/
+                prompt = prompt.replace(
+                    "~/.openclaw/workspace/memory/prompts/",
+                    "~/.claude/prompts/"
+                )
+                await db.execute(
+                    "UPDATE cron_jobs SET model = ?, prompt_path = ? WHERE id = ?",
+                    (model, prompt, row_id),
+                )
+        if rows:
+            await db.commit()
+            print(f"CronEngine: Migrated {len(rows)} jobs to model/prompt_path columns")
 
     # ── Startup Cleanup ────────────────────────────────────────
 
@@ -212,15 +247,16 @@ class CronEngine:
                         quiet_hours_start, quiet_hours_end,
                         max_runs_per_window, run_window_hours,
                         session_type, notify_discord, commander,
+                        model, prompt_path,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     job_def["id"], job_def["name"],
                     job_def.get("description", ""),
                     1 if job_def.get("enabled", True) else 0,
                     schedule["type"], schedule["value"],
                     schedule.get("tz", "America/Phoenix"),
-                    job_def["command"],
+                    job_def.get("command", ""),
                     job_def.get("timeout_seconds", 120),
                     quiet[0] if quiet else None,
                     quiet[1] if quiet else None,
@@ -229,6 +265,8 @@ class CronEngine:
                     job_def.get("session_type", "isolated"),
                     1 if job_def.get("notify_discord") else 0,
                     job_def.get("commander", "mechanicus"),
+                    job_def.get("model"),
+                    job_def.get("prompt_path"),
                     now, now,
                 ))
             await db.commit()
@@ -383,9 +421,15 @@ class CronEngine:
             except Exception as e:
                 print(f"CronEngine: Discord trigger notify failed for '{job['name']}': {e}")
 
+        # Build command from structured fields if available
+        if job.get("prompt_path") and job.get("model"):
+            command = f'claude --model {job["model"]} -p "$(cat {job["prompt_path"]})" --dangerously-skip-permissions'
+        else:
+            command = job["command"]
+
         try:
             proc = await asyncio.create_subprocess_shell(
-                job["command"],
+                command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=_subprocess_env(CRON_JOB_NAME=job["name"], CRON_JOB_ID=job_id),
@@ -579,6 +623,14 @@ class CronEngine:
         if commander not in self.VALID_COMMANDERS:
             raise ValueError(f"Invalid commander '{commander}'. Must be one of: {sorted(self.VALID_COMMANDERS)}")
 
+        model = data.get("model")
+        prompt_path = data.get("prompt_path")
+        command = data.get("command", "")
+
+        # If structured fields provided without a raw command, store empty command
+        if not command and not (model and prompt_path):
+            raise ValueError("Either 'command' or both 'model' and 'prompt_path' are required")
+
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute("""
@@ -588,15 +640,17 @@ class CronEngine:
                         command, timeout_seconds,
                         quiet_hours_start, quiet_hours_end,
                         max_runs_per_window, run_window_hours,
-                        session_type, commander, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        session_type, commander,
+                        model, prompt_path,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     job_id, data["name"],
                     data.get("description", ""),
                     1 if data.get("enabled", True) else 0,
                     schedule["type"], schedule["value"],
                     schedule.get("tz", "America/Phoenix"),
-                    data["command"],
+                    command,
                     data.get("timeout_seconds", 120),
                     quiet[0] if quiet else None,
                     quiet[1] if quiet else None,
@@ -604,6 +658,7 @@ class CronEngine:
                     data.get("run_window_hours", 5),
                     data.get("session_type", "isolated"),
                     commander,
+                    model, prompt_path,
                     now, now,
                 ))
                 await db.commit()
@@ -639,6 +694,8 @@ class CronEngine:
             "run_window_hours": "run_window_hours",
             "session_type": "session_type",
             "commander": "commander",
+            "model": "model",
+            "prompt_path": "prompt_path",
         }
 
         for key, col in field_map.items():
@@ -739,7 +796,11 @@ class CronEngine:
         # Build descriptive output
         details = []
         details.append(f"Job: {job['name']} ({job_id})")
-        details.append(f"Command: {job['command']}")
+        if job.get("prompt_path") and job.get("model"):
+            details.append(f"Model: {job['model']}")
+            details.append(f"Prompt: {job['prompt_path']}")
+        else:
+            details.append(f"Command: {job['command']}")
         details.append(f"Current hour ({tz}): {current_hour}")
         quiet_s, quiet_e = job.get("quiet_hours_start"), job.get("quiet_hours_end")
         if quiet_s is not None:

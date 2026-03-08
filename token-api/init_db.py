@@ -234,6 +234,7 @@ def init_database():
         ("guilliman", "Guilliman, The Codifier", '["g", "guilliman", "ultramar"]', "Imperium-ENV", "Documentation Primarch. Takes raw knowledge and produces clean, cross-linked vault notes. Owns Terra/Ultramar/. Decides what is worth codifying and how to structure it.", "guilliman", "Personas/Guilliman.md"),
         ("sanguinius", "Sanguinius, The Angel", '["sang", "sanguinius", "angel"]', "Imperium-ENV", "Prose stylist. Makes in-place edits to existing notes in Terra/Ultramar/ — elevates readability without changing meaning. Post-Guilliman polish pass.", "sanguinius", "Personas/Sanguinius.md"),
         ("dorn", "Dorn, The Imperial Fist", '["dorn", "fortify", "audit"]', "Imperium-ENV", "Security Primarch. Defensive auditor and hardening reviewer. Reviews code, infrastructure, and configurations for vulnerabilities. Does not build — inspects what others build before it ships.", "dorn", "Personas/Dorn.md"),
+        ("corax", "Corax, The Raven Lord", '["corax", "raven", "monitor", "codax"]', "Imperium-ENV", "Observability Primarch. Long-term monitoring, anomaly detection, pattern recognition across the entire system. Independent observer — not part of the Mechanicus command chain. Read-only. Silent by default, speaks when something is wrong.", "corax", "Personas/Corax.md"),
     ]
     for p in primarch_seed:
         cursor.execute("""
