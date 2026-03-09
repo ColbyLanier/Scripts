@@ -1386,6 +1386,9 @@ async def lifespan(app: FastAPI):
     # Start timer engine worker
     timer_worker_task = asyncio.create_task(timer_worker())
     print("Timer engine started")
+    # Start phone heartbeat monitor
+    asyncio.create_task(phone_heartbeat_worker())
+    print("Phone heartbeat monitor started")
     await run_overdue_tasks()
     yield
 
@@ -3171,6 +3174,13 @@ PHONE_STATE = {
     "twitter_last_zap_wall": 0,  # wall-clock time.time() of last zap (survives restarts via file)
 }
 
+# Phone heartbeat state (absence-of-signal detection)
+PHONE_HEARTBEAT = {
+    "last_seen": None,      # datetime (UTC) or None
+    "device_id": None,
+    "alert_state": None,    # None, "beep", "zap"
+}
+
 TWITTER_ZAP_COOLDOWN_FILE = DB_PATH.parent / "twitter_zap_cooldown.txt"
 TWITTER_ZAP_COOLDOWN_SECS = 1800  # 30 minutes
 
@@ -4393,6 +4403,33 @@ async def restart_satellite_proxy():
         return {"success": True, "note": "timeout expected during restart"}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+# ============ Phone Heartbeat Endpoints ============
+
+@app.post("/api/phone/heartbeat")
+async def phone_heartbeat(request: Request):
+    """Record phone heartbeat — resets silence timer and clears alert state."""
+    body = await request.json()
+    PHONE_HEARTBEAT["last_seen"] = datetime.utcnow()
+    PHONE_HEARTBEAT["device_id"] = body.get("device_id", "phone")
+    PHONE_HEARTBEAT["alert_state"] = None  # Reset alert on heartbeat
+    return {"ok": True, "timestamp": PHONE_HEARTBEAT["last_seen"].isoformat()}
+
+
+@app.get("/api/phone/heartbeat/status")
+async def phone_heartbeat_status():
+    """Return last heartbeat time, silence duration, and current alert state."""
+    last = PHONE_HEARTBEAT["last_seen"]
+    if last is None:
+        return {"last_heartbeat": None, "silence_minutes": None, "alert_state": None, "device_id": None}
+    silence_minutes = (datetime.utcnow() - last).total_seconds() / 60
+    return {
+        "last_heartbeat": last.isoformat(),
+        "silence_minutes": round(silence_minutes, 1),
+        "alert_state": PHONE_HEARTBEAT["alert_state"],
+        "device_id": PHONE_HEARTBEAT["device_id"],
+    }
 
 
 # ============ Phone Activity Detection ============
@@ -7112,6 +7149,54 @@ async def detect_stuck_instances():
         except Exception as e:
             logger.error(f"Error in stuck detection: {e}")
             await asyncio.sleep(300)
+
+
+async def phone_heartbeat_worker():
+    """Monitor phone heartbeat silence. Alert via Discord + Pavlok if phone goes silent."""
+    await asyncio.sleep(120)  # Wait 2 min after startup before first check
+    while True:
+        await asyncio.sleep(300)  # Check every 5 minutes
+        try:
+            last = PHONE_HEARTBEAT["last_seen"]
+            if last is None:
+                continue  # No heartbeat ever received — skip until first ping arrives
+            silence_min = (datetime.utcnow() - last).total_seconds() / 60
+            current_alert = PHONE_HEARTBEAT["alert_state"]
+
+            if silence_min > 60 and current_alert != "zap":
+                PHONE_HEARTBEAT["alert_state"] = "zap"
+                msg = f"⚡ Phone heartbeat silent {silence_min:.0f}min — Pavlok ZAP fired. Check Tailscale."
+                logger.warning(f"PHONE HB: {msg}")
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "discord", "send", "alerts", msg,
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    )
+                    await asyncio.wait_for(proc.communicate(), timeout=15)
+                except Exception as e:
+                    logger.warning(f"PHONE HB: Discord alert failed: {e}")
+                await asyncio.to_thread(
+                    send_pavlok_stimulus, "zap", None, "phone_heartbeat_silence_60min", True
+                )
+
+            elif silence_min > 30 and current_alert is None:
+                PHONE_HEARTBEAT["alert_state"] = "beep"
+                msg = f"📵 Phone heartbeat silent {silence_min:.0f}min — Tailscale may be down."
+                logger.warning(f"PHONE HB: {msg}")
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "discord", "send", "alerts", msg,
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    )
+                    await asyncio.wait_for(proc.communicate(), timeout=15)
+                except Exception as e:
+                    logger.warning(f"PHONE HB: Discord alert failed: {e}")
+                await asyncio.to_thread(
+                    send_pavlok_stimulus, "beep", None, "phone_heartbeat_silence_30min", True
+                )
+
+        except Exception as e:
+            logger.error(f"phone_heartbeat_worker error: {e}")
 
 
 def _is_quiet_hours() -> bool:
