@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# tts - Send a TTS message to Token-API (Mac mini)
+# TAGS: token-api
+# AUDIENCE: agent
+#
+# Usage:
+#   tts "Your spoken message here"
+#   tts --instance-id <id> "Your spoken message"
+#   tts --sync "Your spoken message"   # Wait for response (default: fire-and-forget)
+#
+# The message is passed as all positional arguments after any flags,
+# so quoting is optional: tts Hello world works too.
+#
+# JSON is built with jq so special characters (em dashes, curly quotes,
+# backslashes, etc.) are escaped correctly without manual quoting tricks.
+
+set -euo pipefail
+
+TOKEN_API_HOST="http://100.95.109.23:7777"
+ENDPOINT="/api/notify/tts"
+
+# Defaults
+INSTANCE_ID="${TOKEN_API_INSTANCE_ID:-}"
+SYNC=false
+
+usage() {
+    # Print only the header comment block (stops at first blank line or non-comment)
+    awk '/^#!/{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
+    exit 0
+}
+
+# Parse flags
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
+            ;;
+        --instance-id)
+            INSTANCE_ID="$2"
+            shift 2
+            ;;
+        --sync)
+            SYNC=true
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "tts: unknown flag: $1" >&2
+            echo "Run 'tts --help' for usage." >&2
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# Everything remaining is the message
+MESSAGE="$*"
+
+if [[ -z "$MESSAGE" ]]; then
+    echo "tts: message required" >&2
+    echo "Usage: tts \"Your spoken message\"" >&2
+    exit 1
+fi
+
+# Build JSON with jq — handles all special characters correctly
+# jq --arg passes the value as a literal string, no manual escaping needed
+if [[ -n "$INSTANCE_ID" ]]; then
+    JSON=$(jq -cn \
+        --arg msg "$MESSAGE" \
+        --arg iid "$INSTANCE_ID" \
+        '{"message": $msg, "instance_id": $iid, "priority": true}')
+else
+    JSON=$(jq -cn \
+        --arg msg "$MESSAGE" \
+        '{"message": $msg, "priority": true}')
+fi
+
+if [[ "$SYNC" == "true" ]]; then
+    curl -sf -X POST "${TOKEN_API_HOST}${ENDPOINT}" \
+        -H "Content-Type: application/json" \
+        -d "$JSON"
+else
+    # Fire-and-forget: background the request, discard output
+    curl -sf -X POST "${TOKEN_API_HOST}${ENDPOINT}" \
+        -H "Content-Type: application/json" \
+        -d "$JSON" \
+        >/dev/null 2>&1 &
+    disown
+fi

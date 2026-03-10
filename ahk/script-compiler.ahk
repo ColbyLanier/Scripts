@@ -131,3 +131,13 @@ Media_Stop:: {  ; Skip current TTS
     PostToTokenApi("/api/work-action", "")
 }
 
+; --- Wispr Flow dictation tracking ---
+; Passthrough hotkey: Wispr still receives the keystroke, we just report state to Token-API
+global dictationActive := false
+~^#Space:: {
+    global dictationActive
+    dictationActive := !dictationActive
+    active := dictationActive ? "true" : "false"
+    PostToTokenApi("/api/dictation?active=" active, "")
+}
+

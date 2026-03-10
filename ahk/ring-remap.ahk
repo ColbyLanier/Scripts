@@ -20,6 +20,51 @@ PragmaOnce(A_ScriptFullPath, A_ScriptHwnd)
 
 #Include <AutoHotInterception>
 
+; ============== TOKEN-API INTEGRATION ==============
+TOKENAPI_URL := "http://100.95.109.23:7777"
+
+PostToTokenApi(endpoint, body := "") {
+    global TOKENAPI_URL
+    url := TOKENAPI_URL . endpoint
+    try {
+        http := ComObject("WinHttp.WinHttpRequest.5.1")
+        http.Open("POST", url, false)
+        http.SetRequestHeader("Content-Type", "application/json")
+        http.Send(body)
+        return {success: true, status: http.Status, body: http.ResponseText}
+    } catch as err {
+        return {success: false, status: 0, body: err.Message}
+    }
+}
+
+GetFromTokenApi(endpoint) {
+    global TOKENAPI_URL
+    url := TOKENAPI_URL . endpoint
+    try {
+        http := ComObject("WinHttp.WinHttpRequest.5.1")
+        http.Open("GET", url, false)
+        http.Send()
+        return {success: true, status: http.Status, body: http.ResponseText}
+    } catch as err {
+        return {success: false, status: 0, body: err.Message}
+    }
+}
+
+; Report dictation state change to Token-API
+NotifyDictation(active) {
+    arg := active ? "true" : "false"
+    PostToTokenApi("/api/dictation?active=" arg)
+}
+
+; Check if a voice chat session is active (point-in-time read, not polling)
+IsVoiceChatActive() {
+    resp := GetFromTokenApi("/api/dictation")
+    if (!resp.success)
+        return false
+    ; Parse JSON - look for "voice_chat_instance": "<something>"  (not null)
+    return resp.body != "" && InStr(resp.body, '"voice_chat_instance": null') == 0 && InStr(resp.body, '"voice_chat_instance"')
+}
+
 ; ============== CONFIGURATION ==============
 RING_DEVICE_ID := 0  ; Auto-detected below (set manually to override)
 MINIMUM_RING_ID := 14  ; IDs below this are assumed to be built-in devices (trackpad, etc.)
@@ -453,6 +498,15 @@ HandleLeftTap() {
     global lastLeftTapTime, enterQueued, dictationEndTime
     global doubleTapBypassActive, doubleTapBypassStartTime
 
+    ; Voice chat mode: single tap sends Enter immediately (hook intercepts it)
+    if (IsVoiceChatActive() && !IsDictationActive()) {
+        if (LEFT_TAP_ACTION != "") {
+            Send(LEFT_TAP_ACTION)
+            ShowFeedback("Ring Left (voice chat) → " LEFT_TAP_ACTION)
+        }
+        return
+    }
+
     if (IsDictationActive()) {
         ; Queue Enter - will be sent after dictation ends + buffer
         enterQueued := true
@@ -533,6 +587,7 @@ RightButtonCallback(state) {
         rightButtonDownTime := A_TickCount
         rightButtonHeld := true
         Send("{LCtrl down}{LWin down}")
+        NotifyDictation(true)
         ShowFeedback("Wispr: Holding...")
     } else {
         ; Button released
@@ -544,15 +599,18 @@ RightButtonCallback(state) {
             toggleActive := !toggleActive
             Send("{Space}{LWin up}{LCtrl up}")
             if (toggleActive) {
+                NotifyDictation(true)
                 ShowFeedback("Wispr: Toggle ON (" holdDuration "ms)")
             } else {
                 ; Toggle turned OFF - dictation ended
+                NotifyDictation(false)
                 OnDictationEnd()
                 ShowFeedback("Wispr: Toggle OFF (" holdDuration "ms)")
             }
         } else {
             ; Hold release - dictation ended
             Send("{LWin up}{LCtrl up}")
+            NotifyDictation(false)
             OnDictationEnd()
             ShowFeedback("Wispr: Released (" holdDuration "ms)")
         }
