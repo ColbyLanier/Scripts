@@ -106,8 +106,14 @@ EOF
 
     sleep 1
 
+    # Disconnect mDNS auto-discovered device to avoid "more than one device" error
+    for dev in $(adb devices 2>/dev/null | grep '_adb-tls' | awk '{print $1}'); do
+        log "Disconnecting mDNS device: $dev"
+        adb disconnect "$dev" 2>/dev/null || true
+    done
+
     log "Setting ADB to TCP mode on port ${ADB_PORT}..."
-    adb tcpip "$ADB_PORT"
+    adb -s "$connect_addr" tcpip "$ADB_PORT"
 
     sleep 2
 
