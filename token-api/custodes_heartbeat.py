@@ -268,57 +268,71 @@ def send_discord_thread(message: str):
 
 
 def check_morning_habits() -> str | None:
-    """After 10am Phoenix time: remind if morning habits appear unchecked in daily note.
-    Returns a reminder message, or None if not applicable / already reminded today.
+    """Check habits API for overdue habits and remind the Emperor.
+    Uses the Token-API /api/habits/today endpoint instead of daily note frontmatter.
+    Fires every 2 hours (debounced via flag file with 2h TTL).
     Phoenix is MST = UTC-7 (no DST).
     """
+    import time as _time
+
     phoenix_now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(hours=7)
+    current_hour = phoenix_now.hour
 
-    # Only check between 10am and 2pm Phoenix time
-    if not (10 <= phoenix_now.hour < 14):
+    # Only check during waking hours (7am–10pm)
+    if not (7 <= current_hour < 22):
         return None
 
-    # Only remind once per day
+    # Debounce: only fire once every 2 hours
     today = datetime.date.today().isoformat()
-    flag_file = Path(f"/tmp/custodes_habit_reminded_{today.replace('-', '')}.txt")
+    flag_file = Path(f"/tmp/custodes_habit_check_{today.replace('-', '')}.txt")
     if flag_file.exists():
+        try:
+            mtime = os.path.getmtime(flag_file)
+            if _time.time() - mtime < 7200:  # 2 hours
+                return None
+        except Exception:
+            pass
+
+    # Query habits API
+    try:
+        habits_data = _get("/api/habits/today")
+    except Exception as e:
+        print(f"  Warning: habits API unreachable: {e}", file=sys.stderr)
         return None
 
-    # Read today's daily note
-    note_path = Path(os.path.expanduser(f"~/Token-ENV/Journal/Daily/{today}.md"))
-    if not note_path.exists():
+    habits = habits_data.get("habits", [])
+    if not habits:
         return None
 
-    content = note_path.read_text()
+    # Find overdue habits: window has started, not completed
+    overdue = []
+    for h in habits:
+        if h.get("completed"):
+            continue
+        window_start = h.get("window_start_hour", 24)
+        window_end = h.get("window_end_hour", 0)
+        if current_hour >= window_start and current_hour < window_end:
+            overdue.append(h.get("name", h.get("id", "unknown")))
 
-    # Only check if YAML frontmatter exists — conservative, skip if no structure
-    if not content.startswith("---"):
+    if not overdue:
         return None
 
-    parts = content.split("---", 2)
-    if len(parts) < 3:
-        return None
-    frontmatter = parts[1]
+    # Write flag file
+    try:
+        flag_file.write_text(datetime.datetime.now().isoformat())
+    except Exception:
+        pass
 
-    # Morning habit fields: teeth_brush_morning and breakfast are the core AM indicators
-    has_unchecked = (
-        "teeth_brush_morning: false" in frontmatter
-        or "breakfast: false" in frontmatter
+    summary = habits_data.get("summary", {})
+    done = summary.get("completed", 0)
+    total = summary.get("total", len(habits))
+    habit_names = ", ".join(overdue[:4])
+    urgency = "still pending" if current_hour < 12 else "getting late"
+
+    return (
+        f"Habits ({done}/{total}): **{habit_names}** {urgency} "
+        f"({phoenix_now.strftime('%H:%M')} MST). Did you get to those?"
     )
-    has_checked = (
-        "teeth_brush_morning: true" in frontmatter
-        or "breakfast: true" in frontmatter
-        or "movement: true" in frontmatter
-    )
-
-    if has_unchecked and not has_checked:
-        flag_file.touch()
-        return (
-            f"It's {phoenix_now.strftime('%H:%M')} — morning habits in today's note "
-            f"still unchecked. Worth a quick review before the day gets away."
-        )
-
-    return None
 
 
 def check_break_nudge(metrics: dict) -> str | None:
@@ -443,10 +457,66 @@ def check_instance_zero(metrics: dict) -> tuple[str | None, str | None]:
     return None, None
 
 
+def check_morning_greeting(metrics: dict) -> str | None:
+    """Post a morning greeting on the first heartbeat of the day (7am+ Phoenix time).
+    Creates the daily thread as a side effect. Only fires once per day via flag file.
+    """
+    phoenix_now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(hours=7)
+
+    # Only fire from 7am onward
+    if phoenix_now.hour < 7:
+        return None
+
+    today = datetime.date.today().isoformat()
+    flag_file = Path(f"/tmp/custodes_morning_greeting_{today.replace('-', '')}.txt")
+    if flag_file.exists():
+        return None
+
+    # This is the first heartbeat of the day — create the daily thread
+    thread_id = get_or_create_daily_thread()
+
+    # Build a brief morning status
+    active = metrics.get("active_count", 0)
+    cron = metrics.get("cron_count", 0)
+    mode = metrics.get("effective_mode", "unknown")
+
+    # Check overnight fleet activity
+    try:
+        fleet_state = _get("/api/fleet/state")
+        last_fg = fleet_state.get("last_fg_run", "unknown")
+        notes = fleet_state.get("notes", [])
+        fleet_note = notes[0][:120] if notes else "No fleet notes."
+    except Exception:
+        last_fg = "unknown"
+        fleet_note = "Fleet state unavailable."
+
+    # Check habits summary
+    try:
+        habits_data = _get("/api/habits/today")
+        summary = habits_data.get("summary", {})
+        total_habits = summary.get("total", 0)
+    except Exception:
+        total_habits = 0
+
+    flag_file.touch()
+
+    greeting = (
+        f"Good morning, Emperor. Custodes online — {phoenix_now.strftime('%H:%M')} MST.\n\n"
+        f"Fleet: {active} manual + {cron} cron instances. Mode: {mode}.\n"
+        f"Last FG run: {last_fg[:16] if last_fg != 'unknown' else 'unknown'}\n"
+    )
+    if total_habits > 0:
+        greeting += f"Habits: 0/{total_habits} — tracking begins.\n"
+    if fleet_note:
+        greeting += f"\nFleet note: {fleet_note}"
+
+    return greeting
+
+
 def log_to_daily_note(summary: str):
     today = datetime.date.today().isoformat()
     note_path = os.path.expanduser(
-        f"~/Token-ENV/Journal/Daily/{today}.md"
+        f"~/Imperium-ENV/Terra/Journal/{today}.md"
     )
     timestamp = datetime.datetime.now().strftime("%H:%M")
     line = f"\n- [{timestamp}] Custodes heartbeat: {summary} — ROUTINE\n"
@@ -475,6 +545,17 @@ def main():
         f"processing={metrics['processing_count']}"
     )
     print(f"State: {summary}")
+
+    # 1b. Morning greeting — first heartbeat of the day, creates daily thread
+    morning = check_morning_greeting(metrics)
+    if morning:
+        print(f"  Morning greeting: posting to daily thread")
+        send_discord_thread(f"Custodes: {morning}")
+        # Also post a brief pointer to #briefing
+        send_discord(
+            f"Good morning, Emperor. Daily thread is live. Overnight report in #fleet.",
+            channel=BRIEFING_CHANNEL,
+        )
 
     # 2. Break nudge — unconditional, fires independently of INTERESTING evaluation
     nudge = check_break_nudge(metrics)
