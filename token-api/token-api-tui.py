@@ -887,7 +887,6 @@ def create_instances_table(instances: list, selected_idx: int) -> Table:
 def create_mobile_instances_table(instances: list, selected_idx: int) -> Table:
     """Create a compact instances table for mobile."""
     table = Table(
-        title="Instances [dim](jk r s d c o q)[/dim]",
         show_header=True,
         header_style="bold cyan",
         border_style="blue",
