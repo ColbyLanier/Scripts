@@ -10,6 +10,7 @@ and appends a blurb to the linked session doc (if any).
 """
 
 import json
+import os
 import re
 import sys
 import glob
@@ -469,6 +470,134 @@ def append_to_session_doc(file_path, blurb):
 
 
 # ---------------------------------------------------------------------------
+# Daily note fallback
+# ---------------------------------------------------------------------------
+
+def append_to_daily_note(blurb):
+    """Append blurb to today's daily note in Imperium-ENV vault."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    daily_note_path = f"Terra/Journal/{today}.md"
+    cmd = ["obsidian", "vault=Imperium-ENV", "append",
+           f"path={daily_note_path}", f"content=\n{blurb}\n"]
+    print(f"[daily-note] appending to {daily_note_path}", file=sys.stderr)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if result.returncode == 0:
+            print(f"[ok] Appended blurb to daily note: {daily_note_path}", file=sys.stderr)
+            return True
+        else:
+            print(f"[warn] Daily note append failed: {result.stderr}", file=sys.stderr)
+            return False
+    except Exception as e:
+        print(f"[warn] Daily note append failed: {e}", file=sys.stderr)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Transcript compaction (AI — removes failed attempts)
+# ---------------------------------------------------------------------------
+
+def compact_transcript(events, session_id: str) -> str | None:
+    """Use MiniMax to produce a compact markdown summary, removing failed attempts.
+
+    Differs from summarize_with_guardsman() which gives 2-3 sentences.
+    This returns a structured doc suitable for a session doc activity log.
+    """
+    transcript = render_transcript(events)
+    prompt = (
+        "You are a session historian for an AI coding agent. "
+        "Summarize this Claude Code session transcript into a structured markdown document. "
+        "IMPORTANT: Remove failed implementation attempts — only describe the working approach "
+        "that was actually completed or finalized. Remove retry loops, abandoned paths, and "
+        "debugging noise that went nowhere. "
+        "Output exactly this structure:\n"
+        "## What Was Accomplished\n"
+        "<3-5 bullet points of concrete outcomes>\n\n"
+        "## Files Changed\n"
+        "<list of files modified or created, one per line>\n\n"
+        "## Approach\n"
+        "<2-3 sentences describing the method that actually worked>\n\n"
+        f"Session transcript:\n{transcript[:6000]}"
+    )
+    try:
+        result = subprocess.run(
+            ["openclaw", "agent", "--agent", "main",
+             "--session-id", f"stop-hook-compact-{session_id[:8]}",
+             "-m", prompt, "--local", "--json"],
+            capture_output=True, text=True, timeout=90
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            text = data.get("payloads", [{}])[0].get("text", "").strip()
+            if text:
+                return text
+    except Exception as e:
+        print(f"[warn] compact_transcript failed: {e}", file=sys.stderr)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Servitor swarm session doc creation
+# ---------------------------------------------------------------------------
+
+def create_session_doc_from_transcript(session_id, jsonl_path, events, instance):
+    """Create a session doc from a raw transcript using MiniMax compaction.
+
+    Returns the new doc_id on success, None on failure.
+    """
+    tab_name = instance.get("tab_name", session_id[:8]) if instance else session_id[:8]
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    print(f"[session-doc] compacting transcript for '{tab_name}'...", file=sys.stderr)
+    compact = compact_transcript(events, session_id)
+    if not compact:
+        print(f"[warn] compact_transcript returned nothing — skipping session doc creation", file=sys.stderr)
+        return None
+
+    # Build Obsidian note
+    note_title = f"{today}-{tab_name}"
+    note_path = f"Terra/Sessions/{note_title}.md"
+    note_content = (
+        f"# {tab_name}\n\n"
+        f"**Session**: {session_id[:8]}\n"
+        f"**Date**: {today}\n"
+        f"**Auto-generated**: yes (Administratum servitor)\n\n"
+        f"## Activity Log\n\n"
+        f"{compact}\n"
+    )
+
+    obs_cmd = ["obsidian", "vault=Imperium-ENV", "create",
+               f"path={note_path}", f"content={note_content}"]
+    print(f"[session-doc] creating Obsidian note: {note_path}", file=sys.stderr)
+    try:
+        result = subprocess.run(obs_cmd, capture_output=True, text=True, timeout=15)
+        if result.returncode != 0:
+            print(f"[warn] obsidian create failed: {result.stderr}", file=sys.stderr)
+            return None
+    except Exception as e:
+        print(f"[warn] obsidian create failed: {e}", file=sys.stderr)
+        return None
+
+    # Register with token-api
+    file_path = f"/Users/tokenclaw/Imperium-ENV/{note_path}"
+    payload = json.dumps({"title": tab_name, "file_path": file_path})
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "-X", "POST", "http://localhost:7777/api/session-docs",
+             "-H", "Content-Type: application/json", "-d", payload],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            doc_id = data.get("id")
+            print(f"[ok] Created session doc {doc_id}: {note_path}", file=sys.stderr)
+            return doc_id
+    except Exception as e:
+        print(f"[warn] session doc registration failed: {e}", file=sys.stderr)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -514,26 +643,8 @@ def main():
     print(transcript)
     print("=" * 70)
 
-    # Resolve session doc
+    # Resolve session doc and build blurb
     instance = find_instance_for_session(session_id)
-    if not instance:
-        print(f"\n[info] No instance found for session {session_id} — skipping session doc", file=sys.stderr)
-        return
-
-    doc_id = instance.get("session_doc_id")
-    if not doc_id:
-        print(f"\n[info] Instance '{instance.get('tab_name')}' has no session doc linked", file=sys.stderr)
-        return
-
-    session_doc = fetch_session_doc(doc_id)
-    if not session_doc:
-        print(f"\n[info] Could not fetch session doc {doc_id}", file=sys.stderr)
-        return
-
-    file_path = session_doc.get("file_path", "")
-    print(f"\n[info] Session doc: {file_path}", file=sys.stderr)
-
-    # Build blurb
     blurb = build_blurb(session_id, events, instance)
     print("\n" + "=" * 70)
     print("BLURB TO APPEND:")
@@ -541,7 +652,29 @@ def main():
     print(blurb)
     print("=" * 70)
 
-    # Append to session doc
+    if not instance:
+        print(f"\n[info] No instance found for session {session_id} — appending to daily note", file=sys.stderr)
+        append_to_daily_note(blurb)
+        return
+
+    doc_id = instance.get("session_doc_id")
+    if not doc_id:
+        print(f"\n[info] Instance '{instance.get('tab_name')}' has no session doc — appending to daily note", file=sys.stderr)
+        append_to_daily_note(blurb)
+        if os.path.getsize(jsonl_path) > 5000:
+            create_session_doc_from_transcript(session_id, jsonl_path, events, instance)
+        return
+
+    session_doc = fetch_session_doc(doc_id)
+    if not session_doc:
+        print(f"\n[info] Could not fetch session doc {doc_id} — appending to daily note", file=sys.stderr)
+        append_to_daily_note(blurb)
+        return
+
+    file_path = session_doc.get("file_path", "")
+    print(f"\n[info] Session doc: {file_path}", file=sys.stderr)
+
+    # Append to session doc (existing flow)
     success = append_to_session_doc(file_path, blurb)
     if success:
         print(f"\n[ok] Appended blurb to session doc: {file_path}", file=sys.stderr)
