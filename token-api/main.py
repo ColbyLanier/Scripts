@@ -385,12 +385,17 @@ class PhoneActivityResponse(BaseModel):
 
 
 class PhoneSystemEventRequest(BaseModel):
-    """Request from MacroDroid for phone system events (Shizuku, boot, heartbeat, telemetry)."""
-    event: str  # "shizuku_died", "shizuku_restored", "device_boot", "heartbeat", "app_open", "app_close", "discord_fallback_received"
+    """Request from MacroDroid for phone system events (Shizuku, boot, heartbeat, telemetry).
+
+    Supports two formats:
+      Full:    {"event": "app_open", "app": "Application Launched (X)"}
+      Minimal: {"app": "Application Launched (X)"}  (event inferred from trigger name)
+    """
+    event: Optional[str] = None  # Optional — inferred from trigger name if absent
     time: Optional[str] = None
     server: Optional[str] = None  # heartbeat: server response code
     shizuku_dead: Optional[str] = None  # heartbeat: current shizuku state
-    app: Optional[str] = None  # app_open/app_close: package name (e.g. "com.twitter.android")
+    app: Optional[str] = None  # trigger name (e.g. "Application Launched (X)")
     notification: Optional[str] = None  # discord_fallback_received: original notification text
 
 
@@ -5074,8 +5079,22 @@ async def handle_phone_system_event(request: PhoneSystemEventRequest):
     - device_boot: Phone rebooted
     - heartbeat: Periodic health check
     """
-    event = request.event
     now = datetime.now().isoformat()
+
+    # Infer event from trigger name if not provided
+    # Minimal format: {"app": "Application Launched (X)"} — no event field needed
+    event = request.event
+    if not event and request.app:
+        raw_lower = request.app.lower()
+        if "launched" in raw_lower:
+            event = "app_open"
+        elif "closed" in raw_lower:
+            event = "app_close"
+        else:
+            event = "app_telemetry"
+
+    if not event:
+        return {"received": True, "error": "no event or app field"}
 
     await log_event(f"phone_{event}", device_id="phone", details={
         "time": request.time,
@@ -5084,12 +5103,12 @@ async def handle_phone_system_event(request: PhoneSystemEventRequest):
         "shizuku_dead": request.shizuku_dead,
     })
 
-    # ---- v2 Telemetry: app_open / app_close / app_telemetry ----
-    # All three formats supported:
-    #   {"event": "app_open",  "app": "Application Launched (X)"}  — action from event type
-    #   {"event": "app_close", "app": "Application Closed (X)"}   — action from event type
-    #   {"event": "app_telemetry", "app": "Application Launched (X)"} — action from trigger name
-    # The trigger name always encodes both the app and open/close distinction.
+    # ---- v2 Telemetry ----
+    # Accepts any of:
+    #   {"event": "app_open", "app": "Application Launched (X)"}
+    #   {"app": "Application Launched (X)"}  (event inferred)
+    #   {"app": "Application Closed (X)"}    (event inferred)
+    # The trigger name encodes both the app and open/close distinction.
     if event in ("app_open", "app_close", "app_telemetry"):
         raw_app = request.app or ""
         app_key, trigger_action = parse_macrodroid_trigger(raw_app)
