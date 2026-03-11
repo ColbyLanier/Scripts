@@ -10,9 +10,6 @@ description: "Report app closes to server via /phone/event"
 enabled: true
 
 variables:
-  - name: app_name
-    type: string
-    value: ""
   - name: response_code
     type: integer
     value: 0
@@ -25,23 +22,16 @@ triggers:
     launched: false
 
 actions:
-  # Identify which app triggered
-  - type: set_variable
-    name: "app_name"
-    value: "{trigger_app_package}"
-    var_type: string
-    local: true
-
   # Log
   - type: shell
-    command: 'mkdir -p /storage/emulated/0/MacroDroid/logs && echo "{system_time} INFO app-close TRIGGERED app={lv=app_name}" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    command: 'mkdir -p /storage/emulated/0/MacroDroid/logs && echo "{system_time} INFO app-close TRIGGERED app=twitter" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
     block: false
 
-  # Report to server
+  # Report to server (hardcoded for MVP — one trigger = one app)
   - type: http_request
     url: "http://100.95.109.23:7777/phone/event"
     method: POST
-    body: '{"event": "app_close", "app": "{lv=app_name}"}'
+    body: '{"event": "app_close", "app": "com.twitter.android"}'
     content_type: "application/json"
     code_var: "response_code"
     block_next: true
@@ -49,5 +39,5 @@ actions:
 
   # Log result
   - type: shell
-    command: 'echo "{system_time} INFO app-close HTTP code={lv=response_code} app={lv=app_name}" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
+    command: 'echo "{system_time} INFO app-close HTTP code={lv=response_code}" >> /storage/emulated/0/MacroDroid/logs/telemetry.log'
     block: false
