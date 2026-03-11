@@ -5120,12 +5120,15 @@ async def handle_phone_system_event(request: PhoneSystemEventRequest):
     if not event:
         return {"received": True, "error": "no event or app field"}
 
-    await log_event(f"phone_{event}", device_id="phone", details={
-        "time": request.time,
-        "app": request.app,
-        "server": request.server,
-        "shizuku_dead": request.shizuku_dead,
-    })
+    # Log non-app events here; app open/close are logged downstream by handle_phone_activity
+    # with richer details (phone_app_closed, phone_distraction_allowed, phone_distraction_blocked)
+    if event not in ("app_open", "app_close", "app_telemetry"):
+        await log_event(f"phone_{event}", device_id="phone", details={
+            "time": request.time,
+            "app": request.app,
+            "server": request.server,
+            "shizuku_dead": request.shizuku_dead,
+        })
 
     # ---- App telemetry (open/close) ----
     if event in ("app_open", "app_close", "app_telemetry") and parsed["type"] == "app":
@@ -8987,6 +8990,32 @@ async def receive_discord_message(request: DiscordMessageRequest):
     author_name = request.author.get("username", "unknown") if request.author else "unknown"
     author_id = request.author.get("id") if request.author else None
 
+    # --- Phone fallback: token-ping couldn't reach server, relayed via Discord ---
+    # Format from token-ping: "POST phone/event {'app':'Application Launched (X)'}"
+    # Skip discord_message log for fallback — downstream app event captures it
+    if request.channel_name == "fallback":
+        content = request.content or ""
+        # Extract and replay as /phone/event
+        import re
+        m = re.search(r"phone/event\s+['\"{]", content)
+        if m:
+            body_start = content.find("{", m.start())
+            if body_start >= 0:
+                raw_body = content[body_start:].strip().rstrip("}") + "}"
+                raw_body = raw_body.replace("'", '"')
+                try:
+                    import json as _json
+                    body = _json.loads(raw_body)
+                    app_raw = body.get("app", "")
+                    if app_raw:
+                        req = PhoneSystemEventRequest(app=app_raw)
+                        result = await handle_phone_system_event(req)
+                        logger.info(f"Fallback replayed: {app_raw} -> {result}")
+                except Exception as e:
+                    logger.warning(f"Fallback parse failed: {e} | raw={raw_body[:200]}")
+        return {"received": True, "message_id": request.message_id, "fallback_processed": True}
+
+    # Log non-fallback Discord messages
     await log_event("discord_message", device_id="discord", details={
         "channel_id": request.channel_id,
         "channel_name": request.channel_name,
@@ -9000,48 +9029,6 @@ async def receive_discord_message(request: DiscordMessageRequest):
     })
 
     logger.info(f"Discord [{request.channel_name or request.channel_id}] {author_name}: {request.content[:80]}")
-
-    # --- Phone fallback: token-ping couldn't reach server, relayed via Discord ---
-    # Format from token-ping: "POST phone/event {'app':'Application Launched (X)'}"
-    # Format from v2-telemetry: "FALLBACK: Application Launched (X) (code=0)"
-    if request.channel_name == "fallback":
-        content = request.content or ""
-        logger.info(f"DISCORD FALLBACK RECEIVED: {content[:200]}")
-        await log_event("phone_discord_fallback_received", device_id="phone", details={
-            "content": content[:500],
-            "channel": "fallback",
-            "message_id": request.message_id,
-        })
-        # Try to extract and replay as /phone/event
-        import re
-        # Match: POST phone/event {'app':'...'} or {"app":"..."}
-        m = re.search(r"(?:POST\s+)?phone/event\s+['\"{]", content)
-        if m:
-            # Extract the JSON-like body
-            body_start = content.find("{", m.start())
-            if body_start >= 0:
-                raw_body = content[body_start:].strip().rstrip("}")  + "}"
-                # Normalize single quotes to double quotes for JSON
-                raw_body = raw_body.replace("'", '"')
-                try:
-                    import json as _json
-                    body = _json.loads(raw_body)
-                    app_raw = body.get("app", "")
-                    if app_raw:
-                        req = PhoneSystemEventRequest(app=app_raw)
-                        result = await handle_phone_system_event(req)
-                        logger.info(f"DISCORD FALLBACK REPLAYED: {app_raw} -> {result}")
-                except Exception as e:
-                    logger.warning(f"DISCORD FALLBACK PARSE FAILED: {e} | raw={raw_body[:200]}")
-        # Also try: "FALLBACK: Application Launched (X) (code=N)"
-        elif content.startswith("FALLBACK:"):
-            trigger = content.split("FALLBACK:")[1].strip()
-            trigger = re.sub(r"\s*\(code=\d+\)\s*$", "", trigger)
-            if trigger:
-                req = PhoneSystemEventRequest(app=trigger)
-                result = await handle_phone_system_event(req)
-                logger.info(f"DISCORD FALLBACK REPLAYED: {trigger} -> {result}")
-        return {"received": True, "message_id": request.message_id, "fallback_processed": True}
 
     # --- Discord response routing ---
     # Never respond to bots (loop prevention)

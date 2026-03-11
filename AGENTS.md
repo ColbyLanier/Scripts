@@ -43,9 +43,9 @@ Scripts/
 
 ### Discord Daemon (port 7779)
 
-**Location**: `~/.discord-cli/`
+**Location**: `~/Scripts/discord-daemon/` (code), `~/.discord-cli/` (config, logs, pending)
 **Service**: LaunchAgent `ai.tokenclaw.discord` (KeepAlive)
-**Logs**: `~/.discord-cli/logs/`
+**Logs**: `~/.discord-cli/logs/` (also `launchd-stdout.log` for console output)
 
 Standalone Discord WebSocket daemon (discord.js v14) replacing OpenClaw's Discord gateway. Subscribes to ALL messages in 9 TokenClaw guild channels + operator DMs — no ping/mention required.
 

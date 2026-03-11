@@ -167,11 +167,11 @@ curl http://100.102.92.24:7777/logs  # last 200 lines via HTTP
 ## YAML Sources
 
 v2 specs in `~/Scripts/mobile/macros/`:
-- `v2-app-open.yaml` — App Open (hardcoded body now superseded by trigger_that_fired on phone)
-- `v2-app-close.yaml` — App Close
 - `v2-discord-fallback.yaml` — Discord Fallback v2
 - `v2-enforce-cascade.yaml` — Enforce Cascade v2
-- `test-discord-fallback.yaml` — Test macro (superseded)
+
+**Deleted** (superseded by consolidated phone macros, never imported):
+- `v2-app-open.yaml`, `v2-app-close.yaml`, `v2-telemetry.yaml`
 
 Legacy v1 specs preserved for reference (no longer deployed):
 - `twitter-open.yaml`, `twitter-close.yaml`, `enforce.yaml`, etc.
