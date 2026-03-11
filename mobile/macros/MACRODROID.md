@@ -1,144 +1,180 @@
 # MacroDroid Macro Inventory
 
-Current state of macros deployed to the phone.
+Current state of macros deployed to the phone. Last updated 2026-03-11 (v2 — Shizuku-free).
+
+**Archive:** Pre-v2 backup at `archive/pre-v2-shizuku-era-2026-03-10.mdr`
 
 ## Summary
 
-- **Total Macros:** 35
-- **Enabled:** 33
-- **Disabled:** 2 (Twitter Management, Games Management - local fallback only)
-- **Logging:** All telemetry/geofence/enforce/heartbeat macros log to `/storage/emulated/0/MacroDroid/logs/telemetry.log`
+- **Total Macros:** 23
+- **Enabled:** 21
+- **Disabled:** 2 (Test Discord Fallback, Button)
+- **Endpoint:** All phone HTTP endpoints run on MacroDroid HTTP server, port 7777
+- **Logging:** Telemetry macros log to `/storage/emulated/0/MacroDroid/logs/telemetry.log`
 
 ## Global Variables
 
 | Variable | Type | Purpose |
 |----------|------|---------|
-| `yt_bg` | bool | YouTube background playback active (PiP/audio) |
-| `Connection` | bool | Server connectivity state |
-| `Revanced` | bool | ReVanced variant tracking |
+| `yt_bg` | bool | YouTube background playback active (PiP/audio-only) |
 
-## Telemetry (9 macros)
+## Telemetry (2 macros)
 
-Report app events to server at `POST /phone`.
+Unified open/close macros. Each has N triggers (one per monitored app). Body is the raw MacroDroid trigger name — no hardcoded package names.
 
-| Macro | Trigger | POST Body | Notes |
-|-------|---------|-----------|-------|
-| Twitter Open | X app opened | `{"app": "twitter", "action": "open"}` | Fallback on server error |
-| Twitter Close | X app closed | `{"app": "twitter", "action": "close"}` | |
-| YouTube Open | YouTube opened | `{"app": "youtube", "action": "open"}` | Clears `yt_bg`, fallback + reconnect logic |
-| YouTube Close | YouTube closed | `{"app": "youtube", "action": "close"}` | PiP detection: if music playing, sets `yt_bg=true` and waits |
-| Youtube Play | Music starts (bg) | (runs YouTube Open) | Constraint: `yt_bg==true` |
-| Youtube Pause | Music stops (bg) | (runs YouTube Close) | Constraint: `yt_bg==true` |
-| Games Open | Game opened | `{"app": "game", "action": "open"}` | Fallback on server error |
-| Games Close | Game closed | `{"app": "game", "action": "close"}` | |
-| Spotify open | Spotify opened | (clears `yt_bg`) | New media source takes over |
+| Macro | Triggers | POST Body | Endpoint |
+|-------|----------|-----------|----------|
+| App Open | X, YouTube, YouTube Revanced, games, Snapchat, etc. | `{"app": "{trigger_that_fired}"}` | `POST /phone/event` |
+| App Close | Same apps | `{"app": "{trigger_that_fired}"}` | `POST /phone/event` |
 
-**YouTube PiP/Background Detection:**
-When YouTube leaves foreground, if music is still playing (PiP or background audio), the Close macro sets `yt_bg=true` and waits for music to stop. The Play/Pause macros use `MusicPlaying` trigger + `yt_bg` constraint to re-report open/close events during background playback.
+**Trigger name format** (what `{trigger_that_fired}` produces):
+- `Application Launched (X)` → server parses as `twitter`, action `open`
+- `Application Closed (YouTube)` → server parses as `youtube`, action `close`
 
-**Fallback behavior:** If server returns non-200 on open, triggers local management. If server reconnects (Connection==response_code), disables local fallback.
+**Fallback:** If server returns non-200, macro posts same body to Discord #fallback webhook directly.
 
-## Geofence (4 macros)
+**Server-side map** (`MACRODROID_TRIGGER_APP_MAP` in `token-api/main.py`):
+```
+"x" → "twitter"
+"youtube" → "youtube"
+"thronefall" / "slice & dice" / etc. → "game"
+"spotify" → "spotify"
+```
 
-Report location events to server.
+### YouTube Background Audio (`yt_bg`)
 
-| Macro | Trigger | POST Body |
-|-------|---------|-----------|
-| Geofence Home Enter | Enter Home (20m) | `{"location": "home", "action": "enter"}` |
-| Geofence Home Exit | Exit Home | `{"location": "home", "action": "exit"}` |
-| Geofence Gym Enter | Enter Gym (150m) | `{"location": "gym", "action": "enter"}` |
-| Geofence Gym Exit | Exit Gym | `{"location": "gym", "action": "exit"}` |
+YouTube playing audio in the background (PiP / audio-only) is tracked separately. When YouTube leaves the foreground and music is still playing, `yt_bg` is set to `true`. Music start/stop events with `yt_bg==true` re-report open/close. Spotify opening clears `yt_bg` (new media source takes over).
+
+## Token-Ping (1 macro)
+
+Local HTTP relay for macro parameterization. MacroDroid's `run_macro` action doesn't support passing parameters. Token-Ping solves this: any macro can call another macro with parameters by hitting a local HTTP endpoint.
+
+| Macro | Endpoint | Purpose |
+|-------|----------|---------|
+| Token-Ping | `/Token-Ping` | Receives `endpoint`, `method`, body via query params + POST body; forwards to Token-API; falls back to Discord webhook on failure |
+
+**Pattern:**
+```
+Caller: HTTP GET/POST → localhost:7777/Token-Ping?endpoint=/phone/event&method=POST
+        POST body = {"app": "Application Launched (X)"}
+
+Token-Ping: reads {http_param=endpoint}, {http_param=method}, {http_request_body}
+            → forwards to Token-API
+            → on failure: posts to Discord #fallback webhook
+```
+
+## Enforcement (2 macros)
+
+| Macro | Endpoint | Purpose |
+|-------|----------|---------|
+| Enforce Cascade v2 | `/enforce?level=<1-5>&app=<name>` | Server-pushed escalation, no Shizuku |
+| Discord Fallback v2 | (notification trigger) | Detects Discord notification containing `POST /phone/enforce`, relays to localhost |
+
+### Enforce Cascade v2
+
+Levels triggered by Token-API on a timer. Cascade stops when `app_close` telemetry received.
+
+| Level | Action |
+|-------|--------|
+| 1 | Persistent notification + vibrate |
+| 2 | Loud notification + vibrate + TTS "Close the app now" |
+| 3 | Notification spam (3×) + vibrate + TTS "Final warning" |
+| 4 | Launch Spotify + play (dopamine redirect) |
+| 5 | Pavlok zap via Termux:Tasker `pavlok.sh zap 30` |
+
+### Discord Fallback v2
+
+Trigger: Discord app notification containing `POST /phone/enforce`.
+
+Flow:
+1. Notification received from Discord
+2. Shell script parses `level` and `app` from notification text
+3. `curl localhost:7777/enforce?level=N&app=X`
+4. ACK: `POST /phone/event {"event": "discord_fallback_received"}`
+
+**Security:** Only `POST /phone/enforce` messages are relayed. No arbitrary execution.
+
+## Geofence (6 macros)
+
+Location entry/exit events. Post via Token-Ping pattern to Token-API `/phone/event`. Server parses trigger name and routes to `/api/location` internally.
+
+| Macro | Trigger | Trigger Name Sent |
+|-------|---------|-------------------|
+| Geofence Home Enter | Enter Home zone | `Geofence Entry (Home)` |
+| Geofence Home Exit | Exit Home zone | `Geofence Exit (Home)` |
+| Geofence Gym Enter | Enter Gym zone | `Geofence Entry (Gym)` |
+| Geofence Gym Exit | Exit Gym zone | `Geofence Exit (Gym)` |
+| Campus Enter | Enter Campus zone | `Geofence Entry (Campus)` |
+| Campus Exit | Exit Campus zone | `Geofence Exit (Campus)` |
 
 **Geofence IDs:**
-- Home: `1e4e4f0d-...` (33.41694, -111.92196) r=20m
+- Home: `1e4e4f0d-ccd8-40a2-b84a-6027a2843cb8` (33.41694, -111.92196) r=20m
 - Gym: `7fa61f1d-fcc7-4ffc-8b83-0e5b6ba0e0dd` (33.42584, -111.91496) r=150m
 
-## Enforcement (7 macros)
-
-| Macro | Status | Purpose |
-|-------|--------|---------|
-| Enforce | ✓ | Server-pushed enable/disable via HTTP `/enforce` |
-| Enable Local Fallback | ✓ | Enable local management macros |
-| Disable Local Fallback | ✓ | Disable local management (server back) |
-| Twitter Management | ✗ | Local fallback enforcement for X |
-| Games Management | ✗ | Local fallback enforcement for games |
-| Youtube Enable | ✓ | Enable YouTube apps |
-| Youtube Disable | ✓ | Disable YouTube apps |
-
-### Enforce Endpoint
-
-Accepts `?action=disable&app=<name>` or `?action=enable&app=<name>`:
-- `app=twitter` → X (com.twitter.android)
-- `app=youtube` → YouTube + ReVanced (com.google.android.youtube, app.revanced.android.youtube)
-- `app=game` → Thronefall, Slice & Dice, 20 Minutes Till Dawn, OneBit Adventure
-
-## Endpoints (3 macros)
+## Endpoints (4 macros)
 
 | Macro | Endpoint | Purpose |
 |-------|----------|---------|
-| Claude notifications | `/notify` | Show notification with vibrate |
-| Heartbeat | `/heartbeat` | Server reachability check (returns status JSON) |
-| Server Poll | Every 10min | GET /health, disables local fallback if server is up |
+| Heartbeat | `/heartbeat` | Reachability check, returns status JSON |
+| /notify | `/notify?notification_text=X&tts_text=Y` | Show notification + speak TTS |
+| List Exports API | `/list-exports` | Export .mdr and respond with file list |
+| sshd | (boot trigger) | Start Termux sshd on boot |
 
-## Automation (2 macros)
+### /notify
 
-| Macro | Endpoint | Purpose |
-|-------|----------|---------|
-| List Exports API | `/list-exports` | Export .mdr and respond |
-| Pavlok Endpoint | `/pavlok` | Trigger Pavlok stimulus |
+```
+GET /notify?notification_text=Close+the+app&tts_text=Close+the+app+now
+```
+Both params optional. `notification_text` shown on screen (keep short). `tts_text` spoken by MacroDroid TTS engine.
 
-## System (3 macros)
+## System (2 macros)
 
 | Macro | Trigger | Purpose |
 |-------|---------|---------|
-| Boot Start SSHD | Device boot | Start Termux sshd via Termux:Tasker plugin |
-| Log Viewer | HTTP `/logs` | Serve last 200 lines of telemetry log |
-| Log Rotate | Daily 3 AM | Trim telemetry.log to 1000 lines if >2000 |
+| Boot Startup | Device boot | Start sshd, notify user |
+| Phone Health | Every 15 min | POST heartbeat to server |
 
-## Telemetry Logging
+## Audio / Misc (7 macros)
 
-All telemetry, geofence, enforce, and heartbeat macros append structured log lines via shell actions.
+| Macro | Purpose |
+|-------|---------|
+| BT Disconnect XM5 | HTTP `/bt-disconnect` — disconnect WF-1000XM5 |
+| Change song ⏮️⏭️ | Swipe gestures — next/prev track on locked screen |
+| Zappa | (media control) |
+| Claude notifications | Notification forwarding to server |
+| Potential bluetooth device priority | Placeholder (blocked by BT permissions) |
+| Test Discord Fallback ✗ | Send test enforcement message to webhook — disabled after testing |
+| Button ✗ | Test macro — disabled |
 
-**Log file:** `/storage/emulated/0/MacroDroid/logs/telemetry.log`
+## Telemetry Log
 
-**Format:** `<unix_epoch> <LEVEL> <macro-name> <EVENT> [detail]`
+**File:** `/storage/emulated/0/MacroDroid/logs/telemetry.log`
 
-**Examples:**
 ```
-1740067200 INFO twitter-open TRIGGERED
-1740067200 INFO twitter-open HTTP_RESULT code=200
-1740067200 WARN twitter-open FALLBACK server_unreachable
-1740067200 INFO enforce RECEIVED action=disable app=twitter
-1740067200 INFO heartbeat PING
-1740067200 INFO geofence-home ENTER
-1740067200 INFO log-rotate ROTATED from=2500 to=1000
+{system_time} INFO app-open TRIGGERED app=twitter
+{system_time} INFO app-open HTTP code=200
+{system_time} INFO app-close TRIGGERED app=youtube
+{system_time} INFO discord-fallback TRIGGERED notif=POST /phone/enforce {...}
+{system_time} INFO enforce-cascade TRIGGERED level=2 app=twitter
 ```
 
-**Retrieval:**
+**Access:**
 ```bash
-# Via SSH
-sshp "tail -50 /storage/emulated/0/MacroDroid/logs/telemetry.log"
-
-# Via HTTP endpoint (last 200 lines)
-curl http://<phone-ip>:7777/logs
+ssh-phone "tail -50 /storage/emulated/0/MacroDroid/logs/telemetry.log"
+curl http://100.102.92.24:7777/logs  # last 200 lines via HTTP
 ```
 
-## Music & Audio (2 macros)
+## YAML Sources
 
-| Macro | Trigger | Purpose |
-|-------|---------|---------|
-| Change song | Swipe gestures | Next/prev track on locked screen |
-| Spotify start | - | Auto-start Spotify |
+v2 specs in `~/Scripts/mobile/macros/`:
+- `v2-app-open.yaml` — App Open (hardcoded body now superseded by trigger_that_fired on phone)
+- `v2-app-close.yaml` — App Close
+- `v2-discord-fallback.yaml` — Discord Fallback v2
+- `v2-enforce-cascade.yaml` — Enforce Cascade v2
+- `test-discord-fallback.yaml` — Test macro (superseded)
 
-## Uncategorized / Test (5 macros)
-
-| Macro | Notes |
-|-------|-------|
-| Youtube Toggle | Toggle YouTube state |
-| Twitter | Test/legacy |
-| Tele | Test macro (media button trigger) |
-| Hello worl | Test macro |
-| Bluetooth priority | Placeholder (blocked by permissions) |
+Legacy v1 specs preserved for reference (no longer deployed):
+- `twitter-open.yaml`, `twitter-close.yaml`, `enforce.yaml`, etc.
 
 ## App Package References
 
@@ -152,19 +188,3 @@ curl http://<phone-ip>:7777/logs
 | Slice & Dice | `com.com.tann.dice` |
 | 20 Minutes Till Dawn | `com.Flanne.MinutesTillDawn.roguelike.shooting.gp` |
 | OneBit Adventure | `com.GalacticSlice.OneBitAdventure` |
-
-## YAML Sources
-
-All macro specs are in `~/Scripts/mobile/macros/*.yaml` (Mac) or `/home/token/Scripts/mobile/macros/*.yaml` (WSL):
-- `twitter-open.yaml`, `twitter-close.yaml`
-- `youtube-open.yaml`, `youtube-close.yaml`
-- `youtube-play.yaml`, `youtube-pause.yaml`
-- `spotify-open.yaml`
-- `games-open.yaml`, `games-close.yaml`
-- `geofence-home-enter.yaml`, `geofence-home-exit.yaml`
-- `geofence-gym-enter.yaml`, `geofence-gym-exit.yaml`
-- `enforce.yaml`
-- `enable-local-fallback.yaml`, `disable-local-fallback.yaml`
-- `list-exports.yaml`
-- `heartbeat.yaml`, `pavlok.yaml`, `boot-sshd.yaml`
-- `log-viewer.yaml`, `log-rotate.yaml`

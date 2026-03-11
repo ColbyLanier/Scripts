@@ -1434,6 +1434,10 @@ def create_events_panel(events: list) -> Panel:
         "phone_app_closed": ("blue", "📱", "closed"),
         "phone_distraction_allowed": ("yellow", "📱", "allowed"),
         "phone_distraction_blocked": ("red", "📱", "blocked"),
+        "phone_app_open": ("yellow", "📱", "opened"),
+        "phone_app_close": ("blue", "📱", "closed"),
+        "phone_geofence": ("cyan", "📍", "geofence"),
+        "location_event": ("cyan", "📍", "location"),
     }
 
     for event in events:
@@ -1461,12 +1465,29 @@ def create_events_panel(events: list) -> Panel:
                 msg = f"[{color}]{icon}[/{color}] [bold]{display_name}[/bold]: [{color}]{action}[/{color}]"
                 if voice and event_type == "tts_playing":
                     msg += f" [dim]({voice})[/dim]"
-            elif event_type in ("phone_app_closed", "phone_distraction_allowed", "phone_distraction_blocked"):
+            elif event_type in ("phone_app_closed", "phone_distraction_allowed", "phone_distraction_blocked",
+                                "phone_app_open", "phone_app_close"):
                 app_display = details.get("display_name") or details.get("app", "?")
+                # Strip raw trigger prefix for cleaner display
+                for prefix in ("Application Launched (", "Application Closed ("):
+                    if app_display.startswith(prefix) and app_display.endswith(")"):
+                        app_display = app_display[len(prefix):-1]
                 reason = details.get("reason", "")
                 msg = f"[{color}]{icon}[/{color}] [bold]{app_display}[/bold]: [{color}]{action}[/{color}]"
-                if reason and event_type != "phone_app_closed":
+                if reason and event_type not in ("phone_app_closed", "phone_app_close"):
                     msg += f" [dim]({reason})[/dim]"
+            elif event_type in ("phone_geofence", "location_event"):
+                raw = details.get("app", "") or ""
+                location = details.get("location", "")
+                geo_action = details.get("action", "")
+                # Parse raw trigger: "Geofence Entry (Home)" -> "Home enter"
+                if not location:
+                    for prefix in ("Geofence Entry (", "Geofence Exit ("):
+                        if raw.startswith(prefix) and raw.endswith(")"):
+                            location = raw[len(prefix):-1]
+                            geo_action = "enter" if "Entry" in prefix else "exit"
+                geo_color = "green" if geo_action == "enter" else "red"
+                msg = f"[{color}]{icon}[/{color}] [bold]{location or '?'}[/bold]: [{geo_color}]{geo_action}[/{geo_color}]"
             else:
                 msg = f"[{color}]{icon}[/{color}] [bold]{display_name}[/bold]: [{color}]{action}[/{color}]"
 
@@ -1496,6 +1517,10 @@ def create_mobile_events_panel(events: list) -> Panel:
         "phone_app_closed": "[blue]📱[/blue]",
         "phone_distraction_allowed": "[yellow]📱[/yellow]",
         "phone_distraction_blocked": "[red]📱[/red]",
+        "phone_app_open": "[yellow]📱[/yellow]",
+        "phone_app_close": "[blue]📱[/blue]",
+        "phone_geofence": "[cyan]📍[/cyan]",
+        "location_event": "[cyan]📍[/cyan]",
     }
 
     for event in events[:4]:
@@ -1507,9 +1532,24 @@ def create_mobile_events_panel(events: list) -> Panel:
             details = event.get("details", {}) if isinstance(event.get("details"), dict) else {}
             icon = EVENT_ICONS.get(event_type, "[dim].[/dim]")
 
-            # Phone events: show app display name instead of instance name
-            if event_type in ("phone_app_closed", "phone_distraction_allowed", "phone_distraction_blocked"):
+            # Phone events: show app/location display name instead of instance name
+            if event_type in ("phone_app_closed", "phone_distraction_allowed", "phone_distraction_blocked",
+                              "phone_app_open", "phone_app_close"):
                 display_name = details.get("display_name") or details.get("app", "?")
+                for prefix in ("Application Launched (", "Application Closed ("):
+                    if display_name.startswith(prefix) and display_name.endswith(")"):
+                        display_name = display_name[len(prefix):-1]
+                        break
+            elif event_type in ("phone_geofence", "location_event"):
+                raw = details.get("app", "") or ""
+                location = details.get("location", "")
+                geo_action = details.get("action", "")
+                if not location:
+                    for prefix in ("Geofence Entry (", "Geofence Exit ("):
+                        if raw.startswith(prefix) and raw.endswith(")"):
+                            location = raw[len(prefix):-1]
+                            geo_action = "enter" if "Entry" in prefix else "exit"
+                display_name = f"{location} {geo_action}" if location else raw[:12]
             else:
                 # Get human-readable name using the helper function
                 display_name = format_event_instance_name(event, max_len=12)
