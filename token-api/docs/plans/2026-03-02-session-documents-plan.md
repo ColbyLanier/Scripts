@@ -53,7 +53,7 @@ Note: SQLite ALTER TABLE does not support REFERENCES constraints, so the FK is e
 
 Run:
 ```bash
-cd ~/Scripts/token-api && python3 -c "
+cd /Volumes/Imperium/Scripts/token-api && python3 -c "
 import sqlite3, os
 conn = sqlite3.connect(os.path.expanduser('~/.claude/agents.db'))
 c = conn.cursor()
@@ -665,7 +665,7 @@ git commit -m "feat: add merge primitive with Minimax LLM integration"
 ## Task 5: instance-name CLI --session Flag
 
 **Files:**
-- Modify: `~/Scripts/cli-tools/bin/instance-name`
+- Modify: `/Volumes/Imperium/Scripts/cli-tools/bin/instance-name`
 
 **Step 1: Add --session flag parsing**
 
@@ -780,7 +780,7 @@ instance-name "another-agent" --session "test-session"
 **Step 5: Commit**
 
 ```bash
-git add ~/Scripts/cli-tools/bin/instance-name
+git add /Volumes/Imperium/Scripts/cli-tools/bin/instance-name
 git commit -m "feat: add --session flag to instance-name CLI"
 ```
 

@@ -1,9 +1,9 @@
 # Scripts - Generic Utility Scripts and Tools
 
-**Location**: `/Users/tokenclaw/Scripts/`
+**Location**: `/Volumes/Imperium/Scripts/`
 **Purpose**: Generic utility scripts, tools, and services
 **Last Updated**: 2026-02-15
-**Status**: MOVED from `~/.openclaw/workspace/Scripts` to `~/Scripts` (generic, not OpenClaw-specific)
+**Status**: MOVED from `~/.openclaw/workspace/Scripts` to `/Volumes/Imperium/Scripts` (generic, not OpenClaw-specific)
 
 ## Structure
 
@@ -21,7 +21,7 @@ Scripts/
 
 ### Token API (port 7777)
 
-**Location**: `~/Scripts/token-api/`
+**Location**: `/Volumes/Imperium/Scripts/token-api/`
 **Mac Service**: LaunchAgent `ai.openclaw.tokenapi`
 **WSL Satellite**: systemd `token-satellite.service` (enforcement, `/restart`)
 **Logs**: `~/.claude/token-api-stdout.log`, `~/.claude/token-api-stderr.log`
@@ -39,11 +39,11 @@ Scripts/
 - `token-restart --status`: All-device health check
 - `curl http://localhost:7777/health`: Health check
 
-**See**: `~/Scripts/token-api/CLAUDE.md` for details
+**See**: `/Volumes/Imperium/Scripts/token-api/CLAUDE.md` for details
 
 ### Discord Daemon (port 7779)
 
-**Location**: `~/Scripts/discord-daemon/` (code), `~/.discord-cli/` (config, logs, pending)
+**Location**: `/Volumes/Imperium/Scripts/discord-daemon/` (code), `~/.discord-cli/` (config, logs, pending)
 **Service**: LaunchAgent `ai.tokenclaw.discord` (KeepAlive)
 **Logs**: `~/.discord-cli/logs/` (also `launchd-stdout.log` for console output)
 
@@ -79,7 +79,7 @@ Standalone Discord WebSocket daemon (discord.js v14) replacing OpenClaw's Discor
 ## Verification After Move
 
 **Completed 2026-02-15**:
-- [x] Scripts exist at ~/Scripts
+- [x] Scripts exist at /Volumes/Imperium/Scripts
 - [x] Executable permissions preserved
 - [x] Token API running from new location (port 7777)
 - [x] Cron jobs updated with new paths
@@ -106,7 +106,7 @@ Agents can:
 ### Executor Fleet Deployment
 
 ```bash
-~/Scripts/Shell/deploy-executor-fleet.sh
+/Volumes/Imperium/Scripts/Shell/deploy-executor-fleet.sh
 ```
 
 Deploys 6 executors:
@@ -121,13 +121,13 @@ Deploys 6 executors:
 
 ```bash
 # Create snapshot before risky operation
-~/Scripts/Shell/safety-snapshot.sh pre-deployment
+/Volumes/Imperium/Scripts/Shell/safety-snapshot.sh pre-deployment
 
 # Rollback if something breaks
-~/Scripts/Shell/safety-rollback.sh snapshot-pre-deployment-20260215
+/Volumes/Imperium/Scripts/Shell/safety-rollback.sh snapshot-pre-deployment-20260215
 
 # Check safety status
-~/Scripts/Shell/safety-dashboard.sh
+/Volumes/Imperium/Scripts/Shell/safety-dashboard.sh
 ```
 
 ---

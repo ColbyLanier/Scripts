@@ -91,7 +91,7 @@ These have no triggers — invoked manually via `schtasks /Run /TN "<name>"` or 
 
 ## AHK Script Architecture
 
-All AHK scripts live at `~/Scripts/ahk/` (accessed from Windows via `\\wsl.localhost\Ubuntu\home\token\Scripts\ahk\`).
+All AHK scripts live at `/Volumes/Imperium/Scripts/ahk/` (accessed from Windows via `\\wsl.localhost\Ubuntu\home\token\Scripts\ahk\`).
 
 ```
 script-compiler.ahk          <- ahk_init task (main entry point)
@@ -104,7 +104,7 @@ startup-launcher.ahk          <- AHK startup mode task (standalone)
 monitor-launcher.ahk          <- MonitorLauncher task (standalone, 15s delay)
 ```
 
-> **Note**: Old copies exist at `Documents/Obsidian/Personal-ENV/Scripts/ahk/` — these are superseded by `~/Scripts/ahk/` but kept for historical reference in the Obsidian vault.
+> **Note**: Old copies exist at `Documents/Obsidian/Personal-ENV/Scripts/ahk/` — these are superseded by `/Volumes/Imperium/Scripts/ahk/` but kept for historical reference in the Obsidian vault.
 
 ---
 
