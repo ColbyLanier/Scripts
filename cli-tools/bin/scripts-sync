@@ -29,7 +29,7 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 # Config
-SCRIPTS_DIR="$HOME/Scripts"
+SCRIPTS_DIR="/Volumes/Imperium/Scripts"
 MAC_IP="100.95.109.23"
 WSL_IP="100.66.10.74"
 SSH_OPTS="-o ConnectTimeout=5 -o BatchMode=yes"
