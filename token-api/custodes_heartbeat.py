@@ -16,6 +16,7 @@ from pathlib import Path
 
 BASE = "http://localhost:7777"
 BRIEFING_CHANNEL = "briefing"
+EMPEROR_DISCORD_ID = "229461055628115968"  # For @mentions that cut through thread suppression
 
 
 def _get(path: str) -> dict | list:
@@ -278,8 +279,8 @@ def check_morning_habits() -> str | None:
     phoenix_now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(hours=7)
     current_hour = phoenix_now.hour
 
-    # Only check during waking hours (7am–10pm)
-    if not (7 <= current_hour < 22):
+    # Only check during waking hours (9am–10pm, Emperor alarm 8:30)
+    if not (9 <= current_hour < 22):
         return None
 
     # Debounce: only fire once every 2 hours
@@ -330,7 +331,7 @@ def check_morning_habits() -> str | None:
     urgency = "still pending" if current_hour < 12 else "getting late"
 
     return (
-        f"Habits ({done}/{total}): **{habit_names}** {urgency} "
+        f"<@{EMPEROR_DISCORD_ID}> Habits ({done}/{total}): **{habit_names}** {urgency} "
         f"({phoenix_now.strftime('%H:%M')} MST). Did you get to those?"
     )
 
@@ -463,8 +464,8 @@ def check_morning_greeting(metrics: dict) -> str | None:
     """
     phoenix_now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(hours=7)
 
-    # Only fire from 7am onward
-    if phoenix_now.hour < 7:
+    # Only fire from 9am onward (alarm 8:30, work starts 9)
+    if phoenix_now.hour < 9:
         return None
 
     today = datetime.date.today().isoformat()
@@ -528,6 +529,11 @@ def log_to_daily_note(summary: str):
         print(f"  Warning: could not write daily note: {e}", file=sys.stderr)
 
 
+def emperor_is_live(metrics: dict) -> bool:
+    """Emperor is confirmed live if they have at least one manual (non-cron) instance active."""
+    return metrics.get("active_count", 0) > 0
+
+
 def main():
     # 1. Collect state
     try:
@@ -546,6 +552,13 @@ def main():
     )
     print(f"State: {summary}")
 
+    is_live = emperor_is_live(metrics)
+    if not is_live:
+        print("  Emperor not live (no manual instances). Suppressing all commentary.")
+        log_to_daily_note(summary)
+        print("Done.")
+        return
+
     # 1b. Morning greeting — first heartbeat of the day, creates daily thread
     morning = check_morning_greeting(metrics)
     if morning:
@@ -563,11 +576,11 @@ def main():
         print(f"  Break nudge: {nudge}")
         send_discord(f"Custodes: {nudge}", channel="fleet")
 
-    # 3. Morning habit check — fires to daily thread if habits look unchecked (10am–2pm only)
+    # 3. Morning habit check — fires to main #briefing (NOT thread) so notifications aren't suppressed
     habit_reminder = check_morning_habits()
     if habit_reminder:
         print(f"  Habit reminder: {habit_reminder}")
-        send_discord_thread(f"Custodes: {habit_reminder}")
+        send_discord(f"Custodes: {habit_reminder}", channel=BRIEFING_CHANNEL)
 
     # 3b. Break mode observation — fires to daily thread when in manual BREAK >15 min
     break_obs = check_break_observation(metrics)
